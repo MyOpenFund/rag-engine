@@ -33,6 +33,16 @@ import numpy as np
 if TYPE_CHECKING:
     from rag_engine.config import Settings
 
+__all__ = [
+    "BaseEmbedder",
+    "Embedder",
+    "FakeEmbedder",
+    "ModelSpec",
+    "TorchEmbedder",
+    "detect_device",
+    "make_embedder",
+]
+
 logger = logging.getLogger(__name__)
 
 _TORCH_EXTRA = (
@@ -54,12 +64,30 @@ class ModelSpec:
         Text put in front of every passage before it is embedded; ``""`` for none.
     ``query_prefix``
         Text put in front of every query before it is embedded; ``""`` for none.
+
+    The fields are checked when the specification is built, and nothing is converted:
+    ``name`` must be a non-blank string, ``dim`` an ``int`` of at least 1 (not a ``bool``, a
+    ``float``, a numeric string or a numpy integer), and each prefix a string, taken as it is.
+    Anything else raises ``ValueError`` naming the field.
     """
 
     name: str
     dim: int
     passage_prefix: str
     query_prefix: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(f"ModelSpec: name must be a non-blank string, got {self.name!r}")
+        if type(self.dim) is not int or self.dim < 1:  # a bool is an int subclass, and is not a size
+            raise ValueError(f"ModelSpec: dim must be an integer of at least 1, got {self.dim!r}")
+        # ValueError for every field, as for name and dim: one error type for a bad specification.
+        not_text = [f for f in ("passage_prefix", "query_prefix") if not isinstance(getattr(self, f), str)]
+        if not_text:
+            field = not_text[0]
+            raise ValueError(
+                f"ModelSpec: {field} must be a string ('' for no prefix), got {getattr(self, field)!r}"
+            )
 
     @classmethod
     def from_settings(cls, settings: Settings) -> ModelSpec:

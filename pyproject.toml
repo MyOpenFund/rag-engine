@@ -11,7 +11,13 @@ license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 authors = [{ name = "Marc Jeulin" }]
-dependencies = ["qdrant-client", "numpy"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Typing :: Typed",
+]
+# qdrant-client 1.8.0 is the first release with QdrantClient.collection_exists, which the store
+# uses to tell "the collection is absent" from a failure.
+dependencies = ["qdrant-client>=1.8", "numpy"]
 
 [project.optional-dependencies]
 onnx = ["fastembed"]
@@ -26,6 +32,10 @@ dev = ["pytest>=8.3", "ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rag_engine"]
+
+# The source distribution keeps the tests; the capture tool and the CI files stay in the repository.
+[tool.hatch.build.targets.sdist]
+exclude = ["/tools", "/.github"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -14,6 +14,27 @@ import os
 from collections import Counter
 from dataclasses import dataclass
 
+from rag_engine.config import valid_ocr_languages
+from rag_engine.errors import RagEngineError
+
+__all__ = [
+    "ENABLE_OCR_ENV",
+    "HEADER_LEVELS",
+    "OCR_MODES",
+    "PDF_ADD_HEADERS",
+    "PDF_BODY_LINE_SPACING",
+    "PDF_ENABLE_ML_FEATURES",
+    "PDF_EXTRACT_TABLES",
+    "SUPPORTED_EXTENSIONS",
+    "TESSDATA_PREFIX_ENV",
+    "Chunk",
+    "ChunkingOptions",
+    "UnsupportedFormatError",
+    "check_ocr_languages",
+    "chunk_file",
+    "ocr_available",
+]
+
 logger = logging.getLogger(__name__)
 
 #: Extensions :func:`chunk_file` reads, lower-case with the dot.
@@ -93,7 +114,8 @@ class ChunkingOptions:
     def __post_init__(self) -> None:
         if self.max_headers_to_use not in HEADER_LEVELS:
             raise ValueError(
-                f"max_headers_to_use must be one of {', '.join(HEADER_LEVELS)}, got {self.max_headers_to_use!r}"
+                f"max_headers_to_use must be one of {', '.join(HEADER_LEVELS)}, "
+                f"got {self.max_headers_to_use!r}"
             )
         for name, minimum in (
             ("max_chunk_word_count", 1),
@@ -110,13 +132,30 @@ class ChunkingOptions:
             )
 
 
-class UnsupportedFormatError(ValueError):
+class UnsupportedFormatError(RagEngineError, ValueError):
     """The file's extension is not one of :data:`SUPPORTED_EXTENSIONS`.
 
-    A ``ValueError``, so code written before this class existed still catches it. The parsing
+    A ``ValueError``, so code written before this class existed still catches it, and a
+    :class:`rag_engine.errors.RagEngineError`. The parsing
     libraries raise plain ``ValueError`` of their own (an empty CSV, for instance): catch this
     class to tell "not a format the engine reads" from "a file the parser could not read".
     """
+
+
+def check_ocr_languages(ocr_languages: object) -> str:
+    """Return ``ocr_languages`` when it is a usable Tesseract language string, else ``ValueError``.
+
+    The rule is :func:`rag_engine.config.valid_ocr_languages`, the one :class:`Settings`
+    applies: codes joined by ``+``, no whitespace (``"eng"``, ``"eng+fra"``). :func:`chunk_file`
+    and ``ingest_document`` both call this, so a value refused by the settings is refused by
+    them too, and the reverse.
+    """
+    if not valid_ocr_languages(ocr_languages):
+        raise ValueError(
+            "ocr_languages must be Tesseract language codes joined by '+', without whitespace "
+            f"(for example 'eng+fra'), got {ocr_languages!r}"
+        )
+    return ocr_languages  # type: ignore[return-value]  # a str: valid_ocr_languages checked it
 
 
 def ocr_available() -> bool:
@@ -176,7 +215,8 @@ def chunk_file(
     for the running process. The environment is never changed otherwise.
 
     ``ocr_languages`` is the Tesseract language string (``"eng"``, ``"eng+fra"``); it is given
-    by the caller (``Settings.ocr_languages``), never read from the environment here.
+    by the caller (``Settings.ocr_languages``), never read from the environment here. It is
+    checked for every format, with the rule of the settings (:func:`check_ocr_languages`).
 
     ``options`` are the chunker's sizes, for every format; ``None`` means ``ChunkingOptions()``,
     the values production documents were chunked with.
@@ -185,15 +225,15 @@ def chunk_file(
     (an empty file, a scanned PDF read without OCR) gives ``[]``.
 
     Raises :class:`UnsupportedFormatError` (a ``ValueError``) for an unsupported extension,
-    plain ``ValueError`` for an unknown ``ocr`` mode, a blank ``ocr_languages`` or an
+    plain ``ValueError`` for an unknown ``ocr`` mode, an ``ocr_languages`` that is not a list
+    of language codes joined by ``+``, or an
     ``options`` that is not a :class:`ChunkingOptions`, and ``ImportError`` when the ``ingest``
     extra is not installed. Any error of the parsing libraries, other than "no text found", is
     raised unchanged, whatever its type (an empty CSV gives the parser's own ``ValueError``).
     """
     if not isinstance(ocr, str) or ocr not in OCR_MODES:
         raise ValueError(f"ocr must be one of {', '.join(OCR_MODES)}, got {ocr!r}")
-    if not isinstance(ocr_languages, str) or not ocr_languages.strip():
-        raise ValueError(f"ocr_languages must be a non-empty string such as 'eng+fra', got {ocr_languages!r}")
+    check_ocr_languages(ocr_languages)
     if options is None:
         options = ChunkingOptions()
     elif not isinstance(options, ChunkingOptions):

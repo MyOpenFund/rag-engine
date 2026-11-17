@@ -48,6 +48,8 @@ import hashlib
 from collections.abc import Mapping
 from typing import Any
 
+__all__ = ["RESERVED_KEYS", "build_payload", "page_for_id", "point_id"]
+
 RESERVED_KEYS: tuple[str, ...] = ("doc_id", "filename", "chunk_number", "ingestion_date", "text", "page")
 
 

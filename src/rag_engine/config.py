@@ -12,6 +12,10 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
+from rag_engine.errors import RagEngineError
+
+__all__ = ["BACKENDS", "NO_PREFIX", "ConfigError", "Settings", "valid_ocr_languages"]
+
 BACKENDS = ("torch", "onnx")
 NO_PREFIX = "none"
 
@@ -22,12 +26,29 @@ _FALSE = frozenset({"", "0", "false", "no", "off"})
 _OCR_LANGUAGES = re.compile(r"[A-Za-z][A-Za-z0-9_/-]*(\+[A-Za-z][A-Za-z0-9_/-]*)*")
 
 
-class ConfigError(ValueError):
+class ConfigError(RagEngineError, ValueError):
     """A setting has an invalid value.
 
     The message names the environment variable of the setting and echoes the value, cut to
     80 characters. The Qdrant API key is the exception: its value is never echoed.
+
+    A ``ValueError``, as it has always been, and a :class:`rag_engine.errors.RagEngineError`.
     """
+
+
+def valid_ocr_languages(value: object) -> bool:
+    """Whether ``value`` is a Tesseract language string the engine accepts.
+
+    Accepted: language codes joined by ``+``, without any whitespace: ``"eng"``,
+    ``"eng+fra"``, ``"chi_sim+eng"``, ``"script/Latin"``. Each code starts with a letter and
+    holds letters, digits, ``_``, ``/`` and ``-``. Anything else is refused, a value that is
+    not a string included.
+
+    This is the one rule of the engine: :class:`Settings`, ``chunk_file`` and
+    ``ingest_document`` all apply it, so a value is accepted or refused the same way
+    wherever it enters. Whether each language is installed on the host is not checked here.
+    """
+    return isinstance(value, str) and _OCR_LANGUAGES.fullmatch(value) is not None
 
 
 def _show(value: object) -> str:
@@ -156,15 +177,18 @@ class Settings:
     Ingestion:
 
     ``batch_size`` — ``RAG_ENGINE_BATCH_SIZE``, default ``100``
-        Number of chunks embedded and written per batch, at least 1. The default is the value
-        of the engine this package replaces.
+        Number of points sent to Qdrant per write, at least 1. It sizes the writes only: the
+        chunks of a document are all embedded in one call, whatever this value. The default
+        is the value of the engine this package replaces.
     ``ocr_languages`` — ``RAG_ENGINE_OCR_LANGUAGES``, default ``"eng"``
         Tesseract languages used when a page is read by OCR: language codes joined by ``+``,
-        for example ``"eng+fra"``. This is the value format of the engine this package
-        replaces. That engine had no variable for it: it listed every language file found
-        in the ``TESSDATA_PREFIX`` directory, and fell back to ``"eng"``. There is therefore
-        no older variable name to fall back to, and ``ENABLE_OCR`` / ``TESSDATA_PREFIX`` are
-        not read here: neither holds a language list.
+        for example ``"eng+fra"`` (the rule is :func:`valid_ocr_languages`). Nothing reads
+        this setting behind the caller's back: the caller passes it on, as
+        ``ingest_document(..., ocr_languages=settings.ocr_languages)``. This is the value
+        format of the engine this package replaces. That engine had no variable for it: it
+        listed every language file found in the ``TESSDATA_PREFIX`` directory, and fell back
+        to ``"eng"``. There is therefore no older variable name to fall back to, and
+        ``ENABLE_OCR`` / ``TESSDATA_PREFIX`` are not read here: neither holds a language list.
 
     Search:
 
@@ -210,7 +234,7 @@ class Settings:
                 raise ConfigError(f"{name}={_show(value)} must not be empty")
         if self.backend not in BACKENDS:
             raise ConfigError(f"RAG_ENGINE_BACKEND={_show(self.backend)} is not one of {', '.join(BACKENDS)}")
-        if not _OCR_LANGUAGES.fullmatch(self.ocr_languages):
+        if not valid_ocr_languages(self.ocr_languages):
             raise ConfigError(
                 f"RAG_ENGINE_OCR_LANGUAGES={_show(self.ocr_languages)} is not a list of Tesseract "
                 "language codes joined by '+' (for example 'eng+fra')"

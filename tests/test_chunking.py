@@ -392,6 +392,66 @@ def test_ocr_languages_must_be_a_non_blank_string(stubs, tmp_path, languages):
     assert stubs.calls == []
 
 
+# What the settings refuse and accept (tests/test_config.py): the same rule applies here.
+BAD_OCR_LANGUAGES = ["eng,fra", "eng fra", "eng++fra", "+eng", "eng+", " eng", "eng ", "eng\n", "1eng"]
+GOOD_OCR_LANGUAGES = ["eng", "eng+fra", "chi_sim+eng", "script/Latin", "deu+eng+fra"]
+
+
+@pytest.mark.parametrize("languages", BAD_OCR_LANGUAGES)
+@pytest.mark.parametrize("name", ["a.pdf", "a.md"])
+def test_ocr_languages_the_settings_refuse_are_refused(stubs, tmp_path, name, languages):
+    with pytest.raises(ValueError, match="ocr_languages") as error:
+        chunk_file(_file(tmp_path, name), ocr="always", ocr_languages=languages)
+    assert type(error.value) is ValueError
+    assert repr(languages) in str(error.value)
+    assert stubs.calls == []
+
+
+@pytest.mark.parametrize("languages", GOOD_OCR_LANGUAGES)
+def test_ocr_languages_the_settings_accept_reach_the_parser(stubs, tmp_path, languages):
+    chunk_file(_file(tmp_path, "a.pdf"), ocr="always", ocr_languages=languages)
+    assert _pdf_kwargs(stubs)["ocr_language"] == languages
+
+
+@pytest.mark.parametrize("languages", BAD_OCR_LANGUAGES + GOOD_OCR_LANGUAGES + ["", "  ", None, 3])
+def test_settings_chunk_file_and_ingest_document_agree_on_ocr_languages(stubs, tmp_path, languages):
+    """One rule: a value is accepted by all three, or refused by all three."""
+    from rag_engine.config import Settings, valid_ocr_languages
+    from rag_engine.embedding import FakeEmbedder, ModelSpec
+    from rag_engine.ingest import ingest_document
+    from rag_engine.store import QdrantStore
+
+    class Client:
+        def upsert(self, **_):
+            pass
+
+    def accepted(call):
+        try:
+            call()
+        except ValueError:
+            return False
+        return True
+
+    path = _file(tmp_path, "a.pdf")
+    embedder = FakeEmbedder(ModelSpec("fake", 4, "", ""))
+    answers = {
+        "Settings": accepted(lambda: Settings(ocr_languages=languages)),
+        "chunk_file": accepted(lambda: chunk_file(path, ocr_languages=languages)),
+        "ingest_document": accepted(
+            lambda: ingest_document(
+                path,
+                "doc",
+                {},
+                collection="c",
+                store=QdrantStore(client=Client()),
+                embedder=embedder,
+                ocr_languages=languages,
+            )
+        ),
+    }
+    assert set(answers.values()) == {valid_ocr_languages(languages)}, answers
+
+
 def test_auto_is_never_when_ocr_is_not_available(stubs, tmp_path):
     chunk_file(_file(tmp_path, "a.pdf"))
     assert _pdf_kwargs(stubs) == {"use_ocr": "never", "ocr_language": "eng", **PDF_FIXED_KWARGS}
@@ -810,8 +870,9 @@ def _pdf(path, pages):
 
 
 WORDS = (
-    "rate", "inflation", "growth", "committee", "reserves", "liquidity", "outlook", "employment", "credit",
-    "energy", "prices", "wages", "demand", "supply", "balance", "sheet", "policy", "stance", "guidance", "risk",
+    "rate", "inflation", "growth", "committee", "reserves", "liquidity", "outlook", "employment",
+    "credit", "energy", "prices", "wages", "demand", "supply", "balance", "sheet", "policy", "stance",
+    "guidance", "risk",
 )  # fmt: skip
 
 

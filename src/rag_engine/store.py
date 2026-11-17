@@ -16,6 +16,18 @@ from urllib.parse import urlsplit
 from qdrant_client import QdrantClient, models
 
 from rag_engine.config import Settings
+from rag_engine.errors import RagEngineError
+
+__all__ = [
+    "AUTH_STATUSES",
+    "DEFAULT_TIMEOUT",
+    "DEFAULT_URL_PORT",
+    "DISTANCE",
+    "CollectionMismatchError",
+    "QdrantAuthError",
+    "QdrantStore",
+    "StoreError",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +37,7 @@ DEFAULT_TIMEOUT = 60
 DEFAULT_URL_PORT = 6333
 
 
-class StoreError(Exception):
+class StoreError(RagEngineError):
     """The store cannot do what was asked, for a reason it can name."""
 
 
@@ -54,6 +66,12 @@ def _positive_int(name: str, value: object) -> int:
     return value
 
 
+def _port(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= 65535:  # a bool is an int subclass, not a port
+        raise ValueError(f"port must be an integer between 1 and 65535, got {value!r}")
+    return value
+
+
 def _bare_host(host: str) -> str:
     """``host`` without the square brackets of an IPv6 literal (``[::1]`` -> ``::1``)."""
     if host.startswith("[") and host.endswith("]"):
@@ -75,14 +93,18 @@ class QdrantStore:
 
     Connection values are taken, in this order, from the explicit arguments, from ``settings``,
     and from the environment (:meth:`Settings.from_env`, read when the store is built and
-    only when no ``settings`` is given). A blank ``api_key`` counts as not given.
+    only when neither ``settings`` nor ``client`` is given). A blank ``api_key`` counts as not
+    given. A ``port`` given explicitly must be an integer between 1 and 65535, else
+    ``ValueError``.
 
     ``https`` is always passed to the client: left undecided, qdrant-client turns TLS on as
     soon as an API key is set.
 
     ``client`` injects a ready client (tests, qdrant-client's local mode); no connection is
     then built, and ``host`` / ``port`` are the ones given explicitly, else ``None``: the store
-    cannot know where an injected client points to.
+    cannot know where an injected client points to. With an injected client and no
+    ``settings``, the environment is not read at all: there is no connection to configure,
+    and the batch size is the built-in default (``Settings.batch_size``).
 
     An IPv6 address is accepted bare or in square brackets (``::1``, ``[::1]``); ``host``
     shows it bare, and the client receives it in brackets.
@@ -103,13 +125,18 @@ class QdrantStore:
         settings: Settings | None = None,
         client: Any = None,
     ) -> None:
-        # The settings are not kept: they hold the API key.
-        settings = settings if settings is not None else Settings.from_env()
-        self._batch_size = settings.batch_size
+        if port is not None:
+            _port(port)
         if client is not None:
+            # Nothing to connect to: the environment is not read, so a variable that has
+            # nothing to do with this store (a bad QDRANT_PORT, say) cannot make it fail.
+            self._batch_size = settings.batch_size if settings is not None else Settings.batch_size
             self._host, self._port, self._https = host, port, https
             self._client = client
             return
+        # The settings are not kept: they hold the API key.
+        settings = settings if settings is not None else Settings.from_env()
+        self._batch_size = settings.batch_size
         self._host = _bare_host(host or settings.qdrant_host)
         self._port = port if port is not None else settings.qdrant_port
         self._https = https if https is not None else settings.qdrant_https
@@ -244,8 +271,8 @@ class QdrantStore:
         except Exception as exc:  # noqa: BLE001 - re-raised below unless the collection now exists
             _raise_auth(exc)
             created_error = exc
-        # Lost race, or a create applied despite its error? Any failure while finding out reports the creation error: it is the one
-        # the operator needs.
+        # Lost race, or a create applied despite its error? Any failure while finding out
+        # reports the creation error: it is the one the operator needs.
         try:
             exists = self._client.collection_exists(collection_name=name)
             info = self._client.get_collection(collection_name=name) if exists else None
@@ -258,7 +285,8 @@ class QdrantStore:
     def upsert(self, collection: str, points: Iterable[Any], batch_size: int | None = None) -> int:
         """Write ``points`` in batches of ``batch_size``; returns the number written.
 
-        ``batch_size`` defaults to the ``batch_size`` of the settings; a value that is not an
+        ``batch_size`` defaults to the ``batch_size`` of the settings the store was built
+        with (the built-in default for an injected client without settings); a value that is not an
         integer >= 1 is a ``ValueError``, raised before anything is sent. Each batch waits for
         Qdrant to apply it (``wait=True``). Nothing is sent for no points. HTTP 401 or 403 is
         a :class:`QdrantAuthError`; any other error is raised as is, at the first failed batch.

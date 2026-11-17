@@ -54,6 +54,31 @@ def test_model_spec_is_frozen_and_hashable():
     assert hash(SPEC) == hash(ModelSpec("stub/model", 8, "passage: ", "query: "))
 
 
+@pytest.mark.parametrize("name", ["", "   ", "\t\n", None, 5, b"stub/model"])
+def test_model_spec_refuses_a_name_that_is_not_a_non_blank_string(name):
+    with pytest.raises(ValueError, match="name"):
+        ModelSpec(name, 8, "passage: ", "query: ")
+
+
+@pytest.mark.parametrize("dim", [0, -1, True, 8.0, "8", None, np.int64(8)])
+def test_model_spec_refuses_a_dim_that_is_not_an_integer_of_at_least_one(dim):
+    with pytest.raises(ValueError, match="dim"):
+        ModelSpec("stub/model", dim, "passage: ", "query: ")
+
+
+@pytest.mark.parametrize("field", ["passage_prefix", "query_prefix"])
+@pytest.mark.parametrize("prefix", [None, 3, b"passage: ", ["passage: "]])
+def test_model_spec_refuses_a_prefix_that_is_not_a_string(field, prefix):
+    values = {"name": "stub/model", "dim": 8, "passage_prefix": "p ", "query_prefix": "q ", field: prefix}
+    with pytest.raises(ValueError, match=field):
+        ModelSpec(**values)
+
+
+def test_model_spec_accepts_empty_and_whitespace_prefixes_and_a_dim_of_one():
+    spec = ModelSpec("stub/model", 1, "", "  ")
+    assert (spec.dim, spec.passage_prefix, spec.query_prefix) == (1, "", "  ")
+
+
 # ---------------------------------------------------------------------------
 # FakeEmbedder, and through it the rules shared by every backend
 # ---------------------------------------------------------------------------

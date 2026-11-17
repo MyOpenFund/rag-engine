@@ -19,7 +19,7 @@ from qdrant_client import QdrantClient
 
 import rag_engine.ingest as ingest_mod
 from rag_engine.chunking import Chunk, ChunkingOptions, UnsupportedFormatError
-from rag_engine.config import Settings
+from rag_engine.config import ConfigError, Settings
 from rag_engine.embedding import FakeEmbedder, ModelSpec
 from rag_engine.ingest import IngestResult, ingest_document
 from rag_engine.schema import RESERVED_KEYS, point_id
@@ -42,7 +42,10 @@ class HttpError(Exception):
 
 
 class RecordingClient:
-    """The part of a Qdrant client the store uses to write. ``fail_at`` maps a call number (from 1) to an error."""
+    """The part of a Qdrant client the store uses to write.
+
+    ``fail_at`` maps a call number (from 1) to an error.
+    """
 
     def __init__(self, fail_at: dict[int, Exception] | None = None) -> None:
         self.fail_at = fail_at or {}
@@ -329,6 +332,35 @@ def test_an_ingestion_date_that_is_not_a_non_blank_string_is_refused(setup, monk
     with pytest.raises(ValueError, match="ingestion_date"):
         setup.ingest(ingestion_date=when)
     assert setup.chunk_calls == [] and setup.untouched
+
+
+@pytest.mark.parametrize("languages", ["", "  ", None, 3, "eng,fra", "eng fra", "eng++fra", "+eng", " eng"])
+@pytest.mark.parametrize("path", ["report.pdf", "notes.md"])
+def test_ocr_languages_the_settings_refuse_are_refused_before_the_file_is_read(
+    setup, monkeypatch, path, languages
+):
+    stub_chunker(monkeypatch, THREE, setup.chunk_calls)
+    with pytest.raises(ValueError, match="ocr_languages") as error:
+        setup.ingest(path, ocr_languages=languages)
+    assert type(error.value) is ValueError
+    assert setup.chunk_calls == [] and setup.untouched
+    with pytest.raises(ConfigError):
+        Settings(ocr_languages=languages)
+
+
+def test_ingest_document_reads_no_settings_and_no_environment(setup, monkeypatch):
+    """The caller passes ``settings.ocr_languages``; the variable alone changes nothing."""
+    monkeypatch.setenv("RAG_ENGINE_OCR_LANGUAGES", "fra")
+    monkeypatch.setenv("RAG_ENGINE_BATCH_SIZE", "1")
+    monkeypatch.setenv("QDRANT_PORT", "abc")  # would fail any Settings.from_env()
+    stub_chunker(monkeypatch, THREE, setup.chunk_calls)
+    setup.ingest()
+    assert [call[2] for call in setup.chunk_calls] == ["eng"]
+    assert len(setup.client.calls) == 1  # one write: the batch size of the store, not of the environment
+
+    settings = Settings.from_env({"RAG_ENGINE_OCR_LANGUAGES": "eng+fra"})
+    setup.ingest(ocr_languages=settings.ocr_languages)
+    assert setup.chunk_calls[-1][2] == "eng+fra"
 
 
 def test_a_path_without_a_file_name_is_refused(setup, monkeypatch):

@@ -154,6 +154,44 @@ def test_settings_fill_what_is_not_given(built):
     assert (store.host, store.port) == ("from-settings", 1111)
 
 
+def test_an_injected_client_without_settings_does_not_read_the_environment(monkeypatch):
+    # An unrelated bad variable must not break a store that connects to nothing.
+    monkeypatch.setenv("QDRANT_PORT", "abc")
+    monkeypatch.setenv("RAG_ENGINE_BATCH_SIZE", "7")
+    monkeypatch.setattr(Settings, "from_env", classmethod(lambda cls, environ=None: pytest.fail("read")))
+    client = FakeClient()
+    store = QdrantStore(client=client)
+    assert (store.host, store.port) == (None, None)
+    # The batch size is the built-in default, not the one of the environment.
+    assert Settings.batch_size == 100
+    store.upsert("c", points(Settings.batch_size + 1))
+    assert [len(call[2]) for call in client.calls if call[0] == "upsert"] == [Settings.batch_size, 1]
+
+
+def test_an_injected_client_with_settings_takes_their_batch_size():
+    client = FakeClient()
+    QdrantStore(client=client, settings=Settings(batch_size=2)).upsert("c", points(3))
+    assert [len(call[2]) for call in client.calls if call[0] == "upsert"] == [2, 1]
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536, True, 6333.0, "6333"])
+def test_a_port_outside_1_to_65535_is_refused(built, port):
+    with pytest.raises(ValueError, match="port") as caught:
+        QdrantStore("h", port, settings=Settings())
+    assert "65535" in str(caught.value)
+    assert built == []
+
+
+def test_a_bad_port_is_refused_with_an_injected_client_too():
+    with pytest.raises(ValueError, match="port"):
+        QdrantStore("h", 0, client=FakeClient(), settings=Settings())
+
+
+@pytest.mark.parametrize("port", [1, 6333, 65535])
+def test_the_bounds_of_the_port_range_are_accepted(built, port):
+    assert QdrantStore("h", port, settings=Settings()).port == port
+
+
 def test_without_settings_the_environment_is_read_at_construction(built, monkeypatch):
     monkeypatch.setenv("QDRANT_HOST", "env-host")
     monkeypatch.setenv("QDRANT_PORT", "7777")

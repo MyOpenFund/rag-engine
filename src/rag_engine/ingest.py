@@ -19,10 +19,12 @@ from typing import Any
 
 from qdrant_client import models
 
-from .chunking import ChunkingOptions, chunk_file
+from .chunking import ChunkingOptions, check_ocr_languages, chunk_file
 from .embedding import Embedder
 from .schema import build_payload, page_for_id, point_id
 from .store import QdrantStore
+
+__all__ = ["IngestResult", "ingest_document"]
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,18 @@ def ingest_document(
     with no chunk (an empty file, a scanned PDF read without OCR) is not an error: the result
     is ``IngestResult(0, 0, True)``, and neither the embedder nor the store is called.
 
+    **This function reads no settings and no environment variable.** Every option has a fixed
+    default written in the signature; a caller that keeps its configuration in
+    :class:`rag_engine.config.Settings` passes the values itself::
+
+        ingest_document(path, doc_id, metadata, collection=..., store=store, embedder=embedder,
+                        ocr_languages=settings.ocr_languages)
+
+    In particular ``RAG_ENGINE_OCR_LANGUAGES`` has no effect unless the caller passes
+    ``ocr_languages=settings.ocr_languages``: left out, the languages are ``"eng"``. The same
+    goes for ``batch_size``: left out, the writes use the batch size of ``store`` (the one of
+    the settings the store was built with); pass ``batch_size=...`` only for another one.
+
     Arguments:
 
     - ``metadata`` is copied into every payload and is not changed. It may not contain a
@@ -82,8 +96,10 @@ def ingest_document(
       create or check it**: the caller calls ``store.ensure_collection(collection,
       embedder.dim)`` once per run, not once per document.
     - ``ocr`` and ``ocr_languages`` (PDF only) and ``chunking_options`` are those of
-      :func:`rag_engine.chunking.chunk_file`.
-    - ``batch_size`` is the number of points per write; ``None`` leaves the store's own.
+      :func:`rag_engine.chunking.chunk_file`. ``ocr_languages`` follows the rule of the
+      settings (language codes joined by ``+``), for every format.
+    - ``batch_size`` is the number of points per write; ``None`` leaves the store's own. It
+      sizes the writes only, not the embedding.
     - ``ingestion_date`` is the timestamp written on every point of the document. ``None``,
       the normal case, means the local time at which the document is ingested
       (``datetime.datetime.now().isoformat()``, read once). A caller gives it to replay an
@@ -95,7 +111,8 @@ def ingest_document(
     Errors. The arguments are checked before the file is read: ``ValueError`` for a ``doc_id``
     or a ``collection`` that is not a non-blank string, a ``path`` without a file name, a
     ``batch_size`` that is not an integer >= 1, an ``ingestion_date`` that is not a non-blank
-    string, a reserved key in ``metadata``; ``TypeError`` for a ``metadata`` that is not a
+    string, an ``ocr_languages`` that is not a list of language codes joined by ``+``, a
+    reserved key in ``metadata``; ``TypeError`` for a ``metadata`` that is not a
     mapping. Nothing else is caught: an error of the chunker (``UnsupportedFormatError``, a
     missing file, a parser error), of the embedder or of the store
     (:class:`rag_engine.store.QdrantAuthError` and others, with the number of points written
@@ -115,6 +132,7 @@ def ingest_document(
         raise ValueError(
             f"ingestion_date must be a non-blank ISO 8601 string or None, got {ingestion_date!r}"
         )
+    check_ocr_languages(ocr_languages)
     filename = Path(path).name
     if not filename:
         raise ValueError(f"path has no file name: {os.fspath(path)!r} (document {doc_id!r})")
