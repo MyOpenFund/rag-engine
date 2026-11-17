@@ -1,11 +1,11 @@
 # rag-engine
 
-**Status: ingestion and both embedding backends (PyTorch, ONNX) are delivered; search arrives in the next release.**
+**Status: ingestion, both embedding backends (PyTorch, ONNX) and filtered search are delivered.**
 
-rag-engine is built to do two things:
+rag-engine does two things:
 
-1. **Ingestion** of one document into [Qdrant](https://qdrant.tech): chunk, embed, write. Available.
-2. **Search** over what was ingested. Not available yet: this release has no search function.
+1. **Ingestion** of one document into [Qdrant](https://qdrant.tech): chunk, embed, write.
+2. **Search** over what was ingested: one dense search, narrowed by filters on the source, the type, the language, the document, the corpus and the publication date.
 
 It is used by two MyOpenFund components: the data-orchestrator (ingestion) and the MCP server (search).
 
@@ -15,7 +15,7 @@ Python 3.10 or later. The base install is light; each consumer adds only the ext
 
 | Install | Adds | For |
 |---|---|---|
-| `rag-engine` | `qdrant-client` (1.8 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, writes) |
+| `rag-engine` | `qdrant-client` (1.10 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, indexes, writes), search |
 | `rag-engine[torch]` | `sentence-transformers` | PyTorch embedding backend |
 | `rag-engine[onnx]` | `fastembed` (ONNX runtime) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
 | `rag-engine[ingest]` | `chunknorris`, `markitdown[pptx]`, `psutil` | document parsing and chunking |
@@ -35,9 +35,10 @@ The package root exposes only `__version__`. Everything else is imported from it
 | `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE` |
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
+| `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `QUERY_NORMALIZATION` |
 | `rag_engine.errors` | `RagEngineError` |
 
-Errors. Every exception class the engine defines derives from `rag_engine.errors.RagEngineError`: `ConfigError` (also a `ValueError`), `StoreError` with its subclasses `QdrantAuthError` and `CollectionMismatchError`, and `UnsupportedFormatError` (also a `ValueError`). `except RagEngineError` does not catch what the engine lets through unchanged (an error of a parser, of the embedding backend or of the Qdrant client), nor the plain `ValueError` / `TypeError` of a bad argument.
+Errors. Every exception class the engine defines derives from `rag_engine.errors.RagEngineError`: `ConfigError` (also a `ValueError`), `StoreError` with its subclasses `QdrantAuthError` and `CollectionMismatchError`, `UnsupportedFormatError` (also a `ValueError`), and `SearchError` (also a `ValueError`). `except RagEngineError` does not catch what the engine lets through unchanged (an error of a parser, of the embedding backend or of the Qdrant client), nor the plain `ValueError` / `TypeError` of a bad argument.
 
 ## Configuration
 
@@ -58,8 +59,8 @@ Errors. Every exception class the engine defines derives from `rag_engine.errors
 | `RAG_ENGINE_PARITY_MIN` | `0.999` | Smallest cosine accepted between the `torch` and `onnx` vectors of the same text (above 0, at most 1). Read by the parity test only |
 | `RAG_ENGINE_BATCH_SIZE` | `100` | Points sent to Qdrant per write (at least 1). It sizes the writes only: all the chunks of a document are embedded in one call |
 | `RAG_ENGINE_OCR_LANGUAGES` | `eng` | Tesseract languages joined by `+`, without whitespace, e.g. `eng+fra`. The caller passes it to `ingest_document` (see below) |
-| `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. Read and checked, but not used yet: search is not available |
-| `RAG_ENGINE_SEARCH_MAX_LIMIT` | `50` | Largest limit a caller may ask for; not below the default limit. Not used yet either |
+| `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. The caller passes it to `search` (see [Searching](#searching)) |
+| `RAG_ENGINE_SEARCH_MAX_LIMIT` | `50` | Largest limit a caller may ask for; not below the default limit. Passed to `search` by the caller too |
 
 An unset or blank variable gives the default, and surrounding whitespace is ignored. An invalid value raises `ConfigError` (a `ValueError`) naming the variable and the value as it was set, cut to 80 characters.
 
@@ -169,9 +170,75 @@ store.ensure_payload_indexes("central-bank-e5b-v1")
 - **Errors.** A refused API key is a `QdrantAuthError`. A collection that does not exist is not created: the error of the client is raised, like any other failure. Indexes created before a failure stay, and a second call creates the rest.
 - **Another list.** `ensure_payload_indexes(collection, [("page", "integer")])` takes any list of `(field, kind)`, a kind being the name of a Qdrant payload index type.
 
-**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. Qdrant reads a full date (`2016-03-10`, taken as midnight UTC) or a full date and time (`2016-03-10T12:00:00Z`). Every other value is stored untouched and is never an error, neither when the index is built nor when a point is written, but **it matches no date range**: an imprecise date (`2016-03`, `2016`), an empty string, a null, a missing `date`. A document without a precise date is therefore left out as soon as a date bound is set, with or without the index; it can still be reached through `year`, which is filtered on its own. The bounds of a range are full dates too: Qdrant refuses `2016` or `2016-03` as a bound.
+**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. Qdrant reads a full date (`2016-03-10`, taken as midnight UTC) or a full date and time (`2016-03-10T12:00:00Z`). Every other value is stored untouched and is never an error, neither when the index is built nor when a point is written, but **it matches no date range**: an imprecise date (`2016-03`, `2016`), an empty string, a null, a missing `date`. A document without a precise date is therefore left out as soon as a date bound is set, with or without the index; its `year` is indexed on its own, but `search` has no filter on `year` in this version. The bounds of a range are full dates too: Qdrant refuses `2016` or `2016-03` as a bound.
 
 qdrant-client's local mode (`QdrantClient(":memory:")`) keeps no payload index: it accepts the creation with a warning and filters by reading every point, with the same answers.
+
+## Searching
+
+`search` (in `rag_engine.search`, base install) embeds a query, asks Qdrant for the closest chunks that pass the filters, and returns them as `Hit` objects, best first. It is one dense cosine search; several chunks of one document may come back, nothing is grouped.
+
+Like `ingest_document`, `search` reads no settings and no environment variable. The caller builds everything from `Settings.from_env()` and passes it on, the two limits included: without `limit=settings.search_limit` and `max_limit=settings.search_max_limit`, the limits are the built-in 10 and 50, whatever `RAG_ENGINE_SEARCH_LIMIT` and `RAG_ENGINE_SEARCH_MAX_LIMIT` say.
+
+```python
+from rag_engine.config import Settings
+from rag_engine.embedding import make_embedder
+from rag_engine.search import SearchFilters, search
+from rag_engine.store import QdrantStore
+
+settings = Settings.from_env()  # with RAG_ENGINE_BACKEND=onnx: queries are embedded without PyTorch
+store = QdrantStore(settings=settings)
+embedder = make_embedder(settings)  # same model, dimension and prefixes as the ingestion
+
+collection = "central-bank-e5b-v1"
+store.ensure_collection(collection, embedder.dim)  # once at start: refuses another dimension
+store.ensure_payload_indexes(collection)  # once: the filters are fast with the indexes
+
+hits = search(
+    "What did the Governing Council decide on asset purchases?",
+    collection=collection,
+    store=store,
+    embedder=embedder,
+    filters=SearchFilters(
+        source_codes=["ecb", "fed"],  # ecb OR fed
+        doc_types=["monetary-policy-statement", "minutes"],  # AND one of these types
+        date_from="2016-01-01",  # AND published from this day...
+        date_to="2016-03-10",  # ...to this day, both included
+    ),
+    limit=settings.search_limit,  # RAG_ENGINE_SEARCH_LIMIT; not read otherwise
+    max_limit=settings.search_max_limit,  # RAG_ENGINE_SEARCH_MAX_LIMIT; not read otherwise
+)
+for hit in hits:
+    print(f"{hit.score:.3f}", hit.doc_id, hit.date, hit.page, hit.text[:80])
+```
+
+With an API key that only reads (a search service), leave out the two `ensure_` calls: they are for whoever owns the collection. `search` itself sends one request, and does not check the collection: a collection that does not exist or has another dimension is the error of the Qdrant client.
+
+**Hits.** A `Hit` is a frozen dataclass: `text`, `score` (the cosine, higher is closer), `doc_id`, `title`, `date`, `source_code`, `doc_type`, `language`, `page`, `chunk_number`, `corpus`, then `point_id` and `payload`, the whole payload for the keys that have no field (`year`, `filename`, `ingestion_date`, ...). A key the payload does not have gives `None`; `page` is `None` for a document without pages (and `0` is the first page). `date` is the publication date exactly as stored. `hit.to_dict()` returns the fields without `payload`, ready for `json.dumps`; `to_dict(include_payload=True)` adds it.
+
+**Limits.** `limit` is the largest number of hits wanted, `max_limit` the largest limit accepted. A `limit` above `max_limit` is refused with a `SearchError` that names the maximum; it is never lowered silently.
+
+**Filters.** A `SearchFilters` is built from keyword arguments, all optional, and checked when it is built:
+
+| Field | Payload field | Value |
+|---|---|---|
+| `source_codes`, `doc_types`, `languages`, `doc_ids` | `source_code`, `doc_type`, `language`, `doc_id` | a list (or tuple, or set) of non-blank strings, matched exactly |
+| `date_from`, `date_to` | `date` | a `datetime.date`, or a string written exactly `YYYY-MM-DD` |
+| `corpus` | `corpus` | one non-blank string |
+
+- Fields are combined with **AND**; the values of one list with **OR**.
+- `None` (the default) is the only way to write "no restriction". **An empty list is refused**: it could mean "match nothing" as well as "match everything", and the two give opposite results.
+- A bare string where a list is expected (`source_codes="ecb"`) is refused: it would be read letter by letter. Write `["ecb"]`.
+- A value no chunk carries is not an error: the search returns `[]`. Values are compared as they are, case included.
+- There is no filter on `year` in this version.
+
+**Dates.** Both bounds are inclusive, and a bound is a whole day in UTC: `date_to="2016-03-10"` keeps a document stored as `2016-03-10` and one stored as `2016-03-10T15:30:00Z`. (The upper bound is sent to Qdrant as "before the next day at 00:00 UTC", so it does not depend on the time of day a date was stored with.) Only a full date is a bound: `"2016"`, `"2016-03"`, `"10/03/2016"`, a date with a time, a `datetime.datetime` or a number raise a `SearchError`, and so does `date_from` after `date_to`. The check is the engine's own, on purpose: handed the string `"2016"`, qdrant-client reads a Unix timestamp and the filter matches almost everything. **As soon as one bound is set, a chunk without a full date is left out**: no `date`, a null, an empty string, or an imprecise date such as `2016-03` (see [Payload indexes](#payload-indexes)).
+
+**Query normalisation.** The chunker stores the text of the chunks in Unicode NFKD (accents and other marks as separate characters), and that text is what was embedded. `search` therefore puts the query in NFKD too before embedding it (`normalize_query=True`, the default). For French, German, Spanish or Greek the tokenizer of `intfloat/multilingual-e5-base` gives the same tokens for both forms, so nothing changes. For Japanese (voiced kana), Korean and Vietnamese it does not: typed as usual (NFC), `デフレ脱却` is cut into `デ`, `フレ`, `脱`, `却`, while the stored text was cut into `テ`, `゙`, `フレ`, `脱`, `却`; only the NFKD query gives the tokens of the passages. `normalize_query=False` embeds the query as typed; it is for a collection whose passages were embedded in another form. This is a parameter of `search`, not a setting.
+
+**Errors.** `SearchError` (a `ValueError` and a `RagEngineError`) for a bad argument or filter, raised before anything is embedded or sent. A refused API key is a `QdrantAuthError`. Everything else — an error of the embedder, a missing collection, an unreachable server — reaches the caller unchanged.
+
+**Versions.** Search uses Qdrant's query API: qdrant-client 1.10 or later, and a Qdrant server 1.10 or later.
 
 ## Supported formats and OCR
 
