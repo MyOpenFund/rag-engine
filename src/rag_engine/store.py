@@ -223,8 +223,10 @@ class QdrantStore:
         info = self._create(name, dim)
         if info is not None:
             _check_vectors(name, dim, info.config.params.vectors)
-            logger.info("Create of Qdrant collection %r reported an error, but the collection exists and matches",
-                        name)
+            logger.info(
+                "Create of Qdrant collection %r reported an error, but the collection exists and matches",
+                name,
+            )
 
     def _create(self, name: str, dim: int) -> Any:
         """Create the collection.

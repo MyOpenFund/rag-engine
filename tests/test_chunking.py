@@ -794,7 +794,9 @@ def _page_lines(number, count=45):
     than one chunk holds, so every page gets a chunk of its own.
     """
     rng = random.Random(number)
-    return [f"P{number}L{i} " + " ".join(rng.choice(WORDS) for _ in range(8)) + "." for i in range(1, count + 1)]
+    return [
+        f"P{number}L{i} " + " ".join(rng.choice(WORDS) for _ in range(8)) + "." for i in range(1, count + 1)
+    ]
 
 
 @needs_ingest
@@ -961,7 +963,9 @@ def _pristine_pdf_parser():
     """
     import chunknorris.parsers.pdf.pdf_parser as live
 
-    spec = importlib.util.spec_from_file_location("chunknorris.parsers.pdf._pristine_pdf_parser", live.__file__)
+    spec = importlib.util.spec_from_file_location(
+        "chunknorris.parsers.pdf._pristine_pdf_parser", live.__file__
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.PdfParser
@@ -1044,7 +1048,9 @@ def test_real_library_defaults_are_the_values_passed_explicitly(real):
     from chunknorris.parsers import PdfParser
 
     def defaults(callable_):
-        return {name: p.default for name, p in inspect.signature(callable_).parameters.items() if name != "self"}
+        return {
+            name: p.default for name, p in inspect.signature(callable_).parameters.items() if name != "self"
+        }
 
     chunker = defaults(MarkdownChunker.__init__)
     options = ChunkingOptions()
@@ -1074,7 +1080,8 @@ def test_real_markdown_default_chunks_are_those_of_the_library_defaults(real, tm
     path.write_text(text, encoding="utf-8")
 
     expected = [
-        Chunk(c.get_text(), c.start_page) for c in MarkdownChunker().chunk(MarkdownParser().parse_string(text))
+        Chunk(c.get_text(), c.start_page)
+        for c in MarkdownChunker().chunk(MarkdownParser().parse_string(text))
     ]
     assert len(expected) >= 3
     assert chunk_file(path) == expected
@@ -1115,7 +1122,9 @@ def test_real_lower_maximum_gives_more_chunks(real, tmp_path):
     path = tmp_path / "long.txt"
     path.write_text("\n\n".join(" ".join(_page_lines(i, 6)) for i in range(1, 9)) + "\n", encoding="utf-8")
     default = chunk_file(path)
-    smaller = chunk_file(path, options=ChunkingOptions(max_chunk_word_count=60, hard_max_chunk_word_count=120))
+    smaller = chunk_file(
+        path, options=ChunkingOptions(max_chunk_word_count=60, hard_max_chunk_word_count=120)
+    )
     assert len(smaller) > len(default)
 
 
@@ -1126,7 +1135,9 @@ def test_real_pptx(real, tmp_path):
     presentation = pptx.Presentation()
     slide = presentation.slides.add_slide(presentation.slide_layouts[1])
     slide.shapes.title.text = "Quarterly review"
-    slide.placeholders[1].text = (
+    slide.placeholders[
+        1
+    ].text = (
         "Reserves rose during the quarter, while the policy rate and the balance sheet were left unchanged."
     )
     path = tmp_path / "deck.pptx"

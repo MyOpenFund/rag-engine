@@ -137,16 +137,18 @@ def built(monkeypatch):
 
 
 def test_explicit_arguments_win_over_settings(built):
-    settings = Settings(qdrant_host="from-settings", qdrant_port=1111, qdrant_api_key="settings-key",
-                        qdrant_https=False)
+    settings = Settings(
+        qdrant_host="from-settings", qdrant_port=1111, qdrant_api_key="settings-key", qdrant_https=False
+    )
     store = QdrantStore("explicit-host", 2222, SECRET, True, 5, settings=settings)
     assert built == [{"host": "explicit-host", "port": 2222, "api_key": SECRET, "https": True, "timeout": 5}]
     assert (store.host, store.port) == ("explicit-host", 2222)
 
 
 def test_settings_fill_what_is_not_given(built):
-    settings = Settings(qdrant_host="from-settings", qdrant_port=1111, qdrant_api_key=SECRET,
-                        qdrant_https=True)
+    settings = Settings(
+        qdrant_host="from-settings", qdrant_port=1111, qdrant_api_key=SECRET, qdrant_https=True
+    )
     store = QdrantStore(settings=settings)
     assert built == [{"host": "from-settings", "port": 1111, "api_key": SECRET, "https": True, "timeout": 60}]
     assert (store.host, store.port) == ("from-settings", 1111)
@@ -242,7 +244,9 @@ def test_an_injected_client_store_keeps_no_settings():
 # --- from_url ---------------------------------------------------------------
 def test_from_url_reads_host_port_and_scheme(built):
     store = QdrantStore.from_url("https://qdrant.example:8443", SECRET, settings=Settings())
-    assert built == [{"host": "qdrant.example", "port": 8443, "api_key": SECRET, "https": True, "timeout": 60}]
+    assert built == [
+        {"host": "qdrant.example", "port": 8443, "api_key": SECRET, "https": True, "timeout": 60}
+    ]
     assert (store.host, store.port) == ("qdrant.example", 8443)
 
 
@@ -258,8 +262,14 @@ def test_from_url_without_a_port_uses_the_qdrant_default(built):
 
 @pytest.mark.parametrize(
     "url",
-    ["qdrant.example:6333", "ftp://qdrant.example", "http://", "http://h:6333/prefix", "http://h:notaport",
-     "http://h:6333?x=1"],
+    [
+        "qdrant.example:6333",
+        "ftp://qdrant.example",
+        "http://",
+        "http://h:6333/prefix",
+        "http://h:notaport",
+        "http://h:6333?x=1",
+    ],
 )
 def test_from_url_refuses_what_it_cannot_honour(built, url):
     with pytest.raises(ValueError, match="URL"):
@@ -285,7 +295,9 @@ def test_from_url_refuses_whitespace_and_control_characters_in_the_host(built, h
     assert built == []
 
 
-@pytest.mark.parametrize("url", ["http://qdrant.example:6333\n", "\thttp://qdrant.example:6333", "http://h:63\n33"])
+@pytest.mark.parametrize(
+    "url", ["http://qdrant.example:6333\n", "\thttp://qdrant.example:6333", "http://h:63\n33"]
+)
 def test_from_url_refuses_whitespace_anywhere_rather_than_dropping_it(built, url):
     with pytest.raises(ValueError, match="URL"):
         QdrantStore.from_url(url, settings=Settings())
@@ -300,7 +312,9 @@ def test_from_url_refuses_port_zero(built, url):
     assert built == []
 
 
-@pytest.mark.parametrize("url", ["http://[::1", "http://::1:6333", "http://[::1]x:6333", "http://[not-an-address]:6333"])
+@pytest.mark.parametrize(
+    "url", ["http://[::1", "http://::1:6333", "http://[::1]x:6333", "http://[not-an-address]:6333"]
+)
 def test_from_url_refuses_a_malformed_ipv6_literal(built, url):
     with pytest.raises(ValueError, match="URL"):
         QdrantStore.from_url(url, settings=Settings())
@@ -366,7 +380,9 @@ def test_the_real_client_reaches_a_server_on_an_ipv6_loopback():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        store = QdrantStore.from_url(f"http://[::1]:{server.server_address[1]}", timeout=5, settings=Settings())
+        store = QdrantStore.from_url(
+            f"http://[::1]:{server.server_address[1]}", timeout=5, settings=Settings()
+        )
         assert store.is_reachable() is True
     finally:
         server.shutdown()
@@ -449,8 +465,9 @@ def test_a_failed_existence_check_is_raised_and_never_read_as_absent(error):
     assert client.named("create_collection") == []
 
 
-@pytest.mark.parametrize("error", [ConnectionError("gone"), http_error(500), http_error(404)],
-                         ids=["connection", "500", "404"])
+@pytest.mark.parametrize(
+    "error", [ConnectionError("gone"), http_error(500), http_error(404)], ids=["connection", "500", "404"]
+)
 def test_a_failed_read_of_an_existing_collection_is_raised_and_nothing_is_created(error):
     store, client = fake_store(exists=True, get=error)
     with pytest.raises(type(error)) as info:
@@ -465,8 +482,9 @@ def test_a_refused_api_key_is_a_clear_error(status, where):
     error = http_error(status, body=b'{"status":{"error":"Invalid API key"}}')
     script = {"exists": error} if where == "exists" else {"exists": where == "get", where: error}
     store, client = fake_store(vectors=unnamed(8), **script)
-    with pytest.raises(QdrantAuthError,
-                       match=rf"^Qdrant refused the request \(HTTP {status}\): check QDRANT_API_KEY$") as info:
+    with pytest.raises(
+        QdrantAuthError, match=rf"^Qdrant refused the request \(HTTP {status}\): check QDRANT_API_KEY$"
+    ) as info:
         store.ensure_collection("c", 8)
     assert info.value.__cause__ is error
     if where != "create":
@@ -477,8 +495,11 @@ def test_a_refused_api_key_is_a_clear_error(status, where):
 
 
 # --- the creation race --------------------------------------------------------
-@pytest.mark.parametrize("error", [http_error(409), http_error(400), ValueError("Collection c already exists")],
-                         ids=["409", "400", "local"])
+@pytest.mark.parametrize(
+    "error",
+    [http_error(409), http_error(400), ValueError("Collection c already exists")],
+    ids=["409", "400", "local"],
+)
 def test_losing_the_creation_race_is_not_fatal(error):
     store, client = fake_store(exists=[False, True], vectors=unnamed(8), create=error)
     store.ensure_collection("c", 8)
@@ -486,9 +507,12 @@ def test_losing_the_creation_race_is_not_fatal(error):
     assert client.named("get_collection") == [("get_collection", "c")]
 
 
-@pytest.mark.parametrize("error", [TimeoutError("timed out"), http_error(500), http_error(409)],
-                         ids=["timeout", "500", "409"])
-def test_a_failed_create_that_left_a_matching_collection_is_logged_without_guessing_who_created_it(error, caplog):
+@pytest.mark.parametrize(
+    "error", [TimeoutError("timed out"), http_error(500), http_error(409)], ids=["timeout", "500", "409"]
+)
+def test_a_failed_create_that_left_a_matching_collection_is_logged_without_guessing_who_created_it(
+    error, caplog
+):
     store, _client = fake_store(exists=[False, True], vectors=unnamed(8), create=error)
     with caplog.at_level("INFO", logger="rag_engine.store"):
         store.ensure_collection("c", 8)
@@ -517,8 +541,9 @@ def test_the_race_winner_with_named_vectors_is_refused():
         store.ensure_collection("c", 8)
 
 
-@pytest.mark.parametrize("error", [http_error(409), http_error(500), ConnectionError("gone")],
-                         ids=["409", "500", "connection"])
+@pytest.mark.parametrize(
+    "error", [http_error(409), http_error(500), ConnectionError("gone")], ids=["409", "500", "connection"]
+)
 def test_a_failed_create_that_left_no_collection_is_raised_unchanged(error):
     store, _client = fake_store(exists=[False, False], create=error)
     with pytest.raises(type(error)) as info:
@@ -674,8 +699,9 @@ def test_upsert_refused_api_key_is_a_clear_error(status):
     assert info.value.__cause__ is error
 
 
-@pytest.mark.parametrize("error", [http_error(500), http_error(404), ConnectionError("gone")],
-                         ids=["500", "404", "connection"])
+@pytest.mark.parametrize(
+    "error", [http_error(500), http_error(404), ConnectionError("gone")], ids=["500", "404", "connection"]
+)
 def test_upsert_other_errors_are_raised_unchanged(error):
     store, client = fake_store(upsert=error)
     with pytest.raises(type(error)) as info:
@@ -697,8 +723,11 @@ class FailingFrom(FakeClient):
             raise self._error
 
 
-@pytest.mark.parametrize("error", [http_error(500), ConnectionError("gone"), TimeoutError("timed out")],
-                         ids=["500", "connection", "timeout"])
+@pytest.mark.parametrize(
+    "error",
+    [http_error(500), ConnectionError("gone"), TimeoutError("timed out")],
+    ids=["500", "connection", "timeout"],
+)
 def test_upsert_failure_on_the_second_batch_tells_how_many_points_were_written(error):
     client = FailingFrom(1, error)
     store = QdrantStore(client=client, settings=Settings())
@@ -823,8 +852,11 @@ def test_is_reachable_true_when_the_server_answers(memory_store):
     assert memory_store.is_reachable() is True
 
 
-@pytest.mark.parametrize("error", [ConnectionError("refused"), http_error(401), http_error(500), ValueError("x")],
-                         ids=["connection", "401", "500", "other"])
+@pytest.mark.parametrize(
+    "error",
+    [ConnectionError("refused"), http_error(401), http_error(500), ValueError("x")],
+    ids=["connection", "401", "500", "other"],
+)
 def test_is_reachable_false_and_silent_on_any_failure(error, caplog, capsys):
     class Down(FakeClient):
         def get_collections(self):

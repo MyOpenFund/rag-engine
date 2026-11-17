@@ -65,7 +65,9 @@ def test_page_for_id_maps_none_to_zero():
 
 
 def test_unpaginated_chunk_uses_page_zero_in_id_but_no_page_in_payload():
-    payload = build_payload("d1", {}, filename="a.md", chunk_number=0, ingestion_date="t", text="x", page=None)
+    payload = build_payload(
+        "d1", {}, filename="a.md", chunk_number=0, ingestion_date="t", text="x", page=None
+    )
     assert "page" not in payload
     assert point_id("d1", page_for_id(None), 0) == point_id("d1", 0, 0)
 
@@ -132,7 +134,9 @@ def test_build_payload_without_page_has_no_page_key():
 
 def test_build_payload_keeps_unknown_metadata_keys_and_partial_metadata():
     # The vault row's `extra` adds arbitrary keys; null columns (e.g. `date`) are simply absent.
-    payload = build_payload("d1", {"corpus": "c", "series": "WP", "tags": ["a", "b"]}, **ENGINE_FIELDS, page=1)
+    payload = build_payload(
+        "d1", {"corpus": "c", "series": "WP", "tags": ["a", "b"]}, **ENGINE_FIELDS, page=1
+    )
     assert payload["series"] == "WP"
     assert payload["tags"] == ["a", "b"]
     assert "date" not in payload
@@ -167,7 +171,9 @@ def test_build_payload_rejects_reserved_key_even_with_equal_value_or_none():
 
 def test_build_payload_names_every_offending_key():
     with pytest.raises(ValueError) as excinfo:
-        build_payload("d1", {"text": "t", "doc_id": "other", "page": 9, "title": "ok"}, **ENGINE_FIELDS, page=1)
+        build_payload(
+            "d1", {"text": "t", "doc_id": "other", "page": 9, "title": "ok"}, **ENGINE_FIELDS, page=1
+        )
     message = str(excinfo.value)
     for key in ("text", "doc_id", "page"):
         assert key in message
@@ -202,7 +208,17 @@ def test_module_docstring_documents_schema_v1():
     doc = schema.__doc__
     for key in RESERVED_KEYS:
         assert f"``{key}``" in doc
-    for key in ("corpus", "source_code", "doc_type", "title", "date", "year", "language", "sha256", "provenance"):
+    for key in (
+        "corpus",
+        "source_code",
+        "doc_type",
+        "title",
+        "date",
+        "year",
+        "language",
+        "sha256",
+        "provenance",
+    ):
         assert f"``{key}``" in doc
     assert "publication" in doc
 
