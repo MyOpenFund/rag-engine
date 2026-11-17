@@ -10,9 +10,10 @@ works if both backends give the same vector for the same text. This file measure
   same, in the same order, whether the query is embedded with onnx or with torch, the chunks
   being embedded with torch in both cases.
 
-The onnx vectors must come from the ONNX file the engine pins (``ONNX_MODELS``: one revision,
-one SHA-256), or the measure would say nothing about the file production loads. So the file
-the embedder loaded is hashed again here, and a copy of it with one byte changed must be
+The onnx vectors must come from the files the engine pins (``ONNX_MODELS``: one revision, and
+one SHA-256 per file — the ONNX file, the tokenizer, the configuration), or the measure would
+say nothing about what production loads. So the files the embedder loaded are hashed again
+here, and a copy with one byte changed, in the ONNX file or in ``tokenizer.json``, must be
 refused before any inference.
 
 It needs both extras (``rag-engine[torch,onnx]``) and the model files, which are downloaded on
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import os
 import shutil
 import time
 import unicodedata
@@ -318,6 +320,18 @@ def test_the_onnx_vectors_come_from_the_pinned_file_on_cpu(vectors):
         f"\nonnx vectors computed from {path}\n  revision {pinned.revision}, {pinned.size} bytes, "
         f"sha256 {hasher.hexdigest()} (hashed in {elapsed:.2f} s), providers {loaded['providers']}"
     )
+    # The tokenizer and configuration files next to it are those of the table too.
+    directory = path.parents[len(pinned.model_file.split("/")) - 1]
+    assert set(pinned.files) == {pinned.model_file, *embedding_mod._ONNX_SUPPORT_FILES}
+    print("  files of the model, as found on disk:")
+    for file, (expected, size) in pinned.files.items():
+        found = (
+            hashlib.sha256((directory / file).read_bytes()).hexdigest()
+            if file != pinned.model_file
+            else hasher.hexdigest()
+        )
+        print(f"    {file}: {(directory / file).stat().st_size} bytes, sha256 {found}")
+        assert (found, (directory / file).stat().st_size) == (expected, size), file
 
 
 @pytest.mark.models
@@ -364,9 +378,64 @@ def test_an_altered_onnx_file_is_refused_before_any_inference(vectors, tmp_path,
     print("\n" + message)
     assert f"Expected sha256 {pinned.sha256}" in message
     assert str(altered) in message
+    assert f"the file {pinned.model_file!r}" in message
     assert "parity must be re-measured" in message
     found = message.split("found sha256 ")[1][:64]
     assert found != pinned.sha256 and len(set(found) - set("0123456789abcdef")) == 0
+
+
+@pytest.mark.models
+def test_an_altered_tokenizer_file_is_refused_before_any_inference(vectors, tmp_path, monkeypatch):
+    fastembed = pytest.importorskip("fastembed")
+    loaded = vectors["onnx_model"]
+    pinned = ONNX_MODELS[loaded["name"]]
+    source = loaded["path"].parents[len(pinned.model_file.split("/")) - 1]  # snapshots/<revision>
+    # A model directory of its own. The ONNX file is the real one, through a link (it is not
+    # copied a second time); the small files are copied, and one byte of tokenizer.json is
+    # changed (same size, so only the hash can tell).
+    copy = tmp_path / source.parents[1].name / "snapshots" / pinned.revision
+    for file in pinned.files:
+        (copy / file).parent.mkdir(parents=True, exist_ok=True)
+        if file != pinned.model_file:
+            shutil.copyfile(source / file, copy / file)
+            continue
+        try:
+            os.symlink(os.path.realpath(source / file), copy / file)
+        except OSError:  # no right to create links (Windows): a copy, about 1.1 GB
+            shutil.copyfile(source / file, copy / file)
+    altered = copy / "tokenizer.json"
+    expected, size = pinned.files["tokenizer.json"]
+    with open(altered, "r+b") as stream:
+        stream.seek(size // 2)
+        byte = stream.read(1)
+        stream.seek(size // 2)
+        stream.write(bytes([byte[0] ^ 0x01]))
+    assert altered.stat().st_size == size
+
+    def no_model(*args, **kwargs):
+        raise AssertionError("the model must not be built with a file that failed the hash check")
+
+    monkeypatch.setattr(fastembed.TextEmbedding, "__init__", no_model)
+    spec = ModelSpec.from_settings(Settings.from_env())
+    with pytest.raises(ModelIntegrityError) as caught:
+        OnnxEmbedder(spec, cache_dir=tmp_path)
+    message = str(caught.value)
+    print("\n" + message)
+    assert "the file 'tokenizer.json'" in message
+    assert str(altered) in message
+    assert f"Expected sha256 {expected} ({size} bytes)" in message
+    assert pinned.sha256 not in message  # the ONNX file passed: it is not the one blamed
+    assert "parity must be re-measured" in message
+    found = message.split("found sha256 ")[1][:64]
+    assert found == hashlib.sha256(altered.read_bytes()).hexdigest() != expected
+
+    # With the pinned tokenizer back in place, the same directory is accepted.
+    shutil.copyfile(source / "tokenizer.json", altered)
+    monkeypatch.undo()
+    with OnnxEmbedder(spec, cache_dir=tmp_path) as embedder:
+        assert embedder.model_path == copy / pinned.model_file
+        assert embedder.model_sha256 == pinned.sha256
+        assert np.allclose(embedder.encode_query(QUERIES[0]), vectors["onnx"]["search"][0], atol=1e-6)
 
 
 def describe(text: str) -> str:

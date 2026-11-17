@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -642,16 +643,28 @@ LISTED_SPEC = ModelSpec(name="listed/model", dim=8, passage_prefix="passage: ", 
 CPU_ONLY = ["CPUExecutionProvider"]
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 ONNX_BYTES = b"the bytes of a stub ONNX export"
-SUPPORT_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]
+# The files fastembed reads next to the ONNX file, in the order the engine asks for them.
+SUPPORT_FILES = ["config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json"]
+SUPPORT_BYTES = {name: f'{{"stub of": "{name}"}}'.encode() for name in SUPPORT_FILES}
+PINNED_FILES = ["onnx/model.onnx", *SUPPORT_FILES]
 
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def pinned(**changes):
-    """A table entry that pins the stub ONNX file; ``changes`` replace fields."""
-    fields = {"dim": 8, "revision": REVISION, "sha256": sha256(ONNX_BYTES), "size": len(ONNX_BYTES)}
+def pin(data: bytes) -> tuple[str, int]:
+    return sha256(data), len(data)
+
+
+def pinned(*, repin=None, **changes):
+    """A table entry that pins the stub files; ``changes`` replace fields.
+
+    ``repin`` replaces the pin of some files: ``{file: (sha256, size)}``.
+    """
+    content = {changes.get("model_file", "onnx/model.onnx"): ONNX_BYTES, **SUPPORT_BYTES}
+    files = {**{name: pin(data) for name, data in content.items()}, **(repin or {})}
+    fields = {"dim": 8, "revision": REVISION, "files": files}
     return embedding_mod.OnnxModel(**{**fields, **changes})
 
 
@@ -663,7 +676,7 @@ class StubHub:
     """
 
     def __init__(self):
-        self.content = {"onnx/model.onnx": ONNX_BYTES, **{name: b"{}" for name in SUPPORT_FILES}}
+        self.content = {"onnx/model.onnx": ONNX_BYTES, **SUPPORT_BYTES}
         self.online = True
         self.calls: list[dict] = []
 
@@ -776,7 +789,7 @@ def fastembed_stub(monkeypatch, tmp_path):
 
     With it come a fake ``huggingface_hub`` (``fastembed_stub.hub``), a default model directory
     under ``tmp_path`` (``fastembed_stub.default_cache``), and a table entry for the real model
-    name that pins the stub ONNX file.
+    name that pins the stub files.
     """
     fastembed = types.ModuleType("fastembed")
     fastembed.TextEmbedding = StubTextEmbedding
@@ -804,7 +817,7 @@ def fastembed_stub(monkeypatch, tmp_path):
     monkeypatch.setattr(StubTextEmbedding, "default_cache", default_cache, raising=False)
     monkeypatch.setattr(embedding_mod, "_sha256_cache", {})
     # The table entry of the real model, with the small dimension of the stub rows and the
-    # hash of the stub file.
+    # hashes of the stub files.
     monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {E5: pinned()})
     return StubTextEmbedding
 
@@ -812,19 +825,45 @@ def fastembed_stub(monkeypatch, tmp_path):
 def test_the_table_pins_the_export_of_e5_base_whose_parity_was_measured():
     known = embedding_mod.ONNX_MODELS[E5]
     # The full-precision export, mean pooling over the attention mask, unit-length vectors;
-    # the revision, hash and size of the file the parity numbers of the README were measured on.
+    # the revision, and the hash and size of every file the parity numbers of the README were
+    # measured with: the ONNX file, and the tokenizer and configuration files.
     assert known == embedding_mod.OnnxModel(
         dim=768,
         revision="d128750597153bb5987e10b1c3493a34e5a4502a",
-        sha256="84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa",
-        size=1_110_059_084,
+        files={
+            "onnx/model.onnx": (
+                "84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa",
+                1_110_059_084,
+            ),
+            "config.json": ("9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4", 694),
+            "special_tokens_map.json": (
+                "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+                280,
+            ),
+            "tokenizer.json": (
+                "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+                17_082_660,
+            ),
+            "tokenizer_config.json": (
+                "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15",
+                418,
+            ),
+        },
         model_file="onnx/model.onnx",
         pooling="mean",
         normalization=True,
         hf=None,
     )
+    assert known.sha256 == "84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa"
+    assert known.size == 1_110_059_084
     with pytest.raises(TypeError):
         embedding_mod.ONNX_MODELS["other/model"] = known  # type: ignore[index]
+
+
+def test_a_table_entry_pins_every_file_the_engine_requires():
+    for known in embedding_mod.ONNX_MODELS.values():
+        assert set(known.files) == {known.model_file, *SUPPORT_FILES}
+    assert set(embedding_mod._ONNX_SUPPORT_FILES) == set(SUPPORT_FILES)
 
 
 def test_a_table_entry_cannot_be_written_without_its_pin():
@@ -832,29 +871,107 @@ def test_a_table_entry_cannot_be_written_without_its_pin():
         embedding_mod.OnnxModel(dim=8)
     with pytest.raises(TypeError):
         embedding_mod.OnnxModel(dim=8, revision=REVISION)
+    with pytest.raises(TypeError):
+        embedding_mod.OnnxModel(dim=8, files=pinned().files)
+
+
+@pytest.mark.parametrize("revision", ["main", REVISION[:12], REVISION.upper(), None])
+def test_a_table_entry_refuses_a_revision_that_is_not_a_full_commit_hash(revision):
+    with pytest.raises(ValueError, match=r"OnnxModel: revision "):
+        pinned(revision=revision)
+
+
+@pytest.mark.parametrize("files", [None, [], "onnx/model.onnx", [("onnx/model.onnx", pin(ONNX_BYTES))], {}])
+def test_a_table_entry_refuses_files_that_are_not_a_mapping_with_entries(files):
+    with pytest.raises(ValueError, match=r"OnnxModel: files must be a non-empty mapping"):
+        pinned(files=files)
+
+
+@pytest.mark.parametrize("missing", PINNED_FILES)
+def test_a_table_entry_refuses_to_leave_a_required_file_without_a_pin(missing):
+    files = dict(pinned().files)
+    del files[missing]
+    with pytest.raises(ValueError, match=rf"OnnxModel: files has no entry for {re.escape(repr(missing))}"):
+        pinned(files=files)
+
+
+def test_a_table_entry_must_pin_the_onnx_file_it_names():
+    with pytest.raises(ValueError, match=r"OnnxModel: files has no entry for 'onnx/other\.onnx'"):
+        embedding_mod.OnnxModel(dim=8, revision=REVISION, files=pinned().files, model_file="onnx/other.onnx")
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("revision", "main"),
-        ("revision", REVISION[:12]),
-        ("revision", REVISION.upper()),
-        ("revision", None),
-        ("sha256", "84a4d426"),
-        ("sha256", "g" * 64),
-        ("sha256", "A" * 64),
-        ("sha256", 5),
-        ("size", 0),
-        ("size", -1),
-        ("size", True),
-        ("size", 1.5),
-        ("size", "1110059084"),
-    ],
+    "name",
+    ["", "  ", "/etc/passwd", "../tokenizer.json", "onnx/../../x", "onnx\\model.onnx", "onnx//x", 5, None],
 )
-def test_a_table_entry_refuses_a_pin_of_another_form(field, value):
-    with pytest.raises(ValueError, match=rf"OnnxModel: {field} "):
-        pinned(**{field: value})
+def test_a_table_entry_refuses_a_file_name_that_is_not_a_path_inside_the_repository(name):
+    with pytest.raises(ValueError, match=r"OnnxModel: files: .* is not the path of a file"):
+        pinned(repin={name: pin(b"x")})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa",
+        ("0" * 64,),
+        ("0" * 64, 5, 5),
+        ("84a4d426", 5),
+        ("g" * 64, 5),
+        ("A" * 64, 5),
+        (5, 5),
+        (5, "0" * 64),
+        ("0" * 64, 0),
+        ("0" * 64, -1),
+        ("0" * 64, True),
+        ("0" * 64, 1.5),
+        ("0" * 64, "1110059084"),
+    ],
+    ids=repr,
+)
+@pytest.mark.parametrize("file", ["onnx/model.onnx", "tokenizer.json"])
+def test_a_table_entry_refuses_a_pin_of_another_form(file, value):
+    with pytest.raises(ValueError, match=rf"OnnxModel: files\[{re.escape(repr(file))}\] must be"):
+        pinned(repin={file: value})
+
+
+def test_a_table_entry_keeps_its_own_read_only_copy_of_the_files():
+    given = dict(pinned().files)
+    entry = pinned(files=given)
+    given["tokenizer.json"] = ("0" * 64, 1)
+    given["extra.json"] = ("0" * 64, 1)
+    assert entry.files["tokenizer.json"] == pin(SUPPORT_BYTES["tokenizer.json"])
+    assert "extra.json" not in entry.files
+    with pytest.raises(TypeError):
+        entry.files["tokenizer.json"] = ("0" * 64, 1)  # type: ignore[index]
+    assert all(type(value) is tuple for value in entry.files.values())
+
+
+def test_a_table_entry_does_not_depend_on_the_order_the_files_were_written_in():
+    files = pinned().files
+    backwards = pinned(files=dict(reversed(list(files.items()))))
+    assert backwards == pinned()
+    assert hash(backwards) == hash(pinned())
+    assert repr(backwards) == repr(pinned())
+    # The ONNX file first, then the others by name.
+    assert list(backwards.files) == PINNED_FILES
+    assert pinned(repin={"tokenizer.json": ("0" * 64, 1)}) != pinned()
+    assert (pinned().sha256, pinned().size) == pin(ONNX_BYTES)
+
+
+def test_a_table_entry_may_pin_more_files_than_the_required_ones(fastembed_stub, monkeypatch):
+    extra = b"weights kept outside the ONNX file"
+    entry = pinned(repin={"onnx/model.onnx_data": pin(extra)})
+    assert list(entry.files) == ["onnx/model.onnx", *sorted([*SUPPORT_FILES, "onnx/model.onnx_data"])]
+    monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {E5: entry})
+    fastembed_stub.hub.content["onnx/model.onnx_data"] = extra
+    OnnxEmbedder(E5_SPEC)
+    assert fastembed_stub.hub.calls[-1]["allow_patterns"] == list(entry.files)
+    # It is downloaded with the others, and verified like them.
+    path = snapshot(fastembed_stub.default_cache) / "onnx/model.onnx_data"
+    path.write_bytes(extra[:-1] + b"?")
+    with pytest.raises(ModelIntegrityError, match=r"'onnx/model\.onnx_data'"):
+        OnnxEmbedder(E5_SPEC)
 
 
 def test_onnx_embedder_satisfies_the_protocol(fastembed_stub):
@@ -882,6 +999,7 @@ def test_onnx_registers_a_pinned_model_under_a_name_of_the_engine(fastembed_stub
 def test_onnx_registration_follows_the_table(fastembed_stub, monkeypatch):
     entry = pinned(model_file="onnx/other.onnx", pooling="cls", normalization=False, hf="mirror/repo")
     monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {"acme/model": entry})
+    assert list(entry.files) == ["onnx/other.onnx", *SUPPORT_FILES]
     fastembed_stub.hub.content["onnx/other.onnx"] = ONNX_BYTES
     embedder = OnnxEmbedder(ModelSpec("acme/model", 8, "", ""))
     (registration,) = fastembed_stub.registrations
@@ -964,7 +1082,7 @@ def test_onnx_downloads_the_pinned_revision_when_the_cache_is_empty(fastembed_st
     wanted = {
         "repo_id": E5,
         "revision": REVISION,
-        "allow_patterns": ["onnx/model.onnx", *SUPPORT_FILES],
+        "allow_patterns": PINNED_FILES,
         "cache_dir": cache,
     }
     # The cache is asked first, without the network; then the Hub, for the same files.
@@ -1036,48 +1154,90 @@ def test_onnx_without_huggingface_hub_tells_which_extra_to_install(fastembed_stu
         OnnxEmbedder(E5_SPEC)
 
 
-def test_onnx_a_file_with_another_hash_is_refused_before_the_model_is_loaded(fastembed_stub):
-    altered = ONNX_BYTES[:-1] + b"?"  # same size, one byte changed
-    fastembed_stub.hub.content["onnx/model.onnx"] = altered
+def altered_bytes(file: str) -> bytes:
+    """The content of a stub file with its last byte changed: same size, another hash."""
+    original = StubHub().content[file]
+    return original[:-1] + (b"?" if original[-1:] != b"?" else b"!")
+
+
+@pytest.mark.parametrize("file", PINNED_FILES)
+def test_onnx_a_file_with_another_hash_is_refused_before_the_model_is_loaded(fastembed_stub, file):
+    original, altered = fastembed_stub.hub.content[file], altered_bytes(file)
+    fastembed_stub.hub.content[file] = altered
     with pytest.raises(ModelIntegrityError) as caught:
         OnnxEmbedder(E5_SPEC)
     message = str(caught.value)
     assert repr(E5) in message
-    assert f"Expected sha256 {sha256(ONNX_BYTES)}" in message
+    # The file is named, as it is in the table and where it is on disk.
+    assert f"the file {file!r}" in message
+    assert str(snapshot(fastembed_stub.default_cache) / file) in message
+    assert f"Expected sha256 {sha256(original)}" in message
     assert f"found sha256 {sha256(altered)}" in message
     assert REVISION in message
-    assert str(snapshot(fastembed_stub.default_cache) / "onnx/model.onnx") in message
     assert "parity must be re-measured" in message and "ONNX_MODELS" in message
+    # No other file is blamed.
+    assert [name for name in PINNED_FILES if f"the file {name!r}" in message] == [file]
     # Nothing was registered with fastembed, and no model was built: no inference is possible.
     assert fastembed_stub.registrations == []
     assert fastembed_stub.instances == []
 
 
-def test_onnx_a_file_altered_in_the_cache_is_refused_on_the_next_load(fastembed_stub):
+@pytest.mark.parametrize("file", PINNED_FILES)
+def test_onnx_a_file_altered_in_the_cache_is_refused_on_the_next_load(fastembed_stub, file):
     OnnxEmbedder(E5_SPEC)
-    path = snapshot(fastembed_stub.default_cache) / "onnx/model.onnx"
-    path.write_bytes(b"X" + ONNX_BYTES[1:])
+    path = snapshot(fastembed_stub.default_cache) / file
+    path.write_bytes(altered_bytes(file))
     stat = path.stat()
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
-    with pytest.raises(ModelIntegrityError):
+    with pytest.raises(ModelIntegrityError, match=re.escape(f"the file {file!r}")):
         OnnxEmbedder(E5_SPEC)
     assert len(fastembed_stub.instances) == 1
 
 
-def test_onnx_a_file_of_another_size_is_refused(fastembed_stub):
-    fastembed_stub.hub.content["onnx/model.onnx"] = ONNX_BYTES + b"\0"
-    with pytest.raises(
-        ModelIntegrityError, match=rf"\({len(ONNX_BYTES)} bytes\).*\({len(ONNX_BYTES) + 1} bytes\)"
-    ):
+@pytest.mark.parametrize("file", PINNED_FILES)
+def test_onnx_a_file_of_another_size_is_refused(fastembed_stub, file):
+    size = len(fastembed_stub.hub.content[file])
+    fastembed_stub.hub.content[file] += b"\0"
+    with pytest.raises(ModelIntegrityError, match=rf"\({size} bytes\).*\({size + 1} bytes\)") as caught:
         OnnxEmbedder(E5_SPEC)
+    assert f"the file {file!r}" in str(caught.value)
     assert fastembed_stub.instances == []
 
 
-def test_onnx_the_expected_hash_is_the_one_of_the_table(fastembed_stub, monkeypatch):
-    monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {E5: pinned(sha256="0" * 64)})
-    with pytest.raises(ModelIntegrityError, match=f"Expected sha256 {'0' * 64}"):
+@pytest.mark.parametrize("file", PINNED_FILES)
+def test_onnx_the_expected_hash_is_the_one_of_the_table(fastembed_stub, monkeypatch, file):
+    size = len(fastembed_stub.hub.content[file])
+    monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {E5: pinned(repin={file: ("0" * 64, size)})})
+    with pytest.raises(ModelIntegrityError, match=f"Expected sha256 {'0' * 64}") as caught:
         OnnxEmbedder(E5_SPEC)
+    assert f"the file {file!r}" in str(caught.value)
     assert fastembed_stub.instances == []
+
+
+def test_onnx_every_pinned_file_is_hashed_once_per_process(fastembed_stub, monkeypatch):
+    hashed: list[str] = []
+    real_open = open
+
+    def recording_open(path, *args, **kwargs):
+        hashed.append(os.fspath(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(embedding_mod, "open", recording_open, raising=False)
+    first = OnnxEmbedder(E5_SPEC)
+    directory = snapshot(fastembed_stub.default_cache)
+    expected = [os.path.realpath(directory / file) for file in PINNED_FILES]
+    assert hashed == expected
+    assert sorted(key[0] for key in embedding_mod._sha256_cache) == sorted(expected)
+    second = OnnxEmbedder(E5_SPEC)
+    assert hashed == expected
+    assert first.model_sha256 == second.model_sha256 == sha256(ONNX_BYTES)
+
+
+def test_onnx_the_log_says_how_many_files_were_verified(fastembed_stub, caplog):
+    with caplog.at_level(logging.INFO, logger="rag_engine.embedding"):
+        OnnxEmbedder(E5_SPEC)
+    (line,) = [record.getMessage() for record in caplog.records if "verified" in record.getMessage()]
+    assert REVISION in line and sha256(ONNX_BYTES) in line and "5 files" in line
 
 
 def test_the_hash_of_a_file_is_computed_once_for_a_path_size_and_mtime(tmp_path, monkeypatch):

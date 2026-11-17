@@ -14,8 +14,9 @@ Backends:
 
 * :class:`TorchEmbedder` — sentence-transformers, extra ``rag-engine[torch]``;
 * :class:`OnnxEmbedder` — fastembed on the ONNX runtime (CPU), without PyTorch, extra
-  ``rag-engine[onnx]``. The ONNX file of a model of :data:`ONNX_MODELS` is pinned to one
-  revision and checked against its SHA-256 before it is loaded;
+  ``rag-engine[onnx]``. The files of a model of :data:`ONNX_MODELS` (the ONNX file, the
+  tokenizer and the configuration) are pinned to one revision, and each is checked against
+  its SHA-256 before the model is loaded;
 * :class:`FakeEmbedder` — deterministic vectors without any model, for tests.
 
 :func:`make_embedder` builds the backend named by the settings. :func:`cosine_parity` compares
@@ -75,8 +76,8 @@ _ONNX_EXTRA = (
 class ModelIntegrityError(RagEngineError):
     """A model file is not the one the engine pins: its size or its SHA-256 differs.
 
-    Raised before the file is loaded. The message names the model, the file, the hash
-    expected and the hash found.
+    Raised before the model is loaded, for the ONNX file as for a tokenizer or configuration
+    file. The message names the model, the file, the hash expected and the hash found.
     """
 
 
@@ -354,6 +355,23 @@ class TorchEmbedder(BaseEmbedder):
         logger.info("Embedding model released")
 
 
+_ONNX_SUPPORT_FILES = ("config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json")
+"""Files fastembed reads next to the ONNX file. They decide the tokens, so the vectors."""
+
+_HEXADECIMAL = frozenset("0123456789abcdef")
+
+
+def _is_hexadecimal(value: object, length: int) -> bool:
+    return isinstance(value, str) and len(value) == length and not set(value) - _HEXADECIMAL
+
+
+def _is_repository_path(name: object) -> bool:
+    """Whether ``name`` is the path of a file inside a repository: relative, ``/``-separated."""
+    if not isinstance(name, str) or not name.strip() or "\\" in name:
+        return False
+    return all(part not in ("", ".", "..") for part in name.split("/"))
+
+
 @dataclass(frozen=True)
 class OnnxModel:
     """One ONNX export the engine vouches for: where it comes from, and how it is run.
@@ -363,11 +381,16 @@ class OnnxModel:
     ``revision``
         Commit of the Hugging Face repository the files are taken from: the full hash of 40
         hexadecimal digits, never a branch or a tag, which can move.
-    ``sha256``
-        SHA-256 of the ONNX file, 64 lower-case hexadecimal digits. The file is hashed before
-        it is loaded, and a different hash is a :class:`ModelIntegrityError`.
-    ``size``
-        Size of the ONNX file, in bytes.
+    ``files``
+        Every file the engine loads for the model: a mapping from the path of the file inside
+        the Hugging Face repository to the pair ``(sha256, size)`` — its SHA-256, 64 lower-case
+        hexadecimal digits, and its size in bytes. It must name ``model_file`` and the files
+        fastembed reads next to it: ``config.json``, ``special_tokens_map.json``,
+        ``tokenizer.json`` and ``tokenizer_config.json``. The tokenizer decides the vectors as
+        much as the weights do, so no file is trusted on its name. Every file is hashed
+        before the model is loaded, and a different hash or size is a
+        :class:`ModelIntegrityError`. A file listed beyond the required ones is fetched and
+        verified in the same way.
     ``model_file``
         Path of the ONNX file inside the Hugging Face repository.
     ``pooling``
@@ -376,34 +399,91 @@ class OnnxModel:
     ``normalization``
         Whether the vectors are scaled to unit length.
     ``hf``
-        Hugging Face repository holding the ONNX file; ``None`` for the model name itself.
+        Hugging Face repository holding the files; ``None`` for the model name itself.
 
-    ``revision``, ``sha256`` and ``size`` have no default: an export cannot be listed without
-    being pinned. A value of another form raises a ``ValueError`` naming the field.
+    ``revision`` and ``files`` have no default: an export cannot be listed without being
+    pinned. A value of another form, or a required file left out of ``files``, raises a
+    ``ValueError`` naming the field and the file.
 
-    **These three values identify the file whose vectors were compared with those of
-    sentence-transformers.** Change them only after the parity test (``pytest -m models``) has
-    passed on the new file.
+    ``files`` is kept as a read-only mapping of the entry's own, the ONNX file first and the
+    others by name, whatever the order they were given in. ``sha256`` and ``size`` are those
+    of the ONNX file.
+
+    **The revision and the files identify what the vectors compared with those of
+    sentence-transformers were computed with.** Change them only after the parity test
+    (``pytest -m models``) has passed on the new files.
     """
 
     dim: int
     revision: str
-    sha256: str
-    size: int
+    files: Mapping[str, tuple[str, int]]
     model_file: str = "onnx/model.onnx"
     pooling: str = "mean"
     normalization: bool = True
     hf: str | None = None
 
     def __post_init__(self) -> None:
-        for field, length in (("revision", 40), ("sha256", 64)):
-            value = getattr(self, field)
-            if not isinstance(value, str) or len(value) != length or set(value) - set("0123456789abcdef"):
+        if not _is_hexadecimal(self.revision, 40):
+            raise ValueError(
+                f"OnnxModel: revision must be 40 lower-case hexadecimal digits, got {self.revision!r}"
+            )
+        if not isinstance(self.files, Mapping) or not self.files:
+            raise ValueError(
+                "OnnxModel: files must be a non-empty mapping from the path of a file to its "
+                f"(sha256, size), got {self.files!r}"
+            )
+        for name, value in self.files.items():
+            if not _is_repository_path(name):
                 raise ValueError(
-                    f"OnnxModel: {field} must be {length} lower-case hexadecimal digits, got {value!r}"
+                    f"OnnxModel: files: {name!r} is not the path of a file inside the repository "
+                    "(relative, with '/' between its parts)"
                 )
-        if type(self.size) is not int or self.size < 1:
-            raise ValueError(f"OnnxModel: size must be a number of bytes of at least 1, got {self.size!r}")
+            if (
+                not isinstance(value, (tuple, list))
+                or len(value) != 2
+                or not _is_hexadecimal(value[0], 64)
+                or type(value[1]) is not int  # a bool is an int subclass, and is not a size
+                or value[1] < 1
+            ):
+                raise ValueError(
+                    f"OnnxModel: files[{name!r}] must be (sha256, size): 64 lower-case hexadecimal "
+                    f"digits and a number of bytes of at least 1, got {value!r}"
+                )
+        for required in (self.model_file, *_ONNX_SUPPORT_FILES):
+            if required not in self.files:
+                raise ValueError(
+                    f"OnnxModel: files has no entry for {required!r}: every file loaded for the model "
+                    "is pinned by its SHA-256 and its size"
+                )
+        # One order whatever was written, so that equal entries have the same repr (the
+        # registration name is derived from it): the ONNX file, then the others by name.
+        names = [self.model_file, *sorted(name for name in self.files if name != self.model_file)]
+        ordered = {name: (self.files[name][0], self.files[name][1]) for name in names}
+        object.__setattr__(self, "files", MappingProxyType(ordered))
+
+    def __hash__(self) -> int:
+        # Written out: the mapping of the files is not hashable by itself.
+        return hash(
+            (
+                self.dim,
+                self.revision,
+                tuple(self.files.items()),
+                self.model_file,
+                self.pooling,
+                self.normalization,
+                self.hf,
+            )
+        )
+
+    @property
+    def sha256(self) -> str:
+        """SHA-256 of the ONNX file."""
+        return self.files[self.model_file][0]
+
+    @property
+    def size(self) -> int:
+        """Size of the ONNX file, in bytes."""
+        return self.files[self.model_file][1]
 
 
 ONNX_MODELS: Mapping[str, OnnxModel] = MappingProxyType(
@@ -411,14 +491,34 @@ ONNX_MODELS: Mapping[str, OnnxModel] = MappingProxyType(
         # The full-precision export published in the model's own repository, with the pipeline
         # of sentence-transformers for this model: mean pooling, then normalisation. The
         # repository also holds quantised variants; they are not used.
-        # Parity with sentence-transformers was measured on exactly this file (cosine 1.0, see
-        # the README). Do not change the revision, the hash or the size before the parity test
-        # (pytest -m models) has passed on the new file.
+        # Parity with sentence-transformers was measured with exactly these files (cosine 1.0,
+        # see the README). Do not change the revision, a hash or a size before the parity test
+        # (pytest -m models) has passed on the new files.
         "intfloat/multilingual-e5-base": OnnxModel(
             dim=768,
             revision="d128750597153bb5987e10b1c3493a34e5a4502a",
-            sha256="84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa",
-            size=1_110_059_084,
+            files={
+                "onnx/model.onnx": (
+                    "84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa",
+                    1_110_059_084,
+                ),
+                "config.json": (
+                    "9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4",
+                    694,
+                ),
+                "special_tokens_map.json": (
+                    "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+                    280,
+                ),
+                "tokenizer.json": (
+                    "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+                    17_082_660,
+                ),
+                "tokenizer_config.json": (
+                    "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15",
+                    418,
+                ),
+            },
         ),
     }
 )
@@ -429,9 +529,6 @@ A name of this table is always loaded from the table, whatever fastembed lists u
 
 ONNX_BATCH_SIZE = 32
 """Default number of texts per inference call of :class:`OnnxEmbedder`."""
-
-_ONNX_SUPPORT_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
-"""Files fastembed reads next to the ONNX file; taken from the same pinned revision."""
 
 _CPU_PROVIDERS = ("CPUExecutionProvider",)
 
@@ -473,7 +570,7 @@ def _pinned_model_dir(name: str, known: OnnxModel, cache_dir: str) -> Path:
     except ImportError as exc:
         raise ImportError(_ONNX_EXTRA) from exc
     repository = known.hf or name
-    files = [known.model_file, *_ONNX_SUPPORT_FILES]
+    files = list(known.files)
     request: dict[str, Any] = {"revision": known.revision, "allow_patterns": files, "cache_dir": cache_dir}
 
     def missing_from(directory: Path) -> list[str]:
@@ -525,21 +622,27 @@ def _file_sha256(path: Path) -> tuple[str, int]:
     return digest, stat.st_size
 
 
-def _verify_onnx_file(name: str, known: OnnxModel, path: Path) -> str:
-    """Check the ONNX file about to be loaded against the table; return its SHA-256."""
-    found, size = _file_sha256(path)
-    if found != known.sha256 or size != known.size:
-        raise ModelIntegrityError(
-            f"embedding model {name!r}: the ONNX file {os.fspath(path)!r} is not the pinned one. "
-            f"Expected sha256 {known.sha256} ({known.size} bytes), revision {known.revision} of "
-            f"{known.hf or name!r}; found sha256 {found} ({size} bytes). The vectors of this file were "
-            "never compared with those of sentence-transformers, so it is not loaded. If the file is "
-            # The real file, not the link of the snapshot: the Hub client keeps a blob it finds.
-            f"damaged, delete {os.path.realpath(path)!r} and it is downloaded again. If the model is "
-            "meant to change, parity must be re-measured (pytest -m models) before "
-            "rag_engine.embedding.ONNX_MODELS is updated"
-        )
-    return found
+def _verify_pinned_files(name: str, known: OnnxModel, directory: Path) -> str:
+    """Check every file about to be loaded against the table; return the SHA-256 of the ONNX file.
+
+    The first file that differs raises :class:`ModelIntegrityError`, which names it.
+    """
+    for file, (expected, expected_size) in known.files.items():
+        path = directory / file
+        found, size = _file_sha256(path)
+        if found != expected or size != expected_size:
+            raise ModelIntegrityError(
+                f"embedding model {name!r}: the file {file!r} in the model cache, {os.fspath(path)!r}, is "
+                f"not the pinned one. Expected sha256 {expected} ({expected_size} bytes), revision "
+                f"{known.revision} of {known.hf or name!r}; found sha256 {found} ({size} bytes). The "
+                "vectors this file gives were never compared with those of sentence-transformers, so "
+                "the model is not loaded. If the file is damaged, delete "
+                # The real file, not the link of the snapshot: the Hub client keeps a blob it finds.
+                f"{os.path.realpath(path)!r} and it is downloaded again. If the model is meant to "
+                "change, parity must be re-measured (pytest -m models) before "
+                "rag_engine.embedding.ONNX_MODELS is updated"
+            )
+    return known.sha256
 
 
 def _register_pinned(text_embedding: Any, name: str, known: OnnxModel) -> str:
@@ -586,18 +689,19 @@ class OnnxEmbedder(BaseEmbedder):
     **A model of** :data:`ONNX_MODELS` **is pinned and verified.** Its files are those of the
     revision of the table: found in ``cache_dir``, or else downloaded from the Hugging Face Hub
     (:class:`ModelDownloadError` when that fails). When they are all in the cache, no request is
-    made to the Hub. The ONNX file is then hashed, and loaded only if its SHA-256 and size are
-    those of the table (:class:`ModelIntegrityError` otherwise): the file that runs is the one
-    whose vectors were compared with those of sentence-transformers. The hash of a file is
-    computed once per process (about a second per gigabyte) and kept for the same path, size
-    and modification time. Only the ONNX file is hashed; the tokenizer files come from the same
-    pinned revision. ``model_path`` and ``model_sha256`` give the file loaded and its hash.
+    made to the Hub. Every one of them is then hashed — the ONNX file, and the tokenizer and
+    configuration files, which decide the vectors just as much — and the model is built only
+    if each has the SHA-256 and the size of the table (:class:`ModelIntegrityError` naming
+    the file otherwise): what runs is what the vectors compared with those of
+    sentence-transformers were computed with. The hash of a file is computed once per process
+    (about a second per gigabyte) and kept for the same path, size and modification time.
+    ``model_path`` and ``model_sha256`` give the ONNX file loaded and its hash.
     fastembed is handed that directory and does not download anything, and the name is
     registered with it under a name of the engine's own, so that a model fastembed would list
     under the same name with another source or pooling is never used instead.
 
     A model that is not in the table but that fastembed lists is used as fastembed defines and
-    downloads it, and a warning is logged: the engine neither pins nor verifies its file
+    downloads it, and a warning is logged: the engine neither pins nor verifies its files
     (``model_path`` and ``model_sha256`` are ``None``). A name found in neither raises a
     ``ValueError``. The declared dimension is compared with ``spec.dim`` before anything is
     downloaded.
@@ -651,14 +755,16 @@ class OnnxEmbedder(BaseEmbedder):
             cache = _onnx_cache_dir(cache_dir)
             model_dir = _pinned_model_dir(spec.name, known, cache)
             self.model_path = model_dir / known.model_file
-            self.model_sha256 = _verify_onnx_file(spec.name, known, self.model_path)
+            self.model_sha256 = _verify_pinned_files(spec.name, known, model_dir)
             registered = _register_pinned(TextEmbedding, spec.name, known)
             # specific_model_path: fastembed loads this directory and downloads nothing.
             options.update(cache_dir=cache, specific_model_path=os.fspath(model_dir))
             logger.info(
-                "Loading ONNX embedding model %s (revision %s, sha256 %s verified)",
+                "Loading ONNX embedding model %s (revision %s, %d files verified, sha256 of %s: %s)",
                 spec.name,
                 known.revision,
+                len(known.files),
+                known.model_file,
                 self.model_sha256,
             )
         else:
@@ -675,7 +781,7 @@ class OnnxEmbedder(BaseEmbedder):
                 options["cache_dir"] = os.fspath(cache_dir)
             logger.warning(
                 "ONNX embedding model %s is not in rag_engine.embedding.ONNX_MODELS: fastembed "
-                "downloads and loads it as it defines it; its file is not pinned or verified by the "
+                "downloads and loads it as it defines it; its files are not pinned or verified by the "
                 "engine, and its parity with the torch backend was not measured",
                 spec.name,
             )
