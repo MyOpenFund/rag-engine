@@ -258,10 +258,8 @@ def _question_of(record: object) -> Question:
     if filters is not None:
         if not isinstance(filters, dict):
             raise EvalError(f"'filters' must be a JSON object, got {type(filters).__name__}")
-        for name in filters:
-            if name not in FILTER_FIELDS:
-                raise EvalError(f"unknown filter {name!r} (the filters are: {', '.join(FILTER_FIELDS)})")
-        filters = SearchFilters(**filters)
+        # An unknown filter, a bad value: a SearchError, reported with the line like an EvalError.
+        filters = SearchFilters.from_mapping(filters)
         if _filters_dict(filters) is None:
             filters = None  # {} and a filter of nulls restrict nothing
     for name in ("kind", "language", "rationale"):

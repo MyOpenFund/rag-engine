@@ -54,6 +54,7 @@ PUBLIC_NAMES = {
         "DEFAULT_URL_PORT",
         "DISTANCE",
         "CollectionMismatchError",
+        "CollectionNotFoundError",
         "QdrantAuthError",
         "QdrantStore",
         "StoreError",

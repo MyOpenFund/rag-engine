@@ -376,8 +376,73 @@ def test_a_collection_with_named_vectors_gets_a_clear_message(built, capsys, mon
     store, _ = named_vectors_store(config)
     monkeypatch.setattr(cli, "_store", lambda settings: store)
     assert cli.main(["eval", "--questions", str(QUESTIONS), "--collection", "named"]) == 2
-    assert_refused(capsys, built, "'named'", "named vectors", "'body', 'title'", "unnamed")
+    assert_refused(capsys, built, "'named'", "named vectors", "'body'", "'title'", "unnamed")
     store.client.close()
+
+
+@pytest.mark.parametrize("distance", ["Dot", "Euclid", "Manhattan"])
+def test_a_collection_with_another_distance_is_refused_before_the_model_is_loaded(
+    built, capsys, monkeypatch, distance
+):
+    # The scores of such a collection are not cosines: the vectors would be searched, and ranked
+    # by another measure than the one the engine and its evaluation assume.
+    from qdrant_client import models
+
+    client = QdrantClient(":memory:")
+    client.create_collection(
+        "other", vectors_config=models.VectorParams(size=16, distance=models.Distance(distance))
+    )
+    store = QdrantStore(client=client)
+    monkeypatch.setattr(cli, "_store", lambda settings: store)
+    assert cli.main(["eval", "--questions", str(QUESTIONS), "--collection", "other"]) == 2
+    assert_refused(capsys, built, "'other'", f"found {distance} distance", "Cosine")
+    client.close()
+
+
+def test_a_collection_without_a_dense_vector_is_refused(built, capsys, monkeypatch):
+    from qdrant_client import models
+
+    client = QdrantClient(":memory:")
+    client.create_collection(
+        "sparse", vectors_config={}, sparse_vectors_config={"sparse": models.SparseVectorParams()}
+    )
+    store = QdrantStore(client=client)
+    monkeypatch.setattr(cli, "_store", lambda settings: store)
+    assert cli.main(["eval", "--questions", str(QUESTIONS), "--collection", "sparse"]) == 2
+    assert_refused(capsys, built, "'sparse'", "no dense vector")
+    client.close()
+
+
+def test_the_collection_check_of_the_command_is_the_one_of_the_store(built, monkeypatch, fixture_store):
+    calls = []
+    original = fixture_store.check_collection
+    monkeypatch.setattr(
+        fixture_store, "check_collection", lambda name, dim: calls.append((name, dim)) or original(name, dim)
+    )
+    assert run() == 0
+    assert calls == [(COLLECTION, 16)]
+
+
+def test_an_error_of_the_client_at_the_collection_check_is_exit_code_2(
+    built, capsys, monkeypatch, fixture_store
+):
+    def broken(name, dim):
+        raise RuntimeError("Unexpected Response: 422 (Unprocessable Entity)")
+
+    monkeypatch.setattr(fixture_store, "check_collection", broken)
+    assert run() == 2
+    assert_refused(capsys, built, repr(COLLECTION), "could not be checked", "RuntimeError", "422")
+
+
+def test_a_refused_key_at_the_collection_check_is_exit_code_2(built, capsys, monkeypatch, fixture_store):
+    from rag_engine.store import QdrantAuthError
+
+    def refused(name, dim):
+        raise QdrantAuthError("Qdrant refused the request (HTTP 403): check QDRANT_API_KEY")
+
+    monkeypatch.setattr(fixture_store, "check_collection", refused)
+    assert run() == 2
+    assert_refused(capsys, built, "HTTP 403", "QDRANT_API_KEY")
 
 
 def test_the_checks_come_in_order_of_cost(built, capsys, monkeypatch, fixture_store):

@@ -25,6 +25,7 @@ __all__ = [
     "DEFAULT_URL_PORT",
     "DISTANCE",
     "CollectionMismatchError",
+    "CollectionNotFoundError",
     "QdrantAuthError",
     "QdrantStore",
     "StoreError",
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 AUTH_STATUSES = (401, 403)
 DISTANCE = models.Distance.COSINE
+#: Seconds a request may take when nothing else is said: the default of ``Settings.qdrant_timeout``.
 DEFAULT_TIMEOUT = 60
 DEFAULT_URL_PORT = 6333
 
@@ -51,6 +53,15 @@ class CollectionMismatchError(StoreError):
 
     Its vector configuration differs, or one of its payload fields is indexed with another
     kind of index.
+    """
+
+
+class CollectionNotFoundError(StoreError):
+    """The collection asked about does not exist on the server.
+
+    Raised by :meth:`QdrantStore.check_collection`, the check that never creates. The other
+    methods of the store do not ask first: on a missing collection they raise what the
+    Qdrant client raises.
     """
 
 
@@ -128,6 +139,12 @@ class QdrantStore:
     ``https`` is always passed to the client: left undecided, qdrant-client turns TLS on as
     soon as an API key is set.
 
+    ``timeout`` is the number of seconds a request may take. Given explicitly, it wins;
+    left out (``None``), it is the ``qdrant_timeout`` of the settings
+    (``RAG_ENGINE_QDRANT_TIMEOUT``, default :data:`DEFAULT_TIMEOUT`, 60). qdrant-client counts
+    in whole seconds and rounds a fraction up. It is not used with an injected client, which
+    has its own.
+
     ``client`` injects a ready client (tests, qdrant-client's local mode); no connection is
     then built, and ``host`` / ``port`` are the ones given explicitly, else ``None``: the store
     cannot know where an injected client points to. With an injected client and no
@@ -148,7 +165,7 @@ class QdrantStore:
         port: int | None = None,
         api_key: str | None = None,
         https: bool | None = None,
-        timeout: int = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         *,
         settings: Settings | None = None,
         client: Any = None,
@@ -173,7 +190,7 @@ class QdrantStore:
             port=self._port,
             api_key=(api_key or "").strip() or settings.qdrant_api_key,
             https=self._https,
-            timeout=timeout,
+            timeout=timeout if timeout is not None else settings.qdrant_timeout,
         )
 
     @classmethod
@@ -181,7 +198,7 @@ class QdrantStore:
         cls,
         url: str,
         api_key: str | None = None,
-        timeout: int = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         *,
         settings: Settings | None = None,
     ) -> QdrantStore:
@@ -190,8 +207,8 @@ class QdrantStore:
         The scheme decides TLS, whatever the settings say; the port defaults to 6333. An IPv6
         address is written in square brackets (``http://[::1]:6333``). A URL with a path, a
         query or credentials, with a whitespace or control character anywhere, or with port 0
-        is refused with a ``ValueError`` that never echoes the URL. ``api_key`` and
-        ``settings`` are as in the constructor.
+        is refused with a ``ValueError`` that never echoes the URL. ``api_key``, ``timeout``
+        and ``settings`` are as in the constructor.
         """
         problem = "a Qdrant URL must look like http://host:port or https://host:port"
         # Checked on the raw text: urlsplit silently drops tabs and line breaks.
@@ -246,8 +263,50 @@ class QdrantStore:
             return False
         return True
 
+    def _read_collection(self, name: str) -> Any:
+        """What the server says of collection ``name``; ``None`` when it answers that it does not exist."""
+        try:
+            exists = self._client.collection_exists(collection_name=name)
+            return self._client.get_collection(collection_name=name) if exists else None
+        except Exception as exc:
+            _raise_auth(exc)
+            raise
+
+    def check_collection(self, name: str, dim: int) -> None:
+        """Check that ``name`` exists with one unnamed cosine vector of size ``dim``. Reads only.
+
+        The check of a reader: a search service calls it once when it starts, with the
+        dimension of its embedder, and then knows that its queries can be answered. It
+        sends two read requests and **never creates or changes anything**, so it works with
+        a read-only API key. :meth:`ensure_collection` is the method of a writer.
+
+        * The collection matches: returns ``None``.
+        * Qdrant answers that it does not exist: :class:`CollectionNotFoundError`.
+        * It exists and is not a single unnamed vector of size ``dim`` with cosine distance
+          (another dimension, another distance, named vectors, no dense vector):
+          :class:`CollectionMismatchError`, with the words of :meth:`ensure_collection`.
+        * HTTP 401 or 403: :class:`QdrantAuthError`.
+        * Anything else (connection refused, timeout, server error, a name the server does
+          not accept, a collection deleted between the two requests) is raised as the client
+          raised it. No failure is ever read as "the collection is absent".
+
+        ``dim`` must be an integer >= 1, else ``ValueError``, raised before any request.
+        """
+        _positive_int("dim", dim)
+        info = self._read_collection(name)
+        if info is None:
+            raise CollectionNotFoundError(
+                f"collection {name!r} does not exist on the Qdrant server (a writer creates it with "
+                "ensure_collection; this check never does)"
+            )
+        _check_vectors(name, dim, info.config.params.vectors)
+
     def ensure_collection(self, name: str, dim: int) -> None:
         """Make sure ``name`` exists with one unnamed cosine vector of size ``dim``.
+
+        The method of a writer: it creates the collection when it is missing, which a
+        read-only API key is refused (:class:`QdrantAuthError`). A reader calls
+        :meth:`check_collection` instead.
 
         * The collection exists: its vector configuration is checked, and
           :class:`CollectionMismatchError` is raised when it is not a single unnamed vector of
@@ -266,12 +325,7 @@ class QdrantStore:
         1.8: an older server answers 404, which is raised like any other error.
         """
         _positive_int("dim", dim)
-        try:
-            exists = self._client.collection_exists(collection_name=name)
-            info = self._client.get_collection(collection_name=name) if exists else None
-        except Exception as exc:
-            _raise_auth(exc)
-            raise
+        info = self._read_collection(name)
         if info is not None:
             _check_vectors(name, dim, info.config.params.vectors)
             return

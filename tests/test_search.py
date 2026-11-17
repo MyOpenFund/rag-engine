@@ -221,6 +221,128 @@ def test_filters_are_stored_in_one_form_whatever_was_given():
     assert hash(filters) == hash(SearchFilters(**dataclasses.asdict(filters)))
 
 
+# --- from_mapping: the filters of a JSON object -----------------------------------------
+
+
+def test_from_mapping_builds_the_filters_the_constructor_builds():
+    given = {
+        "source_codes": ["ecb", "fed"],
+        "doc_types": ["minutes"],
+        "languages": ["en"],
+        "doc_ids": ["a", "b"],
+        "date_from": "2016-01-01",
+        "date_to": "2016-03-10",
+        "corpus": "central-bank",
+    }
+    filters = SearchFilters.from_mapping(json.loads(json.dumps(given)))
+    assert isinstance(filters, SearchFilters)
+    assert filters == SearchFilters(**given)
+    assert filters.date_to == datetime.date(2016, 3, 10) and filters.source_codes == ("ecb", "fed")
+    assert given["source_codes"] == ["ecb", "fed"]  # the mapping is not changed
+
+
+def test_from_mapping_takes_any_mapping_and_does_not_keep_it():
+    given = types.MappingProxyType({"corpus": "press", "doc_ids": ["a"]})
+    assert SearchFilters.from_mapping(given) == SearchFilters(corpus="press", doc_ids=["a"])
+
+
+@pytest.mark.parametrize(
+    "given",
+    [{}, {"source_codes": None}, {name: None for name in ("source_codes", "date_from", "date_to", "corpus")}],
+    ids=["empty", "one-null", "nulls"],
+)
+def test_from_mapping_reads_a_missing_key_and_a_null_as_not_set(given):
+    assert SearchFilters.from_mapping(given) == SearchFilters()
+    assert _qdrant_filter(SearchFilters.from_mapping(given)) is None
+
+
+def test_from_mapping_mixes_nulls_and_values():
+    filters = SearchFilters.from_mapping({"source_codes": None, "doc_types": ["A1"], "date_to": None})
+    assert filters == SearchFilters(doc_types=["A1"])
+
+
+ALLOWED = "source_codes, doc_types, languages, doc_ids, date_from, date_to, corpus"
+
+
+@pytest.mark.parametrize(
+    ("given", "named"),
+    [
+        ({"source": ["ecb"]}, "unknown filter 'source'"),
+        ({"source_codes": ["ecb"], "year": 2016}, "unknown filter 'year'"),
+        ({"Source_Codes": ["ecb"]}, "unknown filter 'Source_Codes'"),
+        (
+            {"year": 2016, "source": None, "corpus": "press", "bank": "ecb"},
+            "unknown filters 'year', 'source', 'bank'",
+        ),
+        ({"": ["ecb"]}, "unknown filter ''"),
+        ({3: ["ecb"]}, "unknown filter 3"),
+        ({None: ["ecb"]}, "unknown filter None"),
+    ],
+    ids=["one", "next-to-a-known", "case", "several-in-order", "empty-name", "number", "none"],
+)
+def test_from_mapping_refuses_unknown_keys_naming_them_and_the_allowed_ones(given, named):
+    with pytest.raises(SearchError) as raised:
+        SearchFilters.from_mapping(given)
+    message = str(raised.value)
+    assert message == f"{named} (the filters are: {ALLOWED})"
+    assert isinstance(raised.value, ValueError) and isinstance(raised.value, RagEngineError)
+
+
+def test_the_constructor_raises_a_bare_type_error_for_an_unknown_key_and_from_mapping_does_not():
+    given = {"source": ["ecb"]}
+    with pytest.raises(TypeError):
+        SearchFilters(**given)
+    with pytest.raises(SearchError):
+        SearchFilters.from_mapping(given)
+
+
+@pytest.mark.parametrize(
+    "given", [None, ["source_codes"], "source_codes", 3, [("source_codes", ["ecb"])], SearchFilters()]
+)
+def test_from_mapping_refuses_what_is_not_a_mapping(given):
+    with pytest.raises(SearchError, match="filters must be a mapping of filter names to values"):
+        SearchFilters.from_mapping(given)
+
+
+@pytest.mark.parametrize(
+    ("given", "match"),
+    [
+        ({"source_codes": "ecb"}, "source_codes must be a list of strings, got the single string"),
+        ({"doc_types": []}, "doc_types is an empty list"),
+        ({"languages": ["en", ""]}, "languages must hold non-blank strings"),
+        ({"doc_ids": {"a": 1}}, "doc_ids must be a list of strings or None, got dict"),
+        ({"date_from": "2016"}, "date_from must be a datetime.date or a string written YYYY-MM-DD"),
+        ({"date_to": "2016-02-30"}, "date_to is not a date of the calendar"),
+        ({"date_from": 20160310}, "date_from must be"),
+        ({"date_from": "2016-03-02", "date_to": "2016-03-01"}, "is after date_to"),
+        ({"corpus": ""}, "corpus must be a non-blank string"),
+        ({"corpus": ["press"]}, "corpus must be a non-blank string"),
+        ({"corpus": "\ud800"}, "corpus is a string that cannot be encoded"),
+        ({"source_codes": ["\ud800"]}, "source_codes holds a string that cannot be encoded"),
+    ],
+)
+def test_from_mapping_applies_the_checks_of_the_constructor(given, match):
+    with pytest.raises(SearchError, match=match) as raised:
+        SearchFilters.from_mapping(given)
+    with pytest.raises(SearchError) as direct:
+        SearchFilters(**given)
+    assert str(raised.value) == str(direct.value)
+
+
+def test_from_mapping_names_the_unknown_keys_before_it_checks_the_values():
+    with pytest.raises(SearchError, match="unknown filter 'bank'"):
+        SearchFilters.from_mapping({"source_codes": "ecb", "bank": "ecb"})
+
+
+def test_from_mapping_filters_search_like_the_others(store, embedder):
+    given = json.loads('{"source_codes": ["ecb"], "date_from": "2016-03-10", "languages": null}')
+    hits = run(store, embedder, filters=SearchFilters.from_mapping(given))
+    assert_same_hits(
+        hits, run(store, embedder, filters=SearchFilters(source_codes=["ecb"], date_from="2016-03-10"))
+    )
+    assert hits and {hit.source_code for hit in hits} == {"ecb"}
+
+
 def test_filters_are_frozen():
     filters = SearchFilters(source_codes=["ecb"])
     with pytest.raises(dataclasses.FrozenInstanceError):

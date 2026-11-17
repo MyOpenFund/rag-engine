@@ -3,7 +3,7 @@
 ``search`` embeds the query, asks Qdrant for the closest chunks that pass the filters and
 returns them as :class:`Hit` objects, best first. The filters are a :class:`SearchFilters`,
 checked when it is built: a filter that could be read in two ways is refused instead of
-being guessed.
+being guessed. :meth:`SearchFilters.from_mapping` builds one from a parsed JSON object.
 
 Importing this module loads no embedding backend: the embedder is given by the caller.
 """
@@ -200,6 +200,39 @@ class SearchFilters:
         if self.corpus is not None and not _encodable(self.corpus):
             raise _not_encodable("corpus", "is", self.corpus)
 
+    @classmethod
+    def from_mapping(cls, mapping: Mapping[str, Any]) -> SearchFilters:
+        """The filters written as a mapping, such as a parsed JSON object.
+
+        For a caller that receives its filters as data: the arguments of a tool of an MCP
+        server, the ``filters`` of a question file::
+
+            SearchFilters.from_mapping({"source_codes": ["ecb"], "date_from": "2016-03-01"})
+
+        The keys are the names of the fields. A key that is missing, or whose value is
+        ``None`` (a JSON ``null``), is not set; an empty mapping restricts nothing. The
+        values follow the rules of the constructor, and are refused with the same
+        :class:`SearchError`.
+
+        **A key that is not a field is refused**, with a :class:`SearchError` that names
+        every unknown key and lists the fields: a misspelt filter must not be ignored, and
+        ``SearchFilters(**mapping)`` would raise a bare ``TypeError`` for it. Anything but a
+        mapping is a :class:`SearchError` too. The mapping is neither kept nor changed.
+        """
+        if not isinstance(mapping, Mapping):
+            raise SearchError(
+                "filters must be a mapping of filter names to values (a JSON object), "
+                f"got {type(mapping).__name__}"
+            )
+        names = [field.name for field in fields(cls)]
+        unknown = [key for key in mapping if key not in names]
+        if unknown:
+            raise SearchError(
+                f"unknown filter{'' if len(unknown) == 1 else 's'} {', '.join(repr(key) for key in unknown)} "
+                f"(the filters are: {', '.join(names)})"
+            )
+        return cls(**{name: value for name, value in mapping.items() if value is not None})
+
 
 def _qdrant_filter(filters: SearchFilters | None) -> models.Filter | None:
     """The Qdrant filter of ``filters``; ``None`` when nothing restricts the search."""
@@ -359,10 +392,13 @@ def search(
       given, apart from the normalisation below; it is not stripped.
     - ``collection`` must exist, with the dimension of the embedder. **This function does not
       check it** (no extra request per search): the caller calls
-      ``store.ensure_collection(collection, embedder.dim)`` once. The payload indexes
-      (``store.ensure_payload_indexes``) make the filters fast; the answers are the same
-      without them.
-    - ``filters``: a :class:`SearchFilters`, or ``None`` for no restriction.
+      ``store.check_collection(collection, embedder.dim)`` once, at start. It only reads, so a
+      search service with a read-only API key can call it; ``store.ensure_collection`` is for
+      the writer that owns the collection. The payload indexes
+      (``store.ensure_payload_indexes``, a writer's call too) make the filters fast; the
+      answers are the same without them.
+    - ``filters``: a :class:`SearchFilters`, or ``None`` for no restriction
+      (:meth:`SearchFilters.from_mapping` builds one from a parsed JSON object).
     - ``limit``: the largest number of hits wanted, an integer of at least 1; ``None`` means
       the default, 10.
     - ``max_limit``: the largest ``limit`` accepted, an integer of at least 1; ``None`` means

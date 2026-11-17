@@ -7,6 +7,7 @@ calls :meth:`Settings.from_env`.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -139,7 +140,8 @@ class Settings:
     * Direct construction takes values as they are and converts nothing: an integer must be an
       ``int`` (not a ``bool``, a ``float`` or a numeric string), ``qdrant_https`` must be a
       ``bool`` (the string ``"false"`` is refused, it would be truthy), ``parity_min`` must be
-      a ``float`` (not an ``int``, a ``bool`` or a numeric string), ``onnx_threads`` must be
+      a ``float`` (not an ``int``, a ``bool`` or a numeric string), ``qdrant_timeout`` must be
+      an ``int`` or a ``float`` (not a ``bool`` or a numeric string), ``onnx_threads`` must be
       an ``int`` or ``None``, every other field must be a ``str``, and ``backend`` must be
       exactly ``"torch"`` or ``"onnx"``. Strings are not stripped. An empty or whitespace-only
       ``qdrant_host`` or ``model_name`` is refused; an empty or whitespace-only
@@ -164,6 +166,12 @@ class Settings:
         values: ``0``, ``false``, ``no``, ``off``, blank (case-insensitive). The store always
         passes it to the client explicitly: left undecided, the Qdrant client turns TLS on as
         soon as an API key is set.
+    ``qdrant_timeout`` — ``RAG_ENGINE_QDRANT_TIMEOUT``, default ``60``
+        Seconds a request to Qdrant may take before the client gives up: a positive, finite
+        number. :class:`rag_engine.store.QdrantStore` reads it when it is built from the
+        settings; a ``timeout`` given to the store explicitly wins. qdrant-client counts in
+        whole seconds and rounds a fraction up. A search service that must answer fast
+        lowers it; a writer of large batches may need the default.
 
     Embedding model:
 
@@ -246,6 +254,7 @@ class Settings:
     model_cache: str | None = None
     parity_min: float = 0.999
     onnx_threads: int | None = None
+    qdrant_timeout: float = 60.0
 
     def __post_init__(self) -> None:
         self._check_types()
@@ -273,6 +282,14 @@ class Settings:
             )
         if not 0.0 < self.parity_min <= 1.0:  # a NaN fails both comparisons
             raise ConfigError(f"RAG_ENGINE_PARITY_MIN={_show(self.parity_min)} must be above 0 and at most 1")
+        try:
+            usable = math.isfinite(self.qdrant_timeout) and self.qdrant_timeout > 0
+        except OverflowError:  # an integer too large to be a float
+            usable = False
+        if not usable:
+            raise ConfigError(
+                f"RAG_ENGINE_QDRANT_TIMEOUT={_show(self.qdrant_timeout)} must be a positive number of seconds"
+            )
         if self.search_limit > self.search_max_limit:
             raise ConfigError(
                 f"RAG_ENGINE_SEARCH_LIMIT={_show(self.search_limit)} is above "
@@ -314,6 +331,11 @@ class Settings:
             raise ConfigError(
                 f"RAG_ENGINE_PARITY_MIN={_show(self.parity_min)} must be a float, "
                 f"not {type(self.parity_min).__name__}"
+            )
+        if type(self.qdrant_timeout) not in (int, float):  # a bool is an int subclass, not a duration
+            raise ConfigError(
+                f"RAG_ENGINE_QDRANT_TIMEOUT={_show(self.qdrant_timeout)} must be a number of seconds "
+                f"(an int or a float), not {type(self.qdrant_timeout).__name__}"
             )
         if self.qdrant_api_key is not None:
             if not isinstance(self.qdrant_api_key, str):
@@ -368,4 +390,5 @@ class Settings:
             model_cache=_text(env, "RAG_ENGINE_MODEL_CACHE"),
             parity_min=_float(env, "RAG_ENGINE_PARITY_MIN", cls.parity_min),
             onnx_threads=_optional_int(env, "RAG_ENGINE_ONNX_THREADS"),
+            qdrant_timeout=_float(env, "RAG_ENGINE_QDRANT_TIMEOUT", cls.qdrant_timeout),
         )

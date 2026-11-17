@@ -29,6 +29,7 @@ DEFAULTS = {
     "model_cache": None,
     "parity_min": 0.999,
     "onnx_threads": None,
+    "qdrant_timeout": 60.0,
 }
 
 # Every variable where a blank value means "use the default".
@@ -47,6 +48,7 @@ BLANK_FALLS_BACK = [
     "RAG_ENGINE_MODEL_CACHE",
     "RAG_ENGINE_PARITY_MIN",
     "RAG_ENGINE_ONNX_THREADS",
+    "RAG_ENGINE_QDRANT_TIMEOUT",
 ]
 
 
@@ -86,6 +88,7 @@ def test_all_values_read_from_the_mapping():
         "RAG_ENGINE_MODEL_CACHE": "/var/cache/models",
         "RAG_ENGINE_PARITY_MIN": " 0.9995 ",
         "RAG_ENGINE_ONNX_THREADS": " 2 ",
+        "RAG_ENGINE_QDRANT_TIMEOUT": " 15 ",
     }
     assert dataclasses.asdict(Settings.from_env(env)) == {
         "qdrant_host": "qdrant.internal",
@@ -104,6 +107,7 @@ def test_all_values_read_from_the_mapping():
         "model_cache": "/var/cache/models",
         "parity_min": 0.9995,
         "onnx_threads": 2,
+        "qdrant_timeout": 15.0,
     }
 
 
@@ -449,6 +453,8 @@ INVALID_KWARGS = [
     {"parity_min": 0.0},
     {"onnx_threads": 0},
     {"onnx_threads": "2"},
+    {"qdrant_timeout": 0},
+    {"qdrant_timeout": "60"},
 ]
 
 
@@ -697,3 +703,50 @@ def test_direct_onnx_threads_must_be_an_integer_or_none(value):
 def test_direct_onnx_threads_accepts_a_positive_integer_and_none():
     assert Settings(onnx_threads=1).onnx_threads == 1
     assert Settings(onnx_threads=None).onnx_threads is None
+
+
+# ---------------------------------------------------------------------------
+# qdrant_timeout
+# ---------------------------------------------------------------------------
+def test_qdrant_timeout_defaults_to_sixty_seconds():
+    assert Settings().qdrant_timeout == 60
+    assert Settings.from_env({}).qdrant_timeout == 60
+    assert Settings.from_env({"RAG_ENGINE_QDRANT_TIMEOUT": "  "}).qdrant_timeout == 60
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("5", 5.0), (" 120 ", 120.0), ("2.5", 2.5), ("1e2", 100.0), ("0.25", 0.25)]
+)
+def test_qdrant_timeout_is_read_as_a_number_of_seconds(raw, expected):
+    value = Settings.from_env({"RAG_ENGINE_QDRANT_TIMEOUT": raw}).qdrant_timeout
+    assert type(value) is float
+    assert value == expected
+
+
+@pytest.mark.parametrize("raw", ["soon", "1,5", "60s", "1 minute"])
+def test_qdrant_timeout_that_is_not_a_number_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*not a number"):
+        Settings.from_env({"RAG_ENGINE_QDRANT_TIMEOUT": raw})
+
+
+@pytest.mark.parametrize("raw", ["0", "0.0", "-1", "-0.5", "nan", "inf", "-inf"])
+def test_qdrant_timeout_that_is_not_positive_and_finite_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*positive number of seconds"):
+        Settings.from_env({"RAG_ENGINE_QDRANT_TIMEOUT": raw})
+
+
+@pytest.mark.parametrize("value", [1, 30, 2.5, 0.001])
+def test_direct_qdrant_timeout_accepts_a_positive_integer_or_float(value):
+    assert Settings(qdrant_timeout=value).qdrant_timeout == value
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -1, -2.5, float("nan"), float("inf"), 10**400])
+def test_direct_qdrant_timeout_that_is_not_positive_and_finite_is_refused(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*positive number of seconds"):
+        Settings(qdrant_timeout=value)
+
+
+@pytest.mark.parametrize("value", [True, "60", None, [60]])
+def test_direct_qdrant_timeout_must_be_a_number(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*must be a number"):
+        Settings(qdrant_timeout=value)

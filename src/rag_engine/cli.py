@@ -14,15 +14,16 @@ Exit codes of ``eval``: 0 when the evaluation ran (and met ``--fail-under-hit-at
 given); 1 when ``--fail-under-hit-at-k`` is given and not met; 2 for anything that kept the
 evaluation from running to its end: bad arguments, a bad setting, an unusable question
 file, an unreachable server, a missing collection or embedding backend, a collection of
-another dimension or with named vectors, a collection that holds none of the expected
-documents (unless ``--allow-empty``), a failure midway.
+another dimension, of another distance than cosine or with named vectors
+(:meth:`rag_engine.store.QdrantStore.check_collection`, which only reads), a collection
+that holds none of the expected documents (unless ``--allow-empty``), a failure midway.
 
 ``--fail-under-hit-at-k`` looks at the headline of the report: the hit@k of the kinds of
 question asked without filters, averaged per document
 (:attr:`rag_engine.eval.EvalReport.headline`), not at the pooled mean of all questions.
 
 What is cheap is checked first: the arguments, the question file, the server, the
-collection and its dimension, the presence of the expected documents; the embedding model is
+collection, its dimension and its distance, the presence of the expected documents; the embedding model is
 loaded last.
 
 Importing this module loads no embedding backend.
@@ -51,7 +52,7 @@ from .eval import (
     format_report,
     load_questions,
 )
-from .store import QdrantStore
+from .store import CollectionMismatchError, CollectionNotFoundError, QdrantStore
 
 __all__ = ["main"]
 
@@ -167,26 +168,28 @@ def _check_counts(k: int, chunk_limit: int, maximum: int, resamples: int) -> Non
 
 
 def _check_collection(store: Any, collection: str, dim: int) -> None:
-    """Make sure the server answers and holds ``collection``, with one unnamed vector of ``dim`` values."""
+    """Make sure the server answers and holds ``collection``: one unnamed cosine vector of ``dim`` values."""
     if not store.is_reachable():
         raise _Refused(
             f"Qdrant at {store.host}:{store.port} does not answer, or refuses the API key "
             "(check QDRANT_HOST, QDRANT_PORT, QDRANT_HTTPS and QDRANT_API_KEY)"
         )
-    if not store.client.collection_exists(collection_name=collection):
-        raise _Refused(f"collection {collection!r} does not exist on that server")
-    vectors = store.client.get_collection(collection_name=collection).config.params.vectors
-    if isinstance(vectors, dict):
-        names = ", ".join(repr(name) for name in sorted(vectors)) or "none"
+    try:
+        store.check_collection(collection, dim)  # read-only: the command never creates a collection
+    except CollectionNotFoundError:
+        raise _Refused(f"collection {collection!r} does not exist on that server") from None
+    except CollectionMismatchError as exc:
         raise _Refused(
-            f"collection {collection!r} has named vectors ({names}): the engine searches the single "
-            "unnamed vector of a collection, as QdrantStore.ensure_collection creates it"
-        )
-    size = getattr(vectors, "size", None)
-    if size is None:
-        raise _Refused(f"collection {collection!r} has no unnamed dense vector to search")
-    if int(size) != dim:
-        raise _Refused(_dimensions(collection, int(size), f"RAG_ENGINE_DIM announces {dim}-dimensional ones"))
+            f"{exc}. The engine searches the single unnamed vector of a collection, compared by "
+            f"cosine, as QdrantStore.ensure_collection creates it; its dimension is the one "
+            f"RAG_ENGINE_DIM announces, {dim} (check RAG_ENGINE_MODEL and RAG_ENGINE_DIM)"
+        ) from exc
+    except RagEngineError:
+        raise  # a refused API key: reported as it is
+    except Exception as exc:  # what the Qdrant client raised, e.g. for a name the server refuses
+        raise _Refused(
+            f"collection {collection!r} could not be checked: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _dimensions(collection: str, size: int, model: str) -> str:

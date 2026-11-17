@@ -24,7 +24,13 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 import rag_engine.store as store_mod
 from rag_engine.config import Settings
 from rag_engine.schema import PAYLOAD_INDEXES
-from rag_engine.store import CollectionMismatchError, QdrantAuthError, QdrantStore, StoreError
+from rag_engine.store import (
+    CollectionMismatchError,
+    CollectionNotFoundError,
+    QdrantAuthError,
+    QdrantStore,
+    StoreError,
+)
 
 # Expected here: the tests send a key over plain HTTP on purpose, and talk to servers that are
 # stubs or absent (qdrant-client asks the server for its version when a client is built).
@@ -181,6 +187,61 @@ def test_a_port_outside_1_to_65535_is_refused(built, port):
         QdrantStore("h", port, settings=Settings())
     assert "65535" in str(caught.value)
     assert built == []
+
+
+# --- the timeout: explicit, then the settings ------------------------------------
+def test_the_timeout_of_the_settings_reaches_the_client(built):
+    QdrantStore(settings=Settings(qdrant_timeout=7))
+    QdrantStore(settings=Settings(qdrant_timeout=2.5))
+    QdrantStore.from_url("http://qdrant.example", settings=Settings(qdrant_timeout=9))
+    assert [call["timeout"] for call in built] == [7, 2.5, 9]
+
+
+def test_an_explicit_timeout_wins_over_the_settings(built):
+    settings = Settings(qdrant_timeout=7)
+    QdrantStore(timeout=3, settings=settings)
+    QdrantStore("h", 6333, None, False, 4, settings=settings)
+    QdrantStore.from_url("http://qdrant.example", timeout=5, settings=settings)
+    QdrantStore.from_url("http://qdrant.example", None, 6, settings=settings)
+    assert [call["timeout"] for call in built] == [3, 4, 5, 6]
+
+
+def test_the_timeout_is_read_from_the_environment_when_no_settings_are_given(built, monkeypatch):
+    monkeypatch.setenv("RAG_ENGINE_QDRANT_TIMEOUT", "12")
+    QdrantStore()
+    QdrantStore(timeout=3)
+    QdrantStore.from_url("http://qdrant.example")
+    assert [call["timeout"] for call in built] == [12, 3, 12]
+
+
+def test_the_default_timeout_is_the_one_of_the_settings_and_of_the_constant(built):
+    QdrantStore(settings=Settings())
+    assert built[0]["timeout"] == store_mod.DEFAULT_TIMEOUT == Settings.qdrant_timeout == 60
+
+
+def test_a_bad_timeout_in_the_environment_is_a_config_error(built, monkeypatch):
+    from rag_engine.config import ConfigError
+
+    monkeypatch.setenv("RAG_ENGINE_QDRANT_TIMEOUT", "never")
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT"):
+        QdrantStore()
+    assert built == []
+    # An injected client has no connection to configure: the variable is not read.
+    QdrantStore(client=FakeClient())
+
+
+def test_the_timeout_of_the_settings_is_the_one_the_real_client_waits(monkeypatch):
+    # The real client, without a server: it keeps the timeout it was built with, in whole seconds.
+    # Its look at the version of the server runs in a thread and would warn during a later test.
+    from qdrant_client.qdrant_remote import QdrantRemote
+
+    monkeypatch.setattr(QdrantRemote, "_check_compatibility", staticmethod(lambda *args: None))
+    store = QdrantStore("127.0.0.1", 1, settings=Settings(qdrant_timeout=7))
+    assert store.client._client._timeout == 7
+    store.client.close()
+    rounded = QdrantStore("127.0.0.1", 1, settings=Settings(qdrant_timeout=2.5))
+    assert rounded.client._client._timeout == 3  # qdrant-client rounds up to a whole second
+    rounded.client.close()
 
 
 def test_a_bad_port_is_refused_with_an_injected_client_too():
@@ -426,6 +487,183 @@ def test_the_real_client_reaches_a_server_on_an_ipv6_loopback():
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# check_collection: the read-only check
+# ---------------------------------------------------------------------------
+READS = {"collection_exists", "get_collection"}
+
+
+def test_check_collection_accepts_a_matching_collection_with_two_reads():
+    store, client = fake_store(exists=True, vectors=unnamed(8))
+    assert store.check_collection("c", 8) is None
+    assert client.calls == [("collection_exists", "c"), ("get_collection", "c")]
+
+
+def test_check_collection_reports_an_absent_collection_and_never_creates_it():
+    store, client = fake_store(exists=False)
+    with pytest.raises(CollectionNotFoundError) as info:
+        store.check_collection("central-bank", 8)
+    message = str(info.value)
+    assert "'central-bank'" in message and "does not exist" in message
+    assert "ensure_collection" in message  # who creates it
+    assert client.calls == [("collection_exists", "central-bank")]
+
+
+def test_a_missing_collection_is_a_store_error_and_not_a_mismatch():
+    assert issubclass(CollectionNotFoundError, StoreError)
+    assert not issubclass(CollectionNotFoundError, CollectionMismatchError)
+    assert not issubclass(CollectionMismatchError, CollectionNotFoundError)
+
+
+@pytest.mark.parametrize(
+    ("vectors", "words"),
+    [
+        (unnamed(384), ["768-d", "384-d"]),
+        (unnamed(768, models.Distance.DOT), ["Cosine", "Dot"]),
+        (unnamed(768, models.Distance.EUCLID), ["Cosine", "Euclid"]),
+        (unnamed(768, models.Distance.MANHATTAN), ["Cosine", "Manhattan"]),
+        ({"text": unnamed(768)}, ["named", "'text'"]),
+        ({"a": unnamed(768), "b": unnamed(768)}, ["named", "'a'", "'b'"]),
+        (None, ["no dense vector"]),
+        ({}, ["no dense vector"]),
+    ],
+    ids=["dimension", "dot", "euclid", "manhattan", "named", "two-named", "none", "sparse-only"],
+)
+def test_check_collection_refuses_anything_but_one_unnamed_cosine_vector_of_the_dimension(vectors, words):
+    store, client = fake_store(exists=True, vectors=vectors)
+    with pytest.raises(CollectionMismatchError) as info:
+        store.check_collection("c", 768)
+    message = str(info.value)
+    assert "'c'" in message and all(word in message for word in words), message
+    assert {call[0] for call in client.calls} == READS
+
+
+def test_check_collection_and_ensure_collection_refuse_with_the_same_words():
+    for vectors in (unnamed(384), unnamed(8, models.Distance.DOT), {"text": unnamed(8)}, None):
+        messages = []
+        for method in ("check_collection", "ensure_collection"):
+            store, _client = fake_store(exists=True, vectors=vectors)
+            with pytest.raises(CollectionMismatchError) as info:
+                getattr(store, method)("c", 8)
+            messages.append(str(info.value))
+        assert messages[0] == messages[1]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("where", ["exists", "get"])
+def test_check_collection_reports_a_refused_api_key(status, where):
+    error = http_error(status, body=b'{"status":{"error":"Invalid API key"}}')
+    script = {"exists": error} if where == "exists" else {"exists": True, "get": error}
+    store, client = fake_store(vectors=unnamed(8), **script)
+    with pytest.raises(
+        QdrantAuthError, match=rf"^Qdrant refused the request \(HTTP {status}\): check QDRANT_API_KEY$"
+    ) as info:
+        store.check_collection("c", 8)
+    assert info.value.__cause__ is error
+    assert {call[0] for call in client.calls} <= READS
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("connection refused"),
+        TimeoutError("timed out"),
+        ResponseHandlingException(ConnectionError("connection refused")),
+        http_error(500),
+        http_error(404),  # e.g. a server too old to answer the existence question
+        ValueError("Collection c not found"),  # a message is never read as an answer
+    ],
+    ids=lambda e: f"{type(e).__name__}-{getattr(e, 'status_code', '')}",
+)
+@pytest.mark.parametrize("where", ["exists", "get"])
+def test_check_collection_raises_any_other_failure_as_the_client_raised_it(error, where):
+    script = {"exists": error} if where == "exists" else {"exists": True, "get": error}
+    store, client = fake_store(vectors=unnamed(8), **script)
+    with pytest.raises(type(error)) as info:
+        store.check_collection("c", 8)
+    assert info.value is error
+    assert not isinstance(info.value, StoreError)
+    assert {call[0] for call in client.calls} <= READS
+
+
+@pytest.mark.parametrize("dim", [0, -1, True, 8.0, "8", None])
+def test_check_collection_refuses_a_bad_dimension_before_any_request(dim):
+    store, client = fake_store(exists=True, vectors=unnamed(8))
+    with pytest.raises(ValueError, match="dim must be an integer >= 1"):
+        store.check_collection("c", dim)
+    assert client.calls == []
+
+
+def test_check_collection_only_reads():
+    """Whatever the outcome, the client is asked the two questions and nothing else."""
+
+    class ReadOnly:
+        """Stands for a read-only API key: every call but the two reads is refused."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            if name not in READS:
+                raise http_error(403)
+            return getattr(self._inner, name)
+
+    for script in (
+        {"exists": False},
+        {"exists": True, "vectors": unnamed(8)},
+        {"exists": True, "vectors": None},
+    ):
+        store = QdrantStore(client=ReadOnly(FakeClient(**script)), settings=Settings())
+        try:
+            store.check_collection("c", 8)
+        except (CollectionNotFoundError, CollectionMismatchError):
+            pass
+    # The writer's method, with the same key: refused as soon as it has to create.
+    store = QdrantStore(client=ReadOnly(FakeClient(exists=False)), settings=Settings())
+    with pytest.raises(QdrantAuthError):
+        store.ensure_collection("c", 8)
+
+
+# --- local mode ---------------------------------------------------------------
+def test_local_mode_check_of_a_missing_collection_creates_nothing(memory_store):
+    with pytest.raises(CollectionNotFoundError, match="'absent'"):
+        memory_store.check_collection("absent", 4)
+    assert memory_store.client.get_collections().collections == []
+    assert not memory_store.client.collection_exists("absent")
+
+
+def test_local_mode_check_accepts_what_ensure_collection_created_and_changes_nothing(memory_store):
+    memory_store.ensure_collection("c", 4)
+    memory_store.upsert("c", points(2))
+    before = memory_store.client.get_collection("c")
+    assert memory_store.check_collection("c", 4) is None
+    assert memory_store.client.get_collection("c") == before
+    assert memory_store.count("c") == 2
+    assert [c.name for c in memory_store.client.get_collections().collections] == ["c"]
+
+
+@pytest.mark.parametrize(
+    ("config", "word"),
+    [
+        ({"vectors_config": unnamed(384)}, "384-d"),
+        ({"vectors_config": unnamed(4, models.Distance.DOT)}, "Dot"),
+        ({"vectors_config": unnamed(4, models.Distance.EUCLID)}, "Euclid"),
+        ({"vectors_config": {"text": unnamed(4)}}, "named"),
+        (
+            {"vectors_config": {}, "sparse_vectors_config": {"sparse": models.SparseVectorParams()}},
+            "no dense vector",
+        ),
+    ],
+    ids=["dimension", "dot", "euclid", "named", "sparse-only"],
+)
+def test_local_mode_check_refuses_a_collection_that_does_not_match(memory_store, config, word):
+    memory_store.client.create_collection("c", **config)
+    before = memory_store.client.get_collection("c")
+    with pytest.raises(CollectionMismatchError, match=word):
+        memory_store.check_collection("c", 4)
+    assert memory_store.client.get_collection("c") == before
 
 
 # ---------------------------------------------------------------------------
