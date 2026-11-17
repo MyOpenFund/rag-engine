@@ -27,6 +27,7 @@ DEFAULTS = {
     "search_max_limit": 50,
     "model_cache": None,
     "parity_min": 0.999,
+    "onnx_threads": None,
 }
 
 # Every variable where a blank value means "use the default".
@@ -44,6 +45,7 @@ BLANK_FALLS_BACK = [
     "RAG_ENGINE_SEARCH_MAX_LIMIT",
     "RAG_ENGINE_MODEL_CACHE",
     "RAG_ENGINE_PARITY_MIN",
+    "RAG_ENGINE_ONNX_THREADS",
 ]
 
 
@@ -82,6 +84,7 @@ def test_all_values_read_from_the_mapping():
         "RAG_ENGINE_SEARCH_MAX_LIMIT": "20",
         "RAG_ENGINE_MODEL_CACHE": "/var/cache/models",
         "RAG_ENGINE_PARITY_MIN": " 0.9995 ",
+        "RAG_ENGINE_ONNX_THREADS": " 2 ",
     }
     assert dataclasses.asdict(Settings.from_env(env)) == {
         "qdrant_host": "qdrant.internal",
@@ -99,6 +102,7 @@ def test_all_values_read_from_the_mapping():
         "search_max_limit": 20,
         "model_cache": "/var/cache/models",
         "parity_min": 0.9995,
+        "onnx_threads": 2,
     }
 
 
@@ -420,6 +424,8 @@ INVALID_ENV = [
     {"RAG_ENGINE_PARITY_MIN": "high"},
     {"RAG_ENGINE_PARITY_MIN": "0"},
     {"RAG_ENGINE_PARITY_MIN": "1.5"},
+    {"RAG_ENGINE_ONNX_THREADS": "0"},
+    {"RAG_ENGINE_ONNX_THREADS": "all"},
 ]
 
 INVALID_KWARGS = [
@@ -440,6 +446,8 @@ INVALID_KWARGS = [
     {"model_cache": 5},
     {"parity_min": 1},
     {"parity_min": 0.0},
+    {"onnx_threads": 0},
+    {"onnx_threads": "2"},
 ]
 
 
@@ -639,3 +647,48 @@ def test_direct_parity_min_must_be_a_float(value):
 def test_direct_parity_min_accepts_the_bounds_of_its_range():
     assert Settings(parity_min=1.0).parity_min == 1.0
     assert Settings(parity_min=1e-9).parity_min == 1e-9
+
+
+# ---------------------------------------------------------------------------
+# onnx_threads
+# ---------------------------------------------------------------------------
+def test_onnx_threads_default_leaves_the_choice_to_the_runtime():
+    assert Settings().onnx_threads is None
+    assert Settings.from_env({}).onnx_threads is None
+    assert Settings.from_env({"RAG_ENGINE_ONNX_THREADS": "  "}).onnx_threads is None
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("1", 1), (" 4 ", 4), ("64", 64)])
+def test_onnx_threads_is_read_as_an_integer(raw, expected):
+    value = Settings.from_env({"RAG_ENGINE_ONNX_THREADS": raw}).onnx_threads
+    assert type(value) is int
+    assert value == expected
+
+
+@pytest.mark.parametrize("raw", ["two", "2.0", "1,5", "auto"])
+def test_onnx_threads_that_is_not_an_integer_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_ONNX_THREADS=.*not an integer"):
+        Settings.from_env({"RAG_ENGINE_ONNX_THREADS": raw})
+
+
+@pytest.mark.parametrize("raw", ["0", "-1"])
+def test_onnx_threads_below_one_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_ONNX_THREADS=.*at least 1"):
+        Settings.from_env({"RAG_ENGINE_ONNX_THREADS": raw})
+
+
+@pytest.mark.parametrize("value", [0, -2])
+def test_direct_onnx_threads_below_one_is_refused(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_ONNX_THREADS=.*at least 1"):
+        Settings(onnx_threads=value)
+
+
+@pytest.mark.parametrize("value", [True, 2.0, "2"])
+def test_direct_onnx_threads_must_be_an_integer_or_none(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_ONNX_THREADS=.*must be an integer or None"):
+        Settings(onnx_threads=value)
+
+
+def test_direct_onnx_threads_accepts_a_positive_integer_and_none():
+    assert Settings(onnx_threads=1).onnx_threads == 1
+    assert Settings(onnx_threads=None).onnx_threads is None

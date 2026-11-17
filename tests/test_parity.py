@@ -10,6 +10,11 @@ works if both backends give the same vector for the same text. This file measure
   same, in the same order, whether the query is embedded with onnx or with torch, the chunks
   being embedded with torch in both cases.
 
+The onnx vectors must come from the ONNX file the engine pins (``ONNX_MODELS``: one revision,
+one SHA-256), or the measure would say nothing about the file production loads. So the file
+the embedder loaded is hashed again here, and a copy of it with one byte changed must be
+refused before any inference.
+
 It needs both extras (``rag-engine[torch,onnx]``) and the model files, which are downloaded on
 the first run. Run it with ``pytest -m models -s`` to see the measured numbers.
 """
@@ -17,13 +22,24 @@ the first run. Run it with ``pytest -m models -s`` to see the measured numbers.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import shutil
+import time
 import unicodedata
 
 import numpy as np
 import pytest
 
+import rag_engine.embedding as embedding_mod
 from rag_engine.config import Settings
-from rag_engine.embedding import cosine_parity, make_embedder
+from rag_engine.embedding import (
+    ONNX_MODELS,
+    ModelIntegrityError,
+    ModelSpec,
+    OnnxEmbedder,
+    cosine_parity,
+    make_embedder,
+)
 
 SENTENCES = {
     "en": [
@@ -268,7 +284,89 @@ def vectors():
                 "corpus": embedder.encode_passage(CORPUS),
                 "search": np.stack([embedder.encode_query(text) for text in QUERIES]),
             }
+            if backend == "onnx":
+                # What produced the vectors above: the file, its hash as the engine checked it,
+                # and the execution providers of the onnxruntime session fastembed built.
+                result["onnx_model"] = {
+                    "name": embedder.model_name,
+                    "path": embedder.model_path,
+                    "sha256": embedder.model_sha256,
+                    "providers": embedder._model.model.model.get_providers(),
+                }
     return result
+
+
+@pytest.mark.models
+def test_the_onnx_vectors_come_from_the_pinned_file_on_cpu(vectors):
+    loaded = vectors["onnx_model"]
+    pinned = ONNX_MODELS[loaded["name"]]
+    path = loaded["path"]
+    # The file of the pinned revision, in the layout of the Hugging Face cache.
+    assert path.parts[-4:] == ("snapshots", pinned.revision, *pinned.model_file.split("/"))
+    assert loaded["sha256"] == pinned.sha256
+    # Hashed again here, without the engine: the file on disk is the one of the table.
+    started = time.perf_counter()
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while block := stream.read(1 << 20):
+            hasher.update(block)
+    elapsed = time.perf_counter() - started
+    assert hasher.hexdigest() == pinned.sha256
+    assert path.stat().st_size == pinned.size
+    assert loaded["providers"] == ["CPUExecutionProvider"]
+    print(
+        f"\nonnx vectors computed from {path}\n  revision {pinned.revision}, {pinned.size} bytes, "
+        f"sha256 {hasher.hexdigest()} (hashed in {elapsed:.2f} s), providers {loaded['providers']}"
+    )
+
+
+@pytest.mark.models
+def test_the_hash_of_the_onnx_file_is_computed_once_per_process(vectors, monkeypatch):
+    path = vectors["onnx_model"]["path"]
+    monkeypatch.setattr(embedding_mod, "_sha256_cache", {})
+    started = time.perf_counter()
+    first = embedding_mod._file_sha256(path)
+    cold = time.perf_counter() - started
+    started = time.perf_counter()
+    second = embedding_mod._file_sha256(path)
+    warm = time.perf_counter() - started
+    print(f"\nhash check of the ONNX file: {cold:.2f} s the first time, {warm * 1000:.3f} ms afterwards")
+    assert first == second == (ONNX_MODELS[vectors["onnx_model"]["name"]].sha256, path.stat().st_size)
+    assert warm < cold / 10
+
+
+@pytest.mark.models
+def test_an_altered_onnx_file_is_refused_before_any_inference(vectors, tmp_path, monkeypatch):
+    fastembed = pytest.importorskip("fastembed")
+    loaded = vectors["onnx_model"]
+    pinned = ONNX_MODELS[loaded["name"]]
+    source = loaded["path"].parents[len(pinned.model_file.split("/")) - 1]  # snapshots/<revision>
+    # A model directory of its own: a full copy of the pinned files, one byte of the ONNX file
+    # changed (same size, so only the hash can tell).
+    copy = tmp_path / source.parents[1].name / "snapshots" / pinned.revision
+    shutil.copytree(source, copy)  # follows the links of the cache: real files
+    altered = copy / pinned.model_file
+    with open(altered, "r+b") as stream:
+        stream.seek(pinned.size // 2)
+        byte = stream.read(1)
+        stream.seek(pinned.size // 2)
+        stream.write(bytes([byte[0] ^ 0x01]))
+    assert altered.stat().st_size == pinned.size
+
+    def no_model(*args, **kwargs):
+        raise AssertionError("the model must not be built from a file that failed the hash check")
+
+    monkeypatch.setattr(fastembed.TextEmbedding, "__init__", no_model)
+    spec = ModelSpec.from_settings(Settings.from_env())
+    with pytest.raises(ModelIntegrityError) as caught:
+        OnnxEmbedder(spec, cache_dir=tmp_path)
+    message = str(caught.value)
+    print("\n" + message)
+    assert f"Expected sha256 {pinned.sha256}" in message
+    assert str(altered) in message
+    assert "parity must be re-measured" in message
+    found = message.split("found sha256 ")[1][:64]
+    assert found != pinned.sha256 and len(set(found) - set("0123456789abcdef")) == 0
 
 
 def describe(text: str) -> str:

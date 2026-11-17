@@ -3,7 +3,9 @@
 ``except RagEngineError`` catches every error raised under a class of this package:
 :class:`rag_engine.config.ConfigError`, :class:`rag_engine.store.StoreError` and its
 subclasses, :class:`rag_engine.chunking.UnsupportedFormatError`,
-:class:`rag_engine.search.SearchError`. It does not catch what the
+:class:`rag_engine.search.SearchError`,
+:class:`rag_engine.embedding.ModelIntegrityError` and
+:class:`rag_engine.embedding.ModelDownloadError`. It does not catch what the
 engine lets through unchanged (an error of a parser, of the embedding backend or of the
 Qdrant client), nor the plain ``ValueError`` / ``TypeError`` of a bad argument.
 """

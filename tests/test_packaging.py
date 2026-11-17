@@ -62,6 +62,8 @@ PUBLIC_NAMES = {
         "BaseEmbedder",
         "Embedder",
         "FakeEmbedder",
+        "ModelDownloadError",
+        "ModelIntegrityError",
         "ModelSpec",
         "OnnxEmbedder",
         "OnnxModel",

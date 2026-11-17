@@ -13,8 +13,9 @@ are imported when a :class:`TorchEmbedder` is built (or :func:`detect_device` is
 Backends:
 
 * :class:`TorchEmbedder` — sentence-transformers, extra ``rag-engine[torch]``;
-* :class:`OnnxEmbedder` — fastembed on the ONNX runtime, without PyTorch, extra
-  ``rag-engine[onnx]``;
+* :class:`OnnxEmbedder` — fastembed on the ONNX runtime (CPU), without PyTorch, extra
+  ``rag-engine[onnx]``. The ONNX file of a model of :data:`ONNX_MODELS` is pinned to one
+  revision and checked against its SHA-256 before it is loaded;
 * :class:`FakeEmbedder` — deterministic vectors without any model, for tests.
 
 :func:`make_embedder` builds the backend named by the settings. :func:`cosine_parity` compares
@@ -27,13 +28,17 @@ import gc
 import hashlib
 import logging
 import os
+import tempfile
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import numpy as np
+
+from rag_engine.errors import RagEngineError
 
 if TYPE_CHECKING:
     from rag_engine.config import Settings
@@ -44,6 +49,8 @@ __all__ = [
     "BaseEmbedder",
     "Embedder",
     "FakeEmbedder",
+    "ModelDownloadError",
+    "ModelIntegrityError",
     "ModelSpec",
     "OnnxEmbedder",
     "OnnxModel",
@@ -63,6 +70,22 @@ _ONNX_EXTRA = (
     "the onnx embedding backend needs the 'fastembed' package: "
     "install it with: pip install 'rag-engine[onnx]'"
 )
+
+
+class ModelIntegrityError(RagEngineError):
+    """A model file is not the one the engine pins: its size or its SHA-256 differs.
+
+    Raised before the file is loaded. The message names the model, the file, the hash
+    expected and the hash found.
+    """
+
+
+class ModelDownloadError(RagEngineError):
+    """The pinned files of a model are not in the model cache and could not be downloaded.
+
+    The message names the files, the repository and the revision they come from, and the
+    directory they were looked for in.
+    """
 
 
 @dataclass(frozen=True)
@@ -333,10 +356,18 @@ class TorchEmbedder(BaseEmbedder):
 
 @dataclass(frozen=True)
 class OnnxModel:
-    """How a model that fastembed does not ship is registered with it.
+    """One ONNX export the engine vouches for: where it comes from, and how it is run.
 
     ``dim``
         Dimension of the vectors of the model.
+    ``revision``
+        Commit of the Hugging Face repository the files are taken from: the full hash of 40
+        hexadecimal digits, never a branch or a tag, which can move.
+    ``sha256``
+        SHA-256 of the ONNX file, 64 lower-case hexadecimal digits. The file is hashed before
+        it is loaded, and a different hash is a :class:`ModelIntegrityError`.
+    ``size``
+        Size of the ONNX file, in bytes.
     ``model_file``
         Path of the ONNX file inside the Hugging Face repository.
     ``pooling``
@@ -346,13 +377,33 @@ class OnnxModel:
         Whether the vectors are scaled to unit length.
     ``hf``
         Hugging Face repository holding the ONNX file; ``None`` for the model name itself.
+
+    ``revision``, ``sha256`` and ``size`` have no default: an export cannot be listed without
+    being pinned. A value of another form raises a ``ValueError`` naming the field.
+
+    **These three values identify the file whose vectors were compared with those of
+    sentence-transformers.** Change them only after the parity test (``pytest -m models``) has
+    passed on the new file.
     """
 
     dim: int
+    revision: str
+    sha256: str
+    size: int
     model_file: str = "onnx/model.onnx"
     pooling: str = "mean"
     normalization: bool = True
     hf: str | None = None
+
+    def __post_init__(self) -> None:
+        for field, length in (("revision", 40), ("sha256", 64)):
+            value = getattr(self, field)
+            if not isinstance(value, str) or len(value) != length or set(value) - set("0123456789abcdef"):
+                raise ValueError(
+                    f"OnnxModel: {field} must be {length} lower-case hexadecimal digits, got {value!r}"
+                )
+        if type(self.size) is not int or self.size < 1:
+            raise ValueError(f"OnnxModel: size must be a number of bytes of at least 1, got {self.size!r}")
 
 
 ONNX_MODELS: Mapping[str, OnnxModel] = MappingProxyType(
@@ -360,15 +411,33 @@ ONNX_MODELS: Mapping[str, OnnxModel] = MappingProxyType(
         # The full-precision export published in the model's own repository, with the pipeline
         # of sentence-transformers for this model: mean pooling, then normalisation. The
         # repository also holds quantised variants; they are not used.
-        "intfloat/multilingual-e5-base": OnnxModel(dim=768),
+        # Parity with sentence-transformers was measured on exactly this file (cosine 1.0, see
+        # the README). Do not change the revision, the hash or the size before the parity test
+        # (pytest -m models) has passed on the new file.
+        "intfloat/multilingual-e5-base": OnnxModel(
+            dim=768,
+            revision="d128750597153bb5987e10b1c3493a34e5a4502a",
+            sha256="84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa",
+            size=1_110_059_084,
+        ),
     }
 )
-"""Models :class:`OnnxEmbedder` registers with fastembed when fastembed does not list them."""
+"""The models :class:`OnnxEmbedder` pins: for each name, the one ONNX export it loads.
+
+A name of this table is always loaded from the table, whatever fastembed lists under that name.
+"""
 
 ONNX_BATCH_SIZE = 32
 """Default number of texts per inference call of :class:`OnnxEmbedder`."""
 
+_ONNX_SUPPORT_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
+"""Files fastembed reads next to the ONNX file; taken from the same pinned revision."""
+
+_CPU_PROVIDERS = ("CPUExecutionProvider",)
+
 _onnx_registration_lock = threading.Lock()
+_sha256_lock = threading.Lock()
+_sha256_cache: dict[tuple[str, int, int], str] = {}
 
 
 def _fastembed_description(text_embedding: Any, name: str) -> Mapping[str, Any] | None:
@@ -379,22 +448,162 @@ def _fastembed_description(text_embedding: Any, name: str) -> Mapping[str, Any] 
     return None
 
 
+def _pinned_model(name: str) -> OnnxModel | None:
+    """The entry of :data:`ONNX_MODELS` for ``name``, compared without case as fastembed does."""
+    for known_name, known in ONNX_MODELS.items():
+        if known_name.lower() == name.lower():
+            return known
+    return None
+
+
+def _onnx_cache_dir(cache_dir: str | os.PathLike[str] | None) -> str:
+    """The model directory: ``cache_dir``, else the default of fastembed."""
+    if cache_dir is not None:
+        return os.fspath(cache_dir)
+    return os.environ.get("FASTEMBED_CACHE_PATH") or os.path.join(tempfile.gettempdir(), "fastembed_cache")
+
+
+def _pinned_model_dir(name: str, known: OnnxModel, cache_dir: str) -> Path:
+    """Directory holding the files of ``known`` at its pinned revision, downloaded if needed.
+
+    The files already in ``cache_dir`` are used without any request to the Hugging Face Hub.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise ImportError(_ONNX_EXTRA) from exc
+    repository = known.hf or name
+    files = [known.model_file, *_ONNX_SUPPORT_FILES]
+    request: dict[str, Any] = {"revision": known.revision, "allow_patterns": files, "cache_dir": cache_dir}
+
+    def missing_from(directory: Path) -> list[str]:
+        return [file for file in files if not (directory / file).is_file()]
+
+    try:
+        cached = Path(snapshot_download(repository, local_files_only=True, **request))
+    except Exception:  # noqa: BLE001 - not in the cache, whatever the form: the download reports
+        cached = None
+    if cached is not None and not missing_from(cached):
+        return cached
+    source = (
+        f"{', '.join(files)} of the Hugging Face repository {repository!r} at revision {known.revision} "
+        f"(https://huggingface.co/{repository}/tree/{known.revision})"
+    )
+    logger.info("Downloading %s into %s", source, cache_dir)
+    try:
+        downloaded = Path(snapshot_download(repository, **request))
+    except Exception as exc:
+        raise ModelDownloadError(
+            f"embedding model {name!r}: could not download {source} into {cache_dir!r}: "
+            f"{type(exc).__name__}: {exc}. On a host without access to huggingface.co, set "
+            "RAG_ENGINE_MODEL_CACHE to a directory already filled with these files (the directory "
+            "of a host where the model was loaded once can be copied as it is)"
+        ) from exc
+    missing = missing_from(downloaded)
+    if missing:
+        raise ModelDownloadError(
+            f"embedding model {name!r}: {', '.join(missing)} missing from {os.fspath(downloaded)!r} after "
+            f"the download of {source}"
+        )
+    return downloaded
+
+
+def _file_sha256(path: Path) -> tuple[str, int]:
+    """SHA-256 and size of a file. Computed once per process for a given path, size and mtime."""
+    resolved = os.path.realpath(path)
+    stat = os.stat(resolved)
+    key = (resolved, stat.st_size, stat.st_mtime_ns)
+    # Hashing inside the lock: embedders built at the same time hash the file once.
+    with _sha256_lock:
+        digest = _sha256_cache.get(key)
+        if digest is None:
+            hasher = hashlib.sha256()
+            with open(resolved, "rb") as stream:
+                while block := stream.read(1 << 20):
+                    hasher.update(block)
+            digest = _sha256_cache[key] = hasher.hexdigest()
+    return digest, stat.st_size
+
+
+def _verify_onnx_file(name: str, known: OnnxModel, path: Path) -> str:
+    """Check the ONNX file about to be loaded against the table; return its SHA-256."""
+    found, size = _file_sha256(path)
+    if found != known.sha256 or size != known.size:
+        raise ModelIntegrityError(
+            f"embedding model {name!r}: the ONNX file {os.fspath(path)!r} is not the pinned one. "
+            f"Expected sha256 {known.sha256} ({known.size} bytes), revision {known.revision} of "
+            f"{known.hf or name!r}; found sha256 {found} ({size} bytes). The vectors of this file were "
+            "never compared with those of sentence-transformers, so it is not loaded. If the file is "
+            # The real file, not the link of the snapshot: the Hub client keeps a blob it finds.
+            f"damaged, delete {os.path.realpath(path)!r} and it is downloaded again. If the model is "
+            "meant to change, parity must be re-measured (pytest -m models) before "
+            "rag_engine.embedding.ONNX_MODELS is updated"
+        )
+    return found
+
+
+def _register_pinned(text_embedding: Any, name: str, known: OnnxModel) -> str:
+    """Register ``known`` with fastembed; return the name it is registered under.
+
+    The name is the engine's own, not the model's: fastembed looks a model up by its name, and
+    would give its own definition for a name it lists itself. The name carries a fingerprint of
+    the whole table entry, so two different entries never share a registration.
+    """
+    fingerprint = hashlib.sha256(repr(known).encode()).hexdigest()[:16]
+    registered = f"rag-engine/{name}@{fingerprint}"
+    # The registry of fastembed is global to the process: two embedders built at the same
+    # time must not both register the model (the second registration is an error).
+    with _onnx_registration_lock:
+        if _fastembed_description(text_embedding, registered) is None:
+            from fastembed.common.model_description import ModelSource, PoolingType
+
+            text_embedding.add_custom_model(
+                model=registered,
+                pooling=PoolingType[known.pooling.upper()],
+                normalization=known.normalization,
+                sources=ModelSource(hf=known.hf or name),
+                dim=known.dim,
+                model_file=known.model_file,
+            )
+    return registered
+
+
 class OnnxEmbedder(BaseEmbedder):
-    """fastembed backend on the ONNX runtime, without PyTorch (extra ``rag-engine[onnx]``).
+    """fastembed backend on the ONNX runtime, on CPU, without PyTorch (extra ``rag-engine[onnx]``).
 
     ``cache_dir``
         Directory where the model files are stored; ``None`` leaves the default of fastembed
         (``FASTEMBED_CACHE_PATH``, or a directory under the system's temporary directory).
     ``threads``
-        Number of threads of the ONNX runtime session; ``None`` leaves its default.
+        Number of threads of the ONNX runtime session, at least 1; ``None`` leaves its default,
+        one thread per physical core of the *host*. In a container with a CPU limit, give the
+        limit: the runtime does not see it, and more threads than CPUs slow inference down.
     ``batch_size``
         Number of texts per inference call, at least 1. Texts of one call are padded to the
         longest of them, and the padding is left out of the pooling: the batch size bounds the
         memory, and changes the vectors by rounding noise only.
 
-    A model fastembed lists is used as fastembed defines it. A model it does not list is
-    registered from :data:`ONNX_MODELS`; a name found in neither raises a ``ValueError``. The
-    dimension fastembed declares is compared with ``spec.dim`` before anything is downloaded.
+    **A model of** :data:`ONNX_MODELS` **is pinned and verified.** Its files are those of the
+    revision of the table: found in ``cache_dir``, or else downloaded from the Hugging Face Hub
+    (:class:`ModelDownloadError` when that fails). When they are all in the cache, no request is
+    made to the Hub. The ONNX file is then hashed, and loaded only if its SHA-256 and size are
+    those of the table (:class:`ModelIntegrityError` otherwise): the file that runs is the one
+    whose vectors were compared with those of sentence-transformers. The hash of a file is
+    computed once per process (about a second per gigabyte) and kept for the same path, size
+    and modification time. Only the ONNX file is hashed; the tokenizer files come from the same
+    pinned revision. ``model_path`` and ``model_sha256`` give the file loaded and its hash.
+    fastembed is handed that directory and does not download anything, and the name is
+    registered with it under a name of the engine's own, so that a model fastembed would list
+    under the same name with another source or pooling is never used instead.
+
+    A model that is not in the table but that fastembed lists is used as fastembed defines and
+    downloads it, and a warning is logged: the engine neither pins nor verifies its file
+    (``model_path`` and ``model_sha256`` are ``None``). A name found in neither raises a
+    ``ValueError``. The declared dimension is compared with ``spec.dim`` before anything is
+    downloaded.
+
+    The session runs on the CPU execution provider only, also when the GPU build of
+    onnxruntime is installed: parity was measured on CPU.
 
     Texts are given to fastembed's plain ``embed``, with the prefix of the specification and
     nothing else. Texts longer than the model's limit (512 tokens for E5) are cut by the
@@ -419,55 +628,66 @@ class OnnxEmbedder(BaseEmbedder):
         super().__init__(spec)
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError(f"OnnxEmbedder: batch_size must be an integer of at least 1, got {batch_size!r}")
+        if threads is not None and (type(threads) is not int or threads < 1):
+            raise ValueError(
+                f"OnnxEmbedder: threads must be None or an integer of at least 1, got {threads!r}"
+            )
         try:
             from fastembed import TextEmbedding
         except ImportError as exc:
             raise ImportError(_ONNX_EXTRA) from exc
         self.batch_size = batch_size
+        self.model_path: Path | None = None
+        self.model_sha256: str | None = None
         self._lock = threading.Lock()
         self._model: Any = None
-        actual = self._registered_dimension(TextEmbedding)
-        if actual is not None and actual != spec.dim:
-            raise ValueError(
-                f"embedding model {spec.name!r} produces {actual}-dimensional vectors, but the "
-                f"configured dimension is {spec.dim} (check RAG_ENGINE_MODEL and RAG_ENGINE_DIM)"
-            )
-        options: dict[str, Any] = {}
-        if cache_dir is not None:
-            options["cache_dir"] = os.fspath(cache_dir)
+        # The CPU provider is named: left to itself, fastembed picks CUDA when onnxruntime has it.
+        options: dict[str, Any] = {"providers": list(_CPU_PROVIDERS)}
         if threads is not None:
             options["threads"] = threads
-        logger.info("Loading ONNX embedding model %s", spec.name)
-        self._model = TextEmbedding(spec.name, **options)
+        known = _pinned_model(spec.name)
+        if known is not None:
+            self._check_dimension(known.dim)
+            cache = _onnx_cache_dir(cache_dir)
+            model_dir = _pinned_model_dir(spec.name, known, cache)
+            self.model_path = model_dir / known.model_file
+            self.model_sha256 = _verify_onnx_file(spec.name, known, self.model_path)
+            registered = _register_pinned(TextEmbedding, spec.name, known)
+            # specific_model_path: fastembed loads this directory and downloads nothing.
+            options.update(cache_dir=cache, specific_model_path=os.fspath(model_dir))
+            logger.info(
+                "Loading ONNX embedding model %s (revision %s, sha256 %s verified)",
+                spec.name,
+                known.revision,
+                self.model_sha256,
+            )
+        else:
+            listed = _fastembed_description(TextEmbedding, spec.name)
+            if listed is None:
+                raise ValueError(
+                    f"embedding model {spec.name!r} is not available to the onnx backend: it is not "
+                    f"in rag_engine.embedding.ONNX_MODELS ({', '.join(sorted(ONNX_MODELS))}) and "
+                    "fastembed does not list it (check RAG_ENGINE_MODEL, or set RAG_ENGINE_BACKEND=torch)"
+                )
+            self._check_dimension(listed.get("dim"))
+            registered = spec.name
+            if cache_dir is not None:
+                options["cache_dir"] = os.fspath(cache_dir)
+            logger.warning(
+                "ONNX embedding model %s is not in rag_engine.embedding.ONNX_MODELS: fastembed "
+                "downloads and loads it as it defines it; its file is not pinned or verified by the "
+                "engine, and its parity with the torch backend was not measured",
+                spec.name,
+            )
+        self._model = TextEmbedding(registered, **options)
         logger.info("ONNX embedding model ready (dim=%d)", spec.dim)
 
-    def _registered_dimension(self, text_embedding: Any) -> int | None:
-        """Make sure fastembed knows the model; return the dimension it declares, if any."""
-        name = self._spec.name
-        # The registry of fastembed is global to the process: two embedders built at the same
-        # time must not both register the model (the second registration is an error).
-        with _onnx_registration_lock:
-            listed = _fastembed_description(text_embedding, name)
-            if listed is not None:
-                return listed.get("dim")
-            known = ONNX_MODELS.get(name)
-            if known is None:
-                raise ValueError(
-                    f"embedding model {name!r} is not available to the onnx backend: fastembed does "
-                    f"not list it, and the engine can only register {', '.join(sorted(ONNX_MODELS))} "
-                    "(check RAG_ENGINE_MODEL, or set RAG_ENGINE_BACKEND=torch)"
-                )
-            from fastembed.common.model_description import ModelSource, PoolingType
-
-            text_embedding.add_custom_model(
-                model=name,
-                pooling=PoolingType[known.pooling.upper()],
-                normalization=known.normalization,
-                sources=ModelSource(hf=known.hf or name),
-                dim=known.dim,
-                model_file=known.model_file,
+    def _check_dimension(self, declared: int | None) -> None:
+        if declared is not None and declared != self._spec.dim:
+            raise ValueError(
+                f"embedding model {self._spec.name!r} produces {declared}-dimensional vectors, but the "
+                f"configured dimension is {self._spec.dim} (check RAG_ENGINE_MODEL and RAG_ENGINE_DIM)"
             )
-            return known.dim
 
     def _embed(self, prefixed: list[str]) -> Any:
         with self._lock:
@@ -558,7 +778,7 @@ def make_embedder(settings: Settings, **kwargs: Any) -> Embedder:
     The model comes from :meth:`ModelSpec.from_settings`, and ``settings.model_cache`` is the
     directory of the model files. ``kwargs`` go to the constructor of the backend and win over
     the settings: ``device`` and ``cache_dir`` for the torch backend; ``cache_dir``, ``threads``
-    and ``batch_size`` for the onnx backend.
+    and ``batch_size`` for the onnx backend, whose ``threads`` default to ``settings.onnx_threads``.
     """
     spec = ModelSpec.from_settings(settings)
     if settings.backend == "torch":
@@ -566,5 +786,6 @@ def make_embedder(settings: Settings, **kwargs: Any) -> Embedder:
         return TorchEmbedder(spec, **kwargs)
     if settings.backend == "onnx":
         kwargs.setdefault("cache_dir", settings.model_cache)
+        kwargs.setdefault("threads", settings.onnx_threads)
         return OnnxEmbedder(spec, **kwargs)
     raise ValueError(f"unknown embedding backend {settings.backend!r} (expected torch or onnx)")

@@ -77,6 +77,11 @@ def _int(environ: Mapping[str, str], name: str, default: int) -> int:
         raise ConfigError(f"{name}={_show(environ[name])} is not an integer") from None
 
 
+def _optional_int(environ: Mapping[str, str], name: str) -> int | None:
+    """The integer in ``name``; ``None`` when the variable is unset or blank."""
+    return None if _text(environ, name) is None else _int(environ, name, 0)
+
+
 def _float(environ: Mapping[str, str], name: str, default: float) -> float:
     raw = _text(environ, name)
     if raw is None:
@@ -134,10 +139,11 @@ class Settings:
     * Direct construction takes values as they are and converts nothing: an integer must be an
       ``int`` (not a ``bool``, a ``float`` or a numeric string), ``qdrant_https`` must be a
       ``bool`` (the string ``"false"`` is refused, it would be truthy), ``parity_min`` must be
-      a ``float`` (not an ``int``, a ``bool`` or a numeric string), every other field must
-      be a ``str``, and ``backend`` must be exactly ``"torch"`` or ``"onnx"``. Strings are not
-      stripped. An empty or whitespace-only ``qdrant_host`` or ``model_name`` is refused; an
-      empty or whitespace-only ``qdrant_api_key`` or ``model_cache`` becomes ``None``.
+      a ``float`` (not an ``int``, a ``bool`` or a numeric string), ``onnx_threads`` must be
+      an ``int`` or ``None``, every other field must be a ``str``, and ``backend`` must be
+      exactly ``"torch"`` or ``"onnx"``. Strings are not stripped. An empty or whitespace-only
+      ``qdrant_host`` or ``model_name`` is refused; an empty or whitespace-only
+      ``qdrant_api_key`` or ``model_cache`` becomes ``None``.
 
     The API key is never printed: ``repr()`` and ``str()`` show ``qdrant_api_key=<set>`` or
     ``qdrant_api_key=<unset>``, and no error message echoes it. It is still a plain attribute,
@@ -184,6 +190,12 @@ class Settings:
     ``model_cache`` — ``RAG_ENGINE_MODEL_CACHE``, default ``None``
         Directory where model files are stored. ``None`` (unset or blank) leaves the
         backend's own default.
+    ``onnx_threads`` — ``RAG_ENGINE_ONNX_THREADS``, default ``None``
+        Number of threads the ``onnx`` backend runs inference on, at least 1. ``None`` (unset
+        or blank) lets the ONNX runtime decide: one thread per physical core of the host. The
+        runtime does not see the CPU limit of a container: there, set this to the limit (2 for
+        ``--cpus=2``), or inference is slowed down by more threads than CPUs. The ``torch``
+        backend does not read it.
     ``parity_min`` — ``RAG_ENGINE_PARITY_MIN``, default ``0.999``
         Smallest cosine accepted between the vectors the ``torch`` and ``onnx`` backends give
         for the same text, above 0 and at most 1. The engine itself never reads it: it is the
@@ -233,6 +245,7 @@ class Settings:
     search_max_limit: int = 50
     model_cache: str | None = None
     parity_min: float = 0.999
+    onnx_threads: int | None = None
 
     def __post_init__(self) -> None:
         self._check_types()
@@ -246,6 +259,8 @@ class Settings:
         ):
             if value < 1:
                 raise ConfigError(f"{name}={_show(value)} must be at least 1")
+        if self.onnx_threads is not None and self.onnx_threads < 1:
+            raise ConfigError(f"RAG_ENGINE_ONNX_THREADS={_show(self.onnx_threads)} must be at least 1")
         for name, value in (("QDRANT_HOST", self.qdrant_host), ("RAG_ENGINE_MODEL", self.model_name)):
             if not value.strip():
                 raise ConfigError(f"{name}={_show(value)} must not be empty")
@@ -285,6 +300,11 @@ class Settings:
         ):
             if type(value) is not int:  # a bool is an int subclass, and is not a count
                 raise ConfigError(f"{name}={_show(value)} must be an integer, not {type(value).__name__}")
+        if self.onnx_threads is not None and type(self.onnx_threads) is not int:
+            raise ConfigError(
+                f"RAG_ENGINE_ONNX_THREADS={_show(self.onnx_threads)} must be an integer or None, "
+                f"not {type(self.onnx_threads).__name__}"
+            )
         if type(self.qdrant_https) is not bool:
             raise ConfigError(
                 f"QDRANT_HTTPS={_show(self.qdrant_https)} must be a boolean (True or False), "
@@ -347,4 +367,5 @@ class Settings:
             search_max_limit=_int(env, "RAG_ENGINE_SEARCH_MAX_LIMIT", cls.search_max_limit),
             model_cache=_text(env, "RAG_ENGINE_MODEL_CACHE"),
             parity_min=_float(env, "RAG_ENGINE_PARITY_MIN", cls.parity_min),
+            onnx_threads=_optional_int(env, "RAG_ENGINE_ONNX_THREADS"),
         )
