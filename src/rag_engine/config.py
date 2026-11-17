@@ -77,6 +77,16 @@ def _int(environ: Mapping[str, str], name: str, default: int) -> int:
         raise ConfigError(f"{name}={_show(environ[name])} is not an integer") from None
 
 
+def _float(environ: Mapping[str, str], name: str, default: float) -> float:
+    raw = _text(environ, name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ConfigError(f"{name}={_show(environ[name])} is not a number") from None
+
+
 def _bool(environ: Mapping[str, str], name: str, default: bool) -> bool:
     raw = _text(environ, name)
     if raw is None:
@@ -118,12 +128,13 @@ class Settings:
     :class:`ConfigError` on an invalid value, and apply the same range checks. They differ in
     how lenient they are about the form of a value:
 
-    * :meth:`from_env` parses text: it strips surrounding whitespace, reads integers and
-      booleans from their text form, lower-cases the backend, and replaces a blank value by
+    * :meth:`from_env` parses text: it strips surrounding whitespace, reads integers, numbers
+      and booleans from their text form, lower-cases the backend, and replaces a blank value by
       the default. The two prefixes have their own rule, given below.
     * Direct construction takes values as they are and converts nothing: an integer must be an
       ``int`` (not a ``bool``, a ``float`` or a numeric string), ``qdrant_https`` must be a
-      ``bool`` (the string ``"false"`` is refused, it would be truthy), every other field must
+      ``bool`` (the string ``"false"`` is refused, it would be truthy), ``parity_min`` must be
+      a ``float`` (not an ``int``, a ``bool`` or a numeric string), every other field must
       be a ``str``, and ``backend`` must be exactly ``"torch"`` or ``"onnx"``. Strings are not
       stripped. An empty or whitespace-only ``qdrant_host`` or ``model_name`` is refused; an
       empty or whitespace-only ``qdrant_api_key`` or ``model_cache`` becomes ``None``.
@@ -173,6 +184,11 @@ class Settings:
     ``model_cache`` — ``RAG_ENGINE_MODEL_CACHE``, default ``None``
         Directory where model files are stored. ``None`` (unset or blank) leaves the
         backend's own default.
+    ``parity_min`` — ``RAG_ENGINE_PARITY_MIN``, default ``0.999``
+        Smallest cosine accepted between the vectors the ``torch`` and ``onnx`` backends give
+        for the same text, above 0 and at most 1. The engine itself never reads it: it is the
+        tolerance of the parity test (``tests/test_parity.py``, marker ``models``), to compare
+        with what :func:`rag_engine.embedding.cosine_parity` returns.
 
     Ingestion:
 
@@ -216,6 +232,7 @@ class Settings:
     search_limit: int = 10
     search_max_limit: int = 50
     model_cache: str | None = None
+    parity_min: float = 0.999
 
     def __post_init__(self) -> None:
         self._check_types()
@@ -239,6 +256,8 @@ class Settings:
                 f"RAG_ENGINE_OCR_LANGUAGES={_show(self.ocr_languages)} is not a list of Tesseract "
                 "language codes joined by '+' (for example 'eng+fra')"
             )
+        if not 0.0 < self.parity_min <= 1.0:  # a NaN fails both comparisons
+            raise ConfigError(f"RAG_ENGINE_PARITY_MIN={_show(self.parity_min)} must be above 0 and at most 1")
         if self.search_limit > self.search_max_limit:
             raise ConfigError(
                 f"RAG_ENGINE_SEARCH_LIMIT={_show(self.search_limit)} is above "
@@ -270,6 +289,11 @@ class Settings:
             raise ConfigError(
                 f"QDRANT_HTTPS={_show(self.qdrant_https)} must be a boolean (True or False), "
                 f"not {type(self.qdrant_https).__name__}"
+            )
+        if type(self.parity_min) is not float:
+            raise ConfigError(
+                f"RAG_ENGINE_PARITY_MIN={_show(self.parity_min)} must be a float, "
+                f"not {type(self.parity_min).__name__}"
             )
         if self.qdrant_api_key is not None:
             if not isinstance(self.qdrant_api_key, str):
@@ -322,4 +346,5 @@ class Settings:
             search_limit=_int(env, "RAG_ENGINE_SEARCH_LIMIT", cls.search_limit),
             search_max_limit=_int(env, "RAG_ENGINE_SEARCH_MAX_LIMIT", cls.search_max_limit),
             model_cache=_text(env, "RAG_ENGINE_MODEL_CACHE"),
+            parity_min=_float(env, "RAG_ENGINE_PARITY_MIN", cls.parity_min),
         )

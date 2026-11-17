@@ -7,14 +7,18 @@ only implements :meth:`BaseEmbedder._embed`, which receives texts that already c
 prefix: a backend cannot forget the prefix, nor apply it twice.
 
 Importing this module is light: it needs numpy only. ``torch`` and ``sentence_transformers``
-are imported when a :class:`TorchEmbedder` is built (or :func:`detect_device` is called).
+are imported when a :class:`TorchEmbedder` is built (or :func:`detect_device` is called), and
+``fastembed`` when an :class:`OnnxEmbedder` is built.
 
 Backends:
 
 * :class:`TorchEmbedder` — sentence-transformers, extra ``rag-engine[torch]``;
+* :class:`OnnxEmbedder` — fastembed on the ONNX runtime, without PyTorch, extra
+  ``rag-engine[onnx]``;
 * :class:`FakeEmbedder` — deterministic vectors without any model, for tests.
 
-:func:`make_embedder` builds the backend named by the settings.
+:func:`make_embedder` builds the backend named by the settings. :func:`cosine_parity` compares
+the vectors of two backends, text by text.
 """
 
 from __future__ import annotations
@@ -24,8 +28,9 @@ import hashlib
 import logging
 import os
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import numpy as np
@@ -34,11 +39,16 @@ if TYPE_CHECKING:
     from rag_engine.config import Settings
 
 __all__ = [
+    "ONNX_BATCH_SIZE",
+    "ONNX_MODELS",
     "BaseEmbedder",
     "Embedder",
     "FakeEmbedder",
     "ModelSpec",
+    "OnnxEmbedder",
+    "OnnxModel",
     "TorchEmbedder",
+    "cosine_parity",
     "detect_device",
     "make_embedder",
 ]
@@ -48,6 +58,10 @@ logger = logging.getLogger(__name__)
 _TORCH_EXTRA = (
     "the torch embedding backend needs the 'torch' and 'sentence-transformers' packages: "
     "install them with: pip install 'rag-engine[torch]'"
+)
+_ONNX_EXTRA = (
+    "the onnx embedding backend needs the 'fastembed' package: "
+    "install it with: pip install 'rag-engine[onnx]'"
 )
 
 
@@ -317,6 +331,169 @@ class TorchEmbedder(BaseEmbedder):
         logger.info("Embedding model released")
 
 
+@dataclass(frozen=True)
+class OnnxModel:
+    """How a model that fastembed does not ship is registered with it.
+
+    ``dim``
+        Dimension of the vectors of the model.
+    ``model_file``
+        Path of the ONNX file inside the Hugging Face repository.
+    ``pooling``
+        How token vectors become one vector: ``"mean"`` (average over the attention mask, so
+        padding does not count), ``"cls"``, ``"last_token"`` or ``"disabled"``.
+    ``normalization``
+        Whether the vectors are scaled to unit length.
+    ``hf``
+        Hugging Face repository holding the ONNX file; ``None`` for the model name itself.
+    """
+
+    dim: int
+    model_file: str = "onnx/model.onnx"
+    pooling: str = "mean"
+    normalization: bool = True
+    hf: str | None = None
+
+
+ONNX_MODELS: Mapping[str, OnnxModel] = MappingProxyType(
+    {
+        # The full-precision export published in the model's own repository, with the pipeline
+        # of sentence-transformers for this model: mean pooling, then normalisation. The
+        # repository also holds quantised variants; they are not used.
+        "intfloat/multilingual-e5-base": OnnxModel(dim=768),
+    }
+)
+"""Models :class:`OnnxEmbedder` registers with fastembed when fastembed does not list them."""
+
+ONNX_BATCH_SIZE = 32
+"""Default number of texts per inference call of :class:`OnnxEmbedder`."""
+
+_onnx_registration_lock = threading.Lock()
+
+
+def _fastembed_description(text_embedding: Any, name: str) -> Mapping[str, Any] | None:
+    """What fastembed lists for ``name`` (names compare without case); ``None`` when it does not."""
+    for description in text_embedding.list_supported_models():
+        if str(description.get("model", "")).lower() == name.lower():
+            return description
+    return None
+
+
+class OnnxEmbedder(BaseEmbedder):
+    """fastembed backend on the ONNX runtime, without PyTorch (extra ``rag-engine[onnx]``).
+
+    ``cache_dir``
+        Directory where the model files are stored; ``None`` leaves the default of fastembed
+        (``FASTEMBED_CACHE_PATH``, or a directory under the system's temporary directory).
+    ``threads``
+        Number of threads of the ONNX runtime session; ``None`` leaves its default.
+    ``batch_size``
+        Number of texts per inference call, at least 1. Texts of one call are padded to the
+        longest of them, and the padding is left out of the pooling: the batch size bounds the
+        memory, and changes the vectors by rounding noise only.
+
+    A model fastembed lists is used as fastembed defines it. A model it does not list is
+    registered from :data:`ONNX_MODELS`; a name found in neither raises a ``ValueError``. The
+    dimension fastembed declares is compared with ``spec.dim`` before anything is downloaded.
+
+    Texts are given to fastembed's plain ``embed``, with the prefix of the specification and
+    nothing else. Texts longer than the model's limit (512 tokens for E5) are cut by the
+    tokenizer, as sentence-transformers does. Inference is serialised by a lock, so one
+    instance can be shared between threads.
+
+    The vectors are meant to be compared with those of :class:`TorchEmbedder` for the same
+    model: passages indexed with torch can be searched with queries embedded here. They are
+    close, not bit-identical; :func:`cosine_parity` measures how close.
+
+    Use it as a context manager, or call :meth:`release`, to free the memory of the model.
+    """
+
+    def __init__(
+        self,
+        spec: ModelSpec,
+        *,
+        cache_dir: str | os.PathLike[str] | None = None,
+        threads: int | None = None,
+        batch_size: int = ONNX_BATCH_SIZE,
+    ) -> None:
+        super().__init__(spec)
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError(f"OnnxEmbedder: batch_size must be an integer of at least 1, got {batch_size!r}")
+        try:
+            from fastembed import TextEmbedding
+        except ImportError as exc:
+            raise ImportError(_ONNX_EXTRA) from exc
+        self.batch_size = batch_size
+        self._lock = threading.Lock()
+        self._model: Any = None
+        actual = self._registered_dimension(TextEmbedding)
+        if actual is not None and actual != spec.dim:
+            raise ValueError(
+                f"embedding model {spec.name!r} produces {actual}-dimensional vectors, but the "
+                f"configured dimension is {spec.dim} (check RAG_ENGINE_MODEL and RAG_ENGINE_DIM)"
+            )
+        options: dict[str, Any] = {}
+        if cache_dir is not None:
+            options["cache_dir"] = os.fspath(cache_dir)
+        if threads is not None:
+            options["threads"] = threads
+        logger.info("Loading ONNX embedding model %s", spec.name)
+        self._model = TextEmbedding(spec.name, **options)
+        logger.info("ONNX embedding model ready (dim=%d)", spec.dim)
+
+    def _registered_dimension(self, text_embedding: Any) -> int | None:
+        """Make sure fastembed knows the model; return the dimension it declares, if any."""
+        name = self._spec.name
+        # The registry of fastembed is global to the process: two embedders built at the same
+        # time must not both register the model (the second registration is an error).
+        with _onnx_registration_lock:
+            listed = _fastembed_description(text_embedding, name)
+            if listed is not None:
+                return listed.get("dim")
+            known = ONNX_MODELS.get(name)
+            if known is None:
+                raise ValueError(
+                    f"embedding model {name!r} is not available to the onnx backend: fastembed does "
+                    f"not list it, and the engine can only register {', '.join(sorted(ONNX_MODELS))} "
+                    "(check RAG_ENGINE_MODEL, or set RAG_ENGINE_BACKEND=torch)"
+                )
+            from fastembed.common.model_description import ModelSource, PoolingType
+
+            text_embedding.add_custom_model(
+                model=name,
+                pooling=PoolingType[known.pooling.upper()],
+                normalization=known.normalization,
+                sources=ModelSource(hf=known.hf or name),
+                dim=known.dim,
+                model_file=known.model_file,
+            )
+            return known.dim
+
+    def _embed(self, prefixed: list[str]) -> Any:
+        with self._lock:
+            if self._model is None:
+                raise RuntimeError(
+                    "this OnnxEmbedder has been released: create a new one instead of reusing it "
+                    "after release() or after the end of its 'with' block"
+                )
+            # fastembed returns a generator that runs the model as it is read: it is read
+            # here, inside the lock.
+            return list(self._model.embed(prefixed, batch_size=self.batch_size))
+
+    def release(self) -> None:
+        """Free the model. A second call does nothing.
+
+        Waits for a running inference to finish. Later calls to ``encode_passage`` or
+        ``encode_query`` raise a ``RuntimeError``.
+        """
+        with self._lock:
+            if self._model is None:
+                return
+            self._model = None
+            gc.collect()
+        logger.info("ONNX embedding model released")
+
+
 class FakeEmbedder(BaseEmbedder):
     """Deterministic vectors without any model, for tests. Needs numpy only.
 
@@ -358,20 +535,36 @@ class FakeEmbedder(BaseEmbedder):
         self._released = True
 
 
+def cosine_parity(a: Any, b: Any) -> np.ndarray:
+    """Cosine similarity of each row of ``a`` with the same row of ``b``: ``float64``, shape ``(n,)``.
+
+    ``a`` and ``b`` are two arrays of vectors of the same shape ``(n, dim)``, for example the
+    vectors of the same texts from two backends; anything else raises a ``ValueError``. A row
+    of zeros has no direction: its cosine is ``nan``.
+    """
+    left, right = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    if left.ndim != 2 or left.shape != right.shape:
+        raise ValueError(
+            f"cosine_parity takes two arrays of the same shape (n, dim), got {left.shape} and {right.shape}"
+        )
+    norms = np.linalg.norm(left, axis=1) * np.linalg.norm(right, axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.einsum("ij,ij->i", left, right) / norms
+
+
 def make_embedder(settings: Settings, **kwargs: Any) -> Embedder:
     """Build the embedding backend named by ``settings.backend``.
 
     The model comes from :meth:`ModelSpec.from_settings`, and ``settings.model_cache`` is the
     directory of the model files. ``kwargs`` go to the constructor of the backend and win over
-    the settings: ``device`` and ``cache_dir`` for the torch backend.
+    the settings: ``device`` and ``cache_dir`` for the torch backend; ``cache_dir``, ``threads``
+    and ``batch_size`` for the onnx backend.
     """
     spec = ModelSpec.from_settings(settings)
     if settings.backend == "torch":
         kwargs.setdefault("cache_dir", settings.model_cache)
         return TorchEmbedder(spec, **kwargs)
     if settings.backend == "onnx":
-        raise NotImplementedError(
-            "the onnx embedding backend is not available in this version of rag-engine: "
-            "set RAG_ENGINE_BACKEND=torch"
-        )
+        kwargs.setdefault("cache_dir", settings.model_cache)
+        return OnnxEmbedder(spec, **kwargs)
     raise ValueError(f"unknown embedding backend {settings.backend!r} (expected torch or onnx)")

@@ -26,6 +26,7 @@ DEFAULTS = {
     "search_limit": 10,
     "search_max_limit": 50,
     "model_cache": None,
+    "parity_min": 0.999,
 }
 
 # Every variable where a blank value means "use the default".
@@ -42,6 +43,7 @@ BLANK_FALLS_BACK = [
     "RAG_ENGINE_SEARCH_LIMIT",
     "RAG_ENGINE_SEARCH_MAX_LIMIT",
     "RAG_ENGINE_MODEL_CACHE",
+    "RAG_ENGINE_PARITY_MIN",
 ]
 
 
@@ -79,6 +81,7 @@ def test_all_values_read_from_the_mapping():
         "RAG_ENGINE_SEARCH_LIMIT": "5",
         "RAG_ENGINE_SEARCH_MAX_LIMIT": "20",
         "RAG_ENGINE_MODEL_CACHE": "/var/cache/models",
+        "RAG_ENGINE_PARITY_MIN": " 0.9995 ",
     }
     assert dataclasses.asdict(Settings.from_env(env)) == {
         "qdrant_host": "qdrant.internal",
@@ -95,6 +98,7 @@ def test_all_values_read_from_the_mapping():
         "search_limit": 5,
         "search_max_limit": 20,
         "model_cache": "/var/cache/models",
+        "parity_min": 0.9995,
     }
 
 
@@ -413,6 +417,9 @@ INVALID_ENV = [
     {"RAG_ENGINE_OCR_LANGUAGES": "eng,fra"},
     {"RAG_ENGINE_SEARCH_LIMIT": "51"},
     {"RAG_ENGINE_SEARCH_MAX_LIMIT": "5"},
+    {"RAG_ENGINE_PARITY_MIN": "high"},
+    {"RAG_ENGINE_PARITY_MIN": "0"},
+    {"RAG_ENGINE_PARITY_MIN": "1.5"},
 ]
 
 INVALID_KWARGS = [
@@ -431,6 +438,8 @@ INVALID_KWARGS = [
     {"search_limit": 100},
     {"search_max_limit": 5},
     {"model_cache": 5},
+    {"parity_min": 1},
+    {"parity_min": 0.0},
 ]
 
 
@@ -591,3 +600,42 @@ def test_dotenv_file_in_the_working_directory_is_ignored(tmp_path):
     result = _run(code, _clean_environment(), cwd=tmp_path)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "6333 localhost torch"
+
+
+# ---------------------------------------------------------------------------
+# parity_min
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(("raw", "expected"), [("1", 1.0), ("1.0", 1.0), ("0.5", 0.5), ("9.99e-1", 0.999)])
+def test_parity_min_is_read_as_a_number(raw, expected):
+    value = Settings.from_env({"RAG_ENGINE_PARITY_MIN": raw}).parity_min
+    assert type(value) is float
+    assert value == expected
+
+
+@pytest.mark.parametrize("raw", ["high", "0,999", "0.999x"])
+def test_parity_min_that_is_not_a_number_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_PARITY_MIN=.*not a number"):
+        Settings.from_env({"RAG_ENGINE_PARITY_MIN": raw})
+
+
+@pytest.mark.parametrize("raw", ["0", "-0.5", "1.0001", "2", "nan", "inf", "-inf"])
+def test_parity_min_outside_its_range_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_PARITY_MIN=.*above 0 and at most 1"):
+        Settings.from_env({"RAG_ENGINE_PARITY_MIN": raw})
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, 1.0000001, float("nan"), float("inf")])
+def test_direct_parity_min_outside_its_range_is_refused(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_PARITY_MIN"):
+        Settings(parity_min=value)
+
+
+@pytest.mark.parametrize("value", [1, True, "0.999", None])
+def test_direct_parity_min_must_be_a_float(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_PARITY_MIN=.*must be a float"):
+        Settings(parity_min=value)
+
+
+def test_direct_parity_min_accepts_the_bounds_of_its_range():
+    assert Settings(parity_min=1.0).parity_min == 1.0
+    assert Settings(parity_min=1e-9).parity_min == 1e-9
