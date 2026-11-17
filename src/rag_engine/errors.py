@@ -2,7 +2,10 @@
 
 ``except RagEngineError`` catches every error raised under a class of this package:
 :class:`rag_engine.config.ConfigError`, :class:`rag_engine.store.StoreError` and its
-subclasses, :class:`rag_engine.chunking.UnsupportedFormatError`,
+subclasses (:class:`~rag_engine.store.QdrantAuthError`,
+:class:`~rag_engine.store.CollectionMismatchError`,
+:class:`~rag_engine.store.CollectionNotFoundError`),
+:class:`rag_engine.chunking.UnsupportedFormatError`,
 :class:`rag_engine.search.SearchError`, :class:`rag_engine.eval.EvalError`,
 :class:`rag_engine.embedding.ModelIntegrityError` and
 :class:`rag_engine.embedding.ModelDownloadError`. It does not catch what the
