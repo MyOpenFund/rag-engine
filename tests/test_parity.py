@@ -273,7 +273,11 @@ def test_the_fixed_texts_are_the_ones_described():
 
 @pytest.fixture(scope="module")
 def vectors():
-    """Vectors of every fixed text from both backends, with the settings of the environment."""
+    """Vectors of every fixed text from both backends.
+
+    Of the environment, only RAG_ENGINE_MODEL_CACHE and RAG_ENGINE_PARITY_MIN reach this test
+    (see tests/conftest.py); every other setting has its default.
+    """
     pytest.importorskip("sentence_transformers")
     pytest.importorskip("fastembed")
     settings = Settings.from_env()

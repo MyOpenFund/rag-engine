@@ -98,4 +98,7 @@ jobs:
         with:
           path: .model-cache
           key: models-intfloat-multilingual-e5-base-${{ steps.pin.outputs.revision }}
+      # The import guarantee is checked here too: this is the only job where torch and
+      # fastembed are both installed, the install in which a stray import would show.
+      - run: python -m pytest tests/test_packaging.py -q
       - run: python -m pytest -m models -q -s
