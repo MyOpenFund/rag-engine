@@ -1,0 +1,2 @@
+tests/fixtures/golden/* -text
+tests/fixtures/golden/*.pdf binary

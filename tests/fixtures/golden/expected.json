@@ -1,0 +1,297 @@
+{
+ "captured_with": {
+  "python": "3.13.18",
+  "chunknorris": "1.5.0",
+  "pymupdf": "1.27.2.2"
+ },
+ "embedder": {
+  "model": {
+   "name": "golden-fake",
+   "dim": 8,
+   "passage_prefix": "passage: ",
+   "query_prefix": "query: "
+  },
+  "seed": 0
+ },
+ "ocr": "never",
+ "documents": [
+  {
+   "file": "monetary-policy-statement.md",
+   "collection": "central-bank-e5b-v1",
+   "doc_id": "ecb/monetary-policy-statement/2025-10-30",
+   "metadata": {
+    "corpus": "central-bank",
+    "source_code": "ecb",
+    "doc_type": "monetary_policy_statement",
+    "title": "Décision de politique monétaire",
+    "date": "2025-10-30",
+    "year": 2025,
+    "language": "fr",
+    "provenance": "manifest",
+    "sha256": "6d87846e414048156d45eb3d4bc81ba9244306abb361148881a828f654a02838"
+   },
+   "ingestion_date": "2026-11-17T15:38:52.945007",
+   "points": [
+    {
+     "id": 944144228310869894,
+     "payload": {
+      "doc_id": "ecb/monetary-policy-statement/2025-10-30",
+      "corpus": "central-bank",
+      "source_code": "ecb",
+      "doc_type": "monetary_policy_statement",
+      "title": "Décision de politique monétaire",
+      "date": "2025-10-30",
+      "year": 2025,
+      "language": "fr",
+      "provenance": "manifest",
+      "sha256": "6d87846e414048156d45eb3d4bc81ba9244306abb361148881a828f654a02838",
+      "filename": "monetary-policy-statement.md",
+      "chunk_number": 0,
+      "ingestion_date": "2026-11-17T15:38:52.945007",
+      "text": "# Décision de politique monétaire\n\nLe Conseil des gouverneurs a décidé de maintenir inchangés les trois taux d'intérêt directeurs. Les informations disponibles confirment globalement son évaluation précédente des perspectives d'inflation à moyen terme, même si l'incertitude liée à l'environnement extérieur reste élevée et appelle une approche prudente, réunion par réunion."
+     },
+     "vector": [
+      -0.06941802054643631,
+      0.3895176649093628,
+      0.05285997316241264,
+      0.546700656414032,
+      0.3422512412071228,
+      0.1366346925497055,
+      0.364389032125473,
+      0.5226825475692749
+     ]
+    },
+    {
+     "id": 4328264385989982425,
+     "payload": {
+      "doc_id": "ecb/monetary-policy-statement/2025-10-30",
+      "corpus": "central-bank",
+      "source_code": "ecb",
+      "doc_type": "monetary_policy_statement",
+      "title": "Décision de politique monétaire",
+      "date": "2025-10-30",
+      "year": 2025,
+      "language": "fr",
+      "provenance": "manifest",
+      "sha256": "6d87846e414048156d45eb3d4bc81ba9244306abb361148881a828f654a02838",
+      "filename": "monetary-policy-statement.md",
+      "chunk_number": 1,
+      "ingestion_date": "2026-11-17T15:38:52.945007",
+      "text": "# Décision de politique monétaire\n\n## Activité économique\n\nL'économie de la zone euro a progressé de 0,3 % au troisième trimestre, portée par la consommation des ménages et par une reprise modérée de l'investissement. Le marché du travail demeure solide : le taux de chômage s'établit à 6,3 %, un niveau proche de son plus bas historique. Les enquêtes signalent toutefois un secteur manufacturier encore fragile, pénalisé par des coûts de l'énergie élevés et par une demande étrangère atone."
+     },
+     "vector": [
+      0.42518511414527893,
+      0.25177982449531555,
+      -0.17206527292728424,
+      -0.4034525156021118,
+      0.392251193523407,
+      0.39711856842041016,
+      -0.14229311048984528,
+      -0.4812823235988617
+     ]
+    },
+    {
+     "id": 155244955037468742,
+     "payload": {
+      "doc_id": "ecb/monetary-policy-statement/2025-10-30",
+      "corpus": "central-bank",
+      "source_code": "ecb",
+      "doc_type": "monetary_policy_statement",
+      "title": "Décision de politique monétaire",
+      "date": "2025-10-30",
+      "year": 2025,
+      "language": "fr",
+      "provenance": "manifest",
+      "sha256": "6d87846e414048156d45eb3d4bc81ba9244306abb361148881a828f654a02838",
+      "filename": "monetary-policy-statement.md",
+      "chunk_number": 2,
+      "ingestion_date": "2026-11-17T15:38:52.945007",
+      "text": "# Décision de politique monétaire\n\n## Inflation\n\nL'inflation annuelle est ressortie à 2,1 % en octobre, après 2,2 % en septembre. Les prix de l'énergie ont continué de reculer, tandis que la hausse des prix des services s'est légèrement atténuée. La plupart des mesures de l'inflation sous-jacente restent compatibles avec la cible de 2 % à moyen terme, et la croissance des salaires ralentit comme attendu.\n\n### Évaluation des risques\n\nLes risques pesant sur la croissance restent orientés à la baisse. Une nouvelle escalade des tensions commerciales pourrait freiner les exportations et dégrader la confiance des entreprises. À l'inverse, une hausse des dépenses de défense et d'infrastructure pourrait soutenir l'activité au-delà de ce qui est prévu. Les perspectives d'inflation sont plus incertaines qu'à l'accoutumée, en raison de la volatilité des marchés de l'énergie et du taux de change."
+     },
+     "vector": [
+      0.22877392172813416,
+      -0.41153690218925476,
+      -0.4548412263393402,
+      0.4442107081413269,
+      0.39298492670059204,
+      0.024248072877526283,
+      -0.34412798285484314,
+      -0.3172491192817688
+     ]
+    },
+    {
+     "id": 1215179299834453588,
+     "payload": {
+      "doc_id": "ecb/monetary-policy-statement/2025-10-30",
+      "corpus": "central-bank",
+      "source_code": "ecb",
+      "doc_type": "monetary_policy_statement",
+      "title": "Décision de politique monétaire",
+      "date": "2025-10-30",
+      "year": 2025,
+      "language": "fr",
+      "provenance": "manifest",
+      "sha256": "6d87846e414048156d45eb3d4bc81ba9244306abb361148881a828f654a02838",
+      "filename": "monetary-policy-statement.md",
+      "chunk_number": 3,
+      "ingestion_date": "2026-11-17T15:38:52.945007",
+      "text": "# Décision de politique monétaire\n\n## Financial and monetary conditions\n\nMarket interest rates have edged up since the last meeting, while bank lending rates for firms were broadly unchanged at 3.5 per cent. Lending to households continued to recover gradually, driven by mortgages, and credit standards for business loans were stable. The Governing Council stands ready to adjust all of its instruments within its mandate to ensure that inflation stabilises sustainably at its target."
+     },
+     "vector": [
+      0.39144787192344666,
+      0.09092872589826584,
+      -0.19933129847049713,
+      -0.4687920808792114,
+      -0.4689616858959198,
+      0.18469929695129395,
+      0.42928606271743774,
+      -0.37506815791130066
+     ]
+    },
+    {
+     "id": 7016640435152054972,
+     "payload": {
+      "doc_id": "ecb/monetary-policy-statement/2025-10-30",
+      "corpus": "central-bank",
+      "source_code": "ecb",
+      "doc_type": "monetary_policy_statement",
+      "title": "Décision de politique monétaire",
+      "date": "2025-10-30",
+      "year": 2025,
+      "language": "fr",
+      "provenance": "manifest",
+      "sha256": "6d87846e414048156d45eb3d4bc81ba9244306abb361148881a828f654a02838",
+      "filename": "monetary-policy-statement.md",
+      "chunk_number": 4,
+      "ingestion_date": "2026-11-17T15:38:52.945007",
+      "text": "# Décision de politique monétaire\n\n## Conclusion\n\nLe Conseil des gouverneurs est déterminé à assurer une stabilisation durable de l'inflation au niveau de sa cible de 2 % à moyen terme. Il suivra une approche s'appuyant sur les données pour déterminer l'orientation appropriée de la politique monétaire, sans s'engager à l'avance sur une trajectoire de taux particulière."
+     },
+     "vector": [
+      -0.56477290391922,
+      -0.020219966769218445,
+      0.3860650956630707,
+      -0.3447975516319275,
+      -0.09910311549901962,
+      -0.37577950954437256,
+      0.40139687061309814,
+      0.31708040833473206
+     ]
+    }
+   ]
+  },
+  {
+   "file": "inflation-report-extract.pdf",
+   "collection": "central-bank-e5b-v1",
+   "doc_id": "boe/inflation-report/2024-08-01",
+   "metadata": {
+    "series": "Monetary Policy Report",
+    "doc_id": "boe/inflation-report/2024-08-01",
+    "corpus": "central-bank",
+    "source_code": "boe",
+    "doc_type": "inflation_report",
+    "title": "Monetary Policy Report, August 2024 (extract)",
+    "date": "2024-08-01",
+    "year": 2024,
+    "language": "en",
+    "provenance": "manifest",
+    "sha256": "40bb9d70f80d05ce87184b20256fd79ff46294e76f313567f0673cbaf84a67e9"
+   },
+   "ingestion_date": "2026-11-17T15:38:52.955145",
+   "points": [
+    {
+     "id": 7938738065832252367,
+     "payload": {
+      "doc_id": "boe/inflation-report/2024-08-01",
+      "series": "Monetary Policy Report",
+      "corpus": "central-bank",
+      "source_code": "boe",
+      "doc_type": "inflation_report",
+      "title": "Monetary Policy Report, August 2024 (extract)",
+      "date": "2024-08-01",
+      "year": 2024,
+      "language": "en",
+      "provenance": "manifest",
+      "sha256": "40bb9d70f80d05ce87184b20256fd79ff46294e76f313567f0673cbaf84a67e9",
+      "filename": "inflation-report-extract.pdf",
+      "chunk_number": 0,
+      "ingestion_date": "2026-11-17T15:38:52.955145",
+      "text": "## **Monetary Policy Report**\nThe Monetary Policy Committee sets monetary policy to meet the two per cent inflation target, and in a way that helps to sustain growth and employment. At its meeting ending on 31 July, the Committee voted by a majority of five to four to reduce Bank Rate by a quarter of a percentage point, to five per cent.\nTwelve-month consumer price inflation was at the target in both May and June. The Committee expects the fall in headline inflation, and the normalisation of many indicators of inflation expectations, to continue to feed through to weaker pay and price-setting dynamics over the coming quarters.\nGross domestic product has picked up quite sharply so far this year, but underlying momentum appears weaker. Household consumption has been subdued, business investment has recovered only slowly, and surveys of output point to a more modest pace of expansion in the second half of the year.",
+      "page": 0
+     },
+     "vector": [
+      -0.4815714359283447,
+      0.13861314952373505,
+      -0.3327232301235199,
+      -0.40749672055244446,
+      0.2646881341934204,
+      0.2923658788204193,
+      -0.5383919477462769,
+      0.1634427309036255
+     ]
+    },
+    {
+     "id": 4020476349013684295,
+     "payload": {
+      "doc_id": "boe/inflation-report/2024-08-01",
+      "series": "Monetary Policy Report",
+      "corpus": "central-bank",
+      "source_code": "boe",
+      "doc_type": "inflation_report",
+      "title": "Monetary Policy Report, August 2024 (extract)",
+      "date": "2024-08-01",
+      "year": 2024,
+      "language": "en",
+      "provenance": "manifest",
+      "sha256": "40bb9d70f80d05ce87184b20256fd79ff46294e76f313567f0673cbaf84a67e9",
+      "filename": "inflation-report-extract.pdf",
+      "chunk_number": 1,
+      "ingestion_date": "2026-11-17T15:38:52.955145",
+      "text": "## **Demand and output**\nA margin of slack is projected to emerge in the economy as activity falls below potential and the labour market eases further. Unemployment is expected to rise gradually over the forecast period.",
+      "page": 1
+     },
+     "vector": [
+      -0.47883689403533936,
+      -0.23910218477249146,
+      0.20875269174575806,
+      0.2820245921611786,
+      -0.062445223331451416,
+      0.09048691391944885,
+      -0.6033809185028076,
+      0.46289733052253723
+     ]
+    },
+    {
+     "id": 2586822108312731813,
+     "payload": {
+      "doc_id": "boe/inflation-report/2024-08-01",
+      "series": "Monetary Policy Report",
+      "corpus": "central-bank",
+      "source_code": "boe",
+      "doc_type": "inflation_report",
+      "title": "Monetary Policy Report, August 2024 (extract)",
+      "date": "2024-08-01",
+      "year": 2024,
+      "language": "en",
+      "provenance": "manifest",
+      "sha256": "40bb9d70f80d05ce87184b20256fd79ff46294e76f313567f0673cbaf84a67e9",
+      "filename": "inflation-report-extract.pdf",
+      "chunk_number": 2,
+      "ingestion_date": "2026-11-17T15:38:52.955145",
+      "text": "## **Costs and prices**\nServices price inflation has remained elevated, at 5.7 per cent in June. Private sector regular average weekly earnings growth has fallen to 5.6 per cent in the three months to May, and is expected to ease further as past increases in the minimum wage drop out of the annual comparison.\nEnergy prices are projected to push headline inflation up to around 2.75 per cent in the second half of this year, as declines in energy prices last year fall out of the annual comparison, revealing more clearly the prevailing persistence of domestic inflationary pressures.\nConditional on market interest rates, inflation is projected to fall back to 1.7 per cent in two years' time and to 1.5 per cent in three years, reflecting the continued restrictiveness of the policy stance and the emergence of spare capacity.",
+      "page": 2
+     },
+     "vector": [
+      0.4485189914703369,
+      -0.1046086922287941,
+      0.4424532353878021,
+      -0.02487410418689251,
+      -0.09548110514879227,
+      0.4548545777797699,
+      -0.4168168306350708,
+      -0.4491753876209259
+     ]
+    }
+   ]
+  }
+ ]
+}
