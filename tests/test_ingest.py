@@ -651,6 +651,15 @@ def test_the_golden_fixture_is_the_one_described():
     for document in GOLDEN_DOCUMENTS.values():
         dates = {point["payload"]["ingestion_date"] for point in document["points"]}
         assert dates == {document["ingestion_date"]}
+    # The PDF is given as production gives a document: ``doc_id`` is in the metadata too (the
+    # vault source copies it there). The markdown document covers the metadata without it.
+    pdf_document = GOLDEN_DOCUMENTS["inflation-report-extract.pdf"]
+    assert pdf_document["metadata"]["doc_id"] == pdf_document["doc_id"]
+    assert "doc_id" not in GOLDEN_DOCUMENTS["monetary-policy-statement.md"]["metadata"]
+    for document in GOLDEN_DOCUMENTS.values():
+        for point in document["points"]:
+            assert next(iter(point["payload"])) == "doc_id"
+            assert point["payload"]["doc_id"] == document["doc_id"]
 
 
 @pytest.mark.parametrize("name", sorted(GOLDEN_DOCUMENTS))

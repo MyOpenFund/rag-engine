@@ -11,11 +11,16 @@ It is not part of the package and is not run in CI. It needs a checkout of the
 data-orchestrator and of the engine it drives (eigenmind), both on ``PYTHONPATH``, in an
 environment that has ChunkNorris and this package:
 
-    PYTHONPATH=<data-orchestrator>:<eigenmind> python tools/capture_golden.py
+    PYTHONPATH=<data-orchestrator>:<eigenmind> python tools/capture_golden.py --force
+
+The result goes to ``tests/fixtures/golden/expected.json``, or to the file given with
+``--output``. An existing file is not overwritten unless ``--force`` is given: the committed
+fixture cannot be replaced by accident. To look at a new capture without touching the
+fixture, write it elsewhere (``--output /tmp/expected.json``) and compare.
 
 ``--make-pdf`` writes the PDF fixture first. It was used once: PyMuPDF does not write the same
-bytes twice (creation date, document id), so the PDF is committed and never generated again.
-An existing PDF is not overwritten.
+bytes twice (the ``/ID`` of the trailer differs at each generation), so the PDF is committed
+and never generated again. An existing PDF is not overwritten, ``--force`` or not.
 
 Run it again only to capture from a known-good pipeline; never to make a failing test pass.
 """
@@ -43,7 +48,11 @@ SEED = 0
 OCR = "never"
 
 # Metadata as the vault source of the data-orchestrator provides it. ``sha256`` is filled in
-# from the file. The PDF carries one key outside the usual columns (``series``).
+# from the file. The PDF is the document closest to production: it carries one key outside the
+# usual columns (``series``), and ``doc_id`` itself, which the vault source copies into the
+# payload it hands over (``_PAYLOAD_COLUMNS`` of ``data_orchestrator/sources/vault.py``), after
+# the extra keys and before the other columns. The markdown document has no ``doc_id`` in its
+# metadata, so both forms are pinned.
 DOCUMENTS = (
     {
         "file": MARKDOWN,
@@ -66,6 +75,7 @@ DOCUMENTS = (
         "doc_id": "boe/inflation-report/2024-08-01",
         "metadata": {
             "series": "Monetary Policy Report",
+            "doc_id": "boe/inflation-report/2024-08-01",
             "corpus": "central-bank",
             "source_code": "boe",
             "doc_type": "inflation_report",
@@ -228,7 +238,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--make-pdf", action="store_true", help="write the PDF fixture first (never overwrites)"
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=EXPECTED,
+        help="file the captured points are written to (default: the fixture, %(default)s)",
+    )
+    parser.add_argument("--force", action="store_true", help="overwrite the output file when it exists")
     args = parser.parse_args(argv)
+    output: Path = args.output
+    # Checked first: nothing is generated or captured for a result that would not be written.
+    if output.exists() and not args.force:
+        print(f"{output} exists: not overwritten (give --force to replace it)", file=sys.stderr)
+        return 1
     if args.make_pdf:
         target = GOLDEN_DIR / PDF
         if target.exists():
@@ -237,11 +259,11 @@ def main(argv: list[str] | None = None) -> int:
         make_pdf(target)
         print(f"wrote {target} ({target.stat().st_size} bytes)")
     result = capture()
-    EXPECTED.write_text(json.dumps(result, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    output.write_text(json.dumps(result, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     for document in result["documents"]:
         pages = sorted({point["payload"].get("page") for point in document["points"]}, key=str)
         print(f"{document['file']}: {len(document['points'])} points, pages {pages}")
-    print(f"wrote {EXPECTED}")
+    print(f"wrote {output}")
     return 0
 
 
