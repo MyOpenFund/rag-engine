@@ -69,6 +69,9 @@ jobs:
   # parity test that allows queries embedded with onnx against passages embedded with torch.
   parity:
     runs-on: ubuntu-latest
+    # About 3 minutes with the model cache, about 10 without. The limit stops a download that
+    # hangs long before the 6 hours GitHub allows a job.
+    timeout-minutes: 30
     env:
       HF_HOME: ${{ github.workspace }}/.model-cache/huggingface
       FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.model-cache/fastembed
@@ -84,9 +87,15 @@ jobs:
       - run: pip install -e ".[dev,torch,onnx]"
       - name: Check that both backends are importable
         run: python -c "import fastembed, onnxruntime, sentence_transformers, torch; print(torch.__version__)"
+      # The cache key carries the revision the engine pins for the ONNX file: when the table
+      # ONNX_MODELS changes, the cache starts empty and the new file is really downloaded.
+      - name: Read the pinned revision of the ONNX model
+        id: pin
+        run: |
+          python -c "from rag_engine.embedding import ONNX_MODELS; print('revision=' + ONNX_MODELS['intfloat/multilingual-e5-base'].revision)" >> "$GITHUB_OUTPUT"
       # About 2.2 GB: the weights for sentence-transformers and the ONNX file for fastembed.
       - uses: actions/cache@v4
         with:
           path: .model-cache
-          key: models-intfloat-multilingual-e5-base-v1
+          key: models-intfloat-multilingual-e5-base-${{ steps.pin.outputs.revision }}
       - run: python -m pytest -m models -q -s
