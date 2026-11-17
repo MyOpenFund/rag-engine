@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -420,6 +420,42 @@ class QdrantStore:
                 raise
             created.append(field)
         return created
+
+    def query(
+        self,
+        collection: str,
+        vector: Sequence[float],
+        *,
+        query_filter: models.Filter | None = None,
+        limit: int,
+    ) -> list[Any]:
+        """The ``limit`` points of ``collection`` closest to ``vector``, best first.
+
+        One request: a dense search on the unnamed vector, restricted to the points that pass
+        ``query_filter`` when one is given. The points come with their payload and their
+        score, without their vector. ``limit`` must be an integer >= 1, else ``ValueError``.
+
+        HTTP 401 or 403 is a :class:`QdrantAuthError`; a collection that does not exist, a
+        vector of another dimension, and any other error is raised as the client raised it.
+        Nothing is checked beforehand: this is one request, not two.
+
+        It uses the query API (``query_points``): qdrant-client 1.10 or later, and a server
+        of 1.10 or later.
+        """
+        _positive_int("limit", limit)
+        try:
+            response = self._client.query_points(
+                collection_name=collection,
+                query=list(vector),
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:
+            _raise_auth(exc)
+            raise
+        return list(response.points)
 
     def count(self, collection: str) -> int:
         """Exact number of points in ``collection``."""

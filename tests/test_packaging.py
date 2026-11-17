@@ -27,6 +27,7 @@ def test_version():
         "rag_engine.embedding",
         "rag_engine.chunking",
         "rag_engine.ingest",
+        "rag_engine.search",
     ],
 )
 def test_import_pulls_no_heavy_dependency(modules):
@@ -87,6 +88,7 @@ PUBLIC_NAMES = {
         "ocr_available",
     },
     "rag_engine.ingest": {"IngestResult", "ingest_document"},
+    "rag_engine.search": {"QUERY_NORMALIZATION", "Hit", "SearchError", "SearchFilters", "search"},
 }
 
 
@@ -133,8 +135,9 @@ def pyproject():
 
 
 def test_qdrant_client_has_a_lower_bound(pyproject):
-    # 1.8.0 is the first release with QdrantClient.collection_exists, which the store calls.
-    assert "qdrant-client>=1.8" in pyproject["project"]["dependencies"]
+    # 1.10.0 is the first release with QdrantClient.query_points, which the search calls
+    # (collection_exists, which the store calls, came with 1.8.0).
+    assert "qdrant-client>=1.10" in pyproject["project"]["dependencies"]
 
 
 def test_the_package_is_declared_typed(pyproject):

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "rag-engine"
 version = "0.1.0"
-description = "Ingest one document into Qdrant with deterministic point ids (search arrives in the next release)."
+description = "Ingest one document into Qdrant with deterministic point ids, and search what was ingested."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
@@ -15,9 +15,10 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Typing :: Typed",
 ]
-# qdrant-client 1.8.0 is the first release with QdrantClient.collection_exists, which the store
-# uses to tell "the collection is absent" from a failure.
-dependencies = ["qdrant-client>=1.8", "numpy"]
+# qdrant-client 1.10.0 is the first release with QdrantClient.query_points (the query API), which
+# the search uses. The store also needs collection_exists (1.8.0) to tell "the collection is
+# absent" from a failure.
+dependencies = ["qdrant-client>=1.10", "numpy"]
 
 [project.optional-dependencies]
 onnx = ["fastembed"]
