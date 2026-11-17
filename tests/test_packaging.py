@@ -179,6 +179,8 @@ def test_the_sdist_keeps_the_evaluation_files_and_the_wheel_holds_the_package_on
     assert "include" not in targets["sdist"] and "only-include" not in targets["sdist"]
     assert targets["wheel"]["packages"] == ["src/rag_engine"]
     root = PYPROJECT.parent
+    for name in ("README.md", "make_known_item.py", "known_item_v1.jsonl"):
+        assert (root / "eval" / name).is_file(), name
     for name in ("corpus.json", "questions.jsonl"):
         assert (root / "eval" / "fixtures" / name).is_file(), name
 
