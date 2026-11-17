@@ -1,0 +1,223 @@
+{
+  "description": "A tiny corpus for the evaluation harness: 13 documents, 32 chunks. The embedder of the tests has no semantics: a question is answerable either because its text is the text of a chunk (identical vector), or because its filters isolate the expected document. One document, the combined decisions and statement, repeats a chunk of the decision and a chunk of the statement: these chunks have exactly the same score, on purpose.",
+  "model": {
+    "name": "fake",
+    "dim": 16,
+    "passage_prefix": "",
+    "query_prefix": ""
+  },
+  "documents": [
+    {
+      "doc_id": "fx-ecb-decision-2016-03",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "ecb",
+        "doc_type": "A1",
+        "title": "Monetary policy decisions, 10 March 2016",
+        "language": "en",
+        "date": "2016-03-10",
+        "year": 2016
+      },
+      "chunks": [
+        "The Governing Council decided to lower the interest rate on the main refinancing operations by 5 basis points to 0.00 percent.",
+        "The rate on the deposit facility will be decreased by 10 basis points to -0.40 percent.",
+        "Monthly purchases under the asset purchase programme will be expanded to 80 billion euro starting in April."
+      ]
+    },
+    {
+      "doc_id": "fx-ecb-statement-2016-03",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "ecb",
+        "doc_type": "A2",
+        "title": "Introductory statement to the press conference, 10 March 2016",
+        "language": "en",
+        "date": "2016-03-10",
+        "year": 2016
+      },
+      "chunks": [
+        "Based on our regular economic and monetary analyses, we conducted a thorough review of the monetary policy stance.",
+        "Annual HICP inflation in the euro area is expected to remain negative in the coming months and to pick up later in 2016."
+      ]
+    },
+    {
+      "doc_id": "fx-ecb-combined-2016-03",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "ecb",
+        "doc_type": "B1",
+        "title": "Combined monetary policy decisions and statement, 10 March 2016",
+        "language": "en",
+        "date": "2016-03-10",
+        "year": 2016
+      },
+      "chunks": [
+        "Monthly purchases under the asset purchase programme will be expanded to 80 billion euro starting in April.",
+        "Annual HICP inflation in the euro area is expected to remain negative in the coming months and to pick up later in 2016."
+      ]
+    },
+    {
+      "doc_id": "fx-ecb-account-2016-04",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "ecb",
+        "doc_type": "A3",
+        "title": "Account of the monetary policy meeting of 9-10 March 2016",
+        "language": "en",
+        "date": "2016-04-07",
+        "year": 2016
+      },
+      "chunks": [
+        "Members widely shared the assessment that the outlook for inflation had deteriorated since the December meeting.",
+        "A large majority of members supported the proposed package of measures.",
+        "Some members expressed reservations about a further reduction of the deposit facility rate."
+      ]
+    },
+    {
+      "doc_id": "fx-us-statement-2015-12",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "us",
+        "doc_type": "A2",
+        "title": "FOMC statement, 16 December 2015",
+        "language": "en",
+        "date": "2015-12-16",
+        "year": 2015
+      },
+      "chunks": [
+        "The Committee decided to raise the target range for the federal funds rate to 1/4 to 1/2 percent.",
+        "The stance of monetary policy remains accommodative after this increase."
+      ]
+    },
+    {
+      "doc_id": "fx-us-minutes-2015-12",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "us",
+        "doc_type": "A3",
+        "title": "Minutes of the Federal Open Market Committee, 15-16 December 2015",
+        "language": "en",
+        "date": "2015-12-16",
+        "year": 2015
+      },
+      "chunks": [
+        "Participants judged that there had been considerable improvement in labor market conditions this year.",
+        "Some members said that their decision to raise the target range was a close call.",
+        "Staff continued to project that real GDP would expand at a moderate pace."
+      ]
+    },
+    {
+      "doc_id": "fx-us-presser-2015-12",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "us",
+        "doc_type": "B1",
+        "title": "Transcript of Chair Yellen's press conference, 16 December 2015",
+        "language": "en",
+        "date": "2015-12-16",
+        "year": 2015
+      },
+      "chunks": [
+        "This action marks the end of an extraordinary seven-year period during which the federal funds rate was held near zero.",
+        "The process of normalizing interest rates is likely to proceed gradually."
+      ]
+    },
+    {
+      "doc_id": "fx-us-projections-2015-12",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "us",
+        "doc_type": "F1",
+        "title": "Summary of Economic Projections, December 2015",
+        "language": "en",
+        "date": "2015-12-16",
+        "year": 2015
+      },
+      "chunks": [
+        "The median projection for the federal funds rate at the end of 2016 is 1.4 percent.",
+        "Participants generally projected that inflation would rise to 2 percent over the medium term."
+      ]
+    },
+    {
+      "doc_id": "fx-gb-minutes-2016-08",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "gb",
+        "doc_type": "A3",
+        "title": "Minutes of the Monetary Policy Committee meeting ending on 3 August 2016",
+        "language": "en",
+        "date": "2016-01-01",
+        "year": 2016
+      },
+      "chunks": [
+        "The Committee voted unanimously to reduce Bank Rate by 25 basis points to 0.25 percent.",
+        "The Committee voted by a majority of 6-3 to expand the purchases of UK government bonds.",
+        "Following the referendum, the outlook for growth in the short to medium term had weakened markedly."
+      ]
+    },
+    {
+      "doc_id": "fx-gb-report-2016-08",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "gb",
+        "doc_type": "E1",
+        "title": "Inflation Report - August 2016",
+        "language": "en",
+        "date": "2016-01-01",
+        "year": 2016
+      },
+      "chunks": [
+        "The fall in sterling is likely to push up CPI inflation in the near term.",
+        "GDP growth is expected to slow sharply in the second half of the year.",
+        "The projections are conditioned on a path for Bank Rate implied by market yields."
+      ]
+    },
+    {
+      "doc_id": "fx-au-decision-2016-05",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "au",
+        "doc_type": "A1",
+        "title": "Statement by the Governor: monetary policy decision, 3 May 2016",
+        "language": "en",
+        "date": "2016-05-03",
+        "year": 2016
+      },
+      "chunks": [
+        "At its meeting today, the Board decided to lower the cash rate by 25 basis points to 1.75 percent.",
+        "This follows information showing inflationary pressures are lower than expected."
+      ]
+    },
+    {
+      "doc_id": "fx-ca-report-2016-07",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "ca",
+        "doc_type": "E1",
+        "title": "Rapport sur la politique monetaire, juillet 2016",
+        "language": "fr",
+        "date": "2016-07-13",
+        "year": 2016
+      },
+      "chunks": [
+        "La Banque prevoit que la croissance du PIB reel du Canada sera de 1,3 % en 2016.",
+        "Les feux de foret en Alberta ont reduit la production de petrole au deuxieme trimestre.",
+        "L'inflation mesuree par l'IPC devrait revenir a 2 % en 2017."
+      ]
+    },
+    {
+      "doc_id": "fx-jp-minutes",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "jp",
+        "doc_type": "A3",
+        "title": "Minutes of the Monetary Policy Meeting on January 28 and 29, 2016",
+        "language": "en"
+      },
+      "chunks": [
+        "The Bank decided to introduce quantitative and qualitative monetary easing with a negative interest rate.",
+        "A negative interest rate of minus 0.1 percent will be applied to current accounts that financial institutions hold at the Bank."
+      ]
+    }
+  ]
+}

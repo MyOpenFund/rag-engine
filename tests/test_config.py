@@ -7,6 +7,7 @@ import sys
 
 import pytest
 
+import rag_engine.config as config_module
 from rag_engine.config import ConfigError, Settings
 
 SECRET = "k3y-Zx9-DISTINCTIVE-41f7"
@@ -26,6 +27,9 @@ DEFAULTS = {
     "search_limit": 10,
     "search_max_limit": 50,
     "model_cache": None,
+    "parity_min": 0.999,
+    "onnx_threads": None,
+    "qdrant_timeout": 60.0,
 }
 
 # Every variable where a blank value means "use the default".
@@ -42,6 +46,9 @@ BLANK_FALLS_BACK = [
     "RAG_ENGINE_SEARCH_LIMIT",
     "RAG_ENGINE_SEARCH_MAX_LIMIT",
     "RAG_ENGINE_MODEL_CACHE",
+    "RAG_ENGINE_PARITY_MIN",
+    "RAG_ENGINE_ONNX_THREADS",
+    "RAG_ENGINE_QDRANT_TIMEOUT",
 ]
 
 
@@ -79,6 +86,9 @@ def test_all_values_read_from_the_mapping():
         "RAG_ENGINE_SEARCH_LIMIT": "5",
         "RAG_ENGINE_SEARCH_MAX_LIMIT": "20",
         "RAG_ENGINE_MODEL_CACHE": "/var/cache/models",
+        "RAG_ENGINE_PARITY_MIN": " 0.9995 ",
+        "RAG_ENGINE_ONNX_THREADS": " 2 ",
+        "RAG_ENGINE_QDRANT_TIMEOUT": " 15 ",
     }
     assert dataclasses.asdict(Settings.from_env(env)) == {
         "qdrant_host": "qdrant.internal",
@@ -95,6 +105,9 @@ def test_all_values_read_from_the_mapping():
         "search_limit": 5,
         "search_max_limit": 20,
         "model_cache": "/var/cache/models",
+        "parity_min": 0.9995,
+        "onnx_threads": 2,
+        "qdrant_timeout": 15.0,
     }
 
 
@@ -413,6 +426,11 @@ INVALID_ENV = [
     {"RAG_ENGINE_OCR_LANGUAGES": "eng,fra"},
     {"RAG_ENGINE_SEARCH_LIMIT": "51"},
     {"RAG_ENGINE_SEARCH_MAX_LIMIT": "5"},
+    {"RAG_ENGINE_PARITY_MIN": "high"},
+    {"RAG_ENGINE_PARITY_MIN": "0"},
+    {"RAG_ENGINE_PARITY_MIN": "1.5"},
+    {"RAG_ENGINE_ONNX_THREADS": "0"},
+    {"RAG_ENGINE_ONNX_THREADS": "all"},
 ]
 
 INVALID_KWARGS = [
@@ -431,6 +449,12 @@ INVALID_KWARGS = [
     {"search_limit": 100},
     {"search_max_limit": 5},
     {"model_cache": 5},
+    {"parity_min": 1},
+    {"parity_min": 0.0},
+    {"onnx_threads": 0},
+    {"onnx_threads": "2"},
+    {"qdrant_timeout": 0},
+    {"qdrant_timeout": "60"},
 ]
 
 
@@ -526,6 +550,10 @@ def test_short_values_are_echoed_in_full():
 
 
 def _run(code, env, cwd=None):
+    # The engine is found from any working directory, also when it is not installed and the
+    # tests were started with a relative PYTHONPATH (PYTHONPATH=src).
+    source = os.path.dirname(os.path.dirname(os.path.abspath(config_module.__file__)))
+    env = dict(env, PYTHONPATH=os.pathsep.join(filter(None, [source, env.get("PYTHONPATH")])))
     return subprocess.run(
         [sys.executable, "-c", code], env=env, cwd=cwd, capture_output=True, text=True, check=False
     )
@@ -591,3 +619,134 @@ def test_dotenv_file_in_the_working_directory_is_ignored(tmp_path):
     result = _run(code, _clean_environment(), cwd=tmp_path)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "6333 localhost torch"
+
+
+# ---------------------------------------------------------------------------
+# parity_min
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(("raw", "expected"), [("1", 1.0), ("1.0", 1.0), ("0.5", 0.5), ("9.99e-1", 0.999)])
+def test_parity_min_is_read_as_a_number(raw, expected):
+    value = Settings.from_env({"RAG_ENGINE_PARITY_MIN": raw}).parity_min
+    assert type(value) is float
+    assert value == expected
+
+
+@pytest.mark.parametrize("raw", ["high", "0,999", "0.999x"])
+def test_parity_min_that_is_not_a_number_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_PARITY_MIN=.*not a number"):
+        Settings.from_env({"RAG_ENGINE_PARITY_MIN": raw})
+
+
+@pytest.mark.parametrize("raw", ["0", "-0.5", "1.0001", "2", "nan", "inf", "-inf"])
+def test_parity_min_outside_its_range_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_PARITY_MIN=.*above 0 and at most 1"):
+        Settings.from_env({"RAG_ENGINE_PARITY_MIN": raw})
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, 1.0000001, float("nan"), float("inf")])
+def test_direct_parity_min_outside_its_range_is_refused(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_PARITY_MIN"):
+        Settings(parity_min=value)
+
+
+@pytest.mark.parametrize("value", [1, True, "0.999", None])
+def test_direct_parity_min_must_be_a_float(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_PARITY_MIN=.*must be a float"):
+        Settings(parity_min=value)
+
+
+def test_direct_parity_min_accepts_the_bounds_of_its_range():
+    assert Settings(parity_min=1.0).parity_min == 1.0
+    assert Settings(parity_min=1e-9).parity_min == 1e-9
+
+
+# ---------------------------------------------------------------------------
+# onnx_threads
+# ---------------------------------------------------------------------------
+def test_onnx_threads_default_leaves_the_choice_to_the_runtime():
+    assert Settings().onnx_threads is None
+    assert Settings.from_env({}).onnx_threads is None
+    assert Settings.from_env({"RAG_ENGINE_ONNX_THREADS": "  "}).onnx_threads is None
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("1", 1), (" 4 ", 4), ("64", 64)])
+def test_onnx_threads_is_read_as_an_integer(raw, expected):
+    value = Settings.from_env({"RAG_ENGINE_ONNX_THREADS": raw}).onnx_threads
+    assert type(value) is int
+    assert value == expected
+
+
+@pytest.mark.parametrize("raw", ["two", "2.0", "1,5", "auto"])
+def test_onnx_threads_that_is_not_an_integer_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_ONNX_THREADS=.*not an integer"):
+        Settings.from_env({"RAG_ENGINE_ONNX_THREADS": raw})
+
+
+@pytest.mark.parametrize("raw", ["0", "-1"])
+def test_onnx_threads_below_one_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_ONNX_THREADS=.*at least 1"):
+        Settings.from_env({"RAG_ENGINE_ONNX_THREADS": raw})
+
+
+@pytest.mark.parametrize("value", [0, -2])
+def test_direct_onnx_threads_below_one_is_refused(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_ONNX_THREADS=.*at least 1"):
+        Settings(onnx_threads=value)
+
+
+@pytest.mark.parametrize("value", [True, 2.0, "2"])
+def test_direct_onnx_threads_must_be_an_integer_or_none(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_ONNX_THREADS=.*must be an integer or None"):
+        Settings(onnx_threads=value)
+
+
+def test_direct_onnx_threads_accepts_a_positive_integer_and_none():
+    assert Settings(onnx_threads=1).onnx_threads == 1
+    assert Settings(onnx_threads=None).onnx_threads is None
+
+
+# ---------------------------------------------------------------------------
+# qdrant_timeout
+# ---------------------------------------------------------------------------
+def test_qdrant_timeout_defaults_to_sixty_seconds():
+    assert Settings().qdrant_timeout == 60
+    assert Settings.from_env({}).qdrant_timeout == 60
+    assert Settings.from_env({"RAG_ENGINE_QDRANT_TIMEOUT": "  "}).qdrant_timeout == 60
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("5", 5.0), (" 120 ", 120.0), ("2.5", 2.5), ("1e2", 100.0), ("0.25", 0.25)]
+)
+def test_qdrant_timeout_is_read_as_a_number_of_seconds(raw, expected):
+    value = Settings.from_env({"RAG_ENGINE_QDRANT_TIMEOUT": raw}).qdrant_timeout
+    assert type(value) is float
+    assert value == expected
+
+
+@pytest.mark.parametrize("raw", ["soon", "1,5", "60s", "1 minute"])
+def test_qdrant_timeout_that_is_not_a_number_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*not a number"):
+        Settings.from_env({"RAG_ENGINE_QDRANT_TIMEOUT": raw})
+
+
+@pytest.mark.parametrize("raw", ["0", "0.0", "-1", "-0.5", "nan", "inf", "-inf"])
+def test_qdrant_timeout_that_is_not_positive_and_finite_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*positive number of seconds"):
+        Settings.from_env({"RAG_ENGINE_QDRANT_TIMEOUT": raw})
+
+
+@pytest.mark.parametrize("value", [1, 30, 2.5, 0.001])
+def test_direct_qdrant_timeout_accepts_a_positive_integer_or_float(value):
+    assert Settings(qdrant_timeout=value).qdrant_timeout == value
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -1, -2.5, float("nan"), float("inf"), 10**400])
+def test_direct_qdrant_timeout_that_is_not_positive_and_finite_is_refused(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*positive number of seconds"):
+        Settings(qdrant_timeout=value)
+
+
+@pytest.mark.parametrize("value", [True, "60", None, [60]])
+def test_direct_qdrant_timeout_must_be_a_number(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*must be a number"):
+        Settings(qdrant_timeout=value)

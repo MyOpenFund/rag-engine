@@ -1,11 +1,13 @@
 # rag-engine
 
-**Status: ingestion is delivered; search and the ONNX backend arrive in the next release.**
+**Status: ingestion, both embedding backends (PyTorch, ONNX), filtered search and the search evaluation harness are delivered.**
 
-rag-engine is built to do two things:
+rag-engine does two things:
 
-1. **Ingestion** of one document into [Qdrant](https://qdrant.tech): chunk, embed, write. Available.
-2. **Search** over what was ingested. Not available yet: this release has no search function.
+1. **Ingestion** of one document into [Qdrant](https://qdrant.tech): chunk, embed, write.
+2. **Search** over what was ingested: one dense search, narrowed by filters on the source, the type, the language, the document, the corpus and the publication date.
+
+It also measures that search: `rag-engine eval` runs a file of questions with known answers and reports how often the right documents come first (see [Evaluating search quality](#evaluating-search-quality)).
 
 It is used by two MyOpenFund components: the data-orchestrator (ingestion) and the MCP server (search).
 
@@ -15,13 +17,17 @@ Python 3.10 or later. The base install is light; each consumer adds only the ext
 
 | Install | Adds | For |
 |---|---|---|
-| `rag-engine` | `qdrant-client` (1.8 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, writes) |
-| `rag-engine[torch]` | `sentence-transformers` | PyTorch embedding backend |
-| `rag-engine[onnx]` | `fastembed` | ONNX embedding backend: **not available yet**. The extra installs the library, but this release has no code that uses it. |
+| `rag-engine` | `qdrant-client` (1.10 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, indexes, writes), search, the evaluation harness and the `rag-engine` command |
+| `rag-engine[torch]` | `sentence-transformers` 6.x | PyTorch embedding backend |
+| `rag-engine[onnx]` | `fastembed` 0.9.x (ONNX runtime), `huggingface_hub` (0.20 or later) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
 | `rag-engine[ingest]` | `chunknorris`, `markitdown[pptx]`, `psutil` | document parsing and chunking |
 | `rag-engine[dev]` | `pytest`, `ruff` | development |
 
-`import rag_engine` never loads an embedding backend or a document parser. The package ships a `py.typed` marker: its annotations are usable by type checkers.
+The modules of the engine import no embedding backend and no document parser at import time: each is imported when it is used, and `torch` is never imported unless the torch backend is built. One import is not the engine's to decide: `qdrant-client`, which the store, the search, the evaluation and the command import, itself loads `fastembed` when that package is installed — so with the `onnx` extra, `import rag_engine.store` loads fastembed, the ONNX runtime, `huggingface_hub` and `tokenizers`. Without that extra none of them is loaded.
+
+`sentence-transformers` is bounded to the major version parity was measured on (`>=6,<7`: 6.0.0 to 6.3.0 today, not 5.x), for the reason `fastembed` is bounded: the vectors depend on it. Raise a bound only after `pytest -m models` has passed on the new version.
+
+The package ships a `py.typed` marker: its annotations are usable by type checkers.
 
 ## Public API
 
@@ -30,14 +36,46 @@ The package root exposes only `__version__`. Everything else is imported from it
 | Module | Main names |
 |---|---|
 | `rag_engine.config` | `Settings`, `ConfigError`, `valid_ocr_languages` |
-| `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `RESERVED_KEYS` |
-| `rag_engine.store` | `QdrantStore`, `StoreError`, `QdrantAuthError`, `CollectionMismatchError` |
-| `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device` |
+| `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `RESERVED_KEYS`, `PAYLOAD_INDEXES` |
+| `rag_engine.store` | `QdrantStore`, `StoreError`, `QdrantAuthError`, `CollectionMismatchError`, `CollectionNotFoundError`, `DEFAULT_TIMEOUT` |
+| `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE`, `ModelIntegrityError`, `ModelDownloadError` |
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
+| `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `is_searchable`, `QUERY_NORMALIZATION` |
+| `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `Means`, `EvalError`, `DEFAULT_K`, `DEFAULT_CHUNK_LIMIT`, `DEFAULT_BOOTSTRAP_RESAMPLES`, `DEFAULT_INTERVAL_MIN_DOCUMENTS`, `BOOTSTRAP_SEED`, `INTERVAL_LEVEL` |
+| `rag_engine.cli` | `main` (the `rag-engine` command) |
 | `rag_engine.errors` | `RagEngineError` |
 
-Errors. Every exception class the engine defines derives from `rag_engine.errors.RagEngineError`: `ConfigError` (also a `ValueError`), `StoreError` with its subclasses `QdrantAuthError` and `CollectionMismatchError`, and `UnsupportedFormatError` (also a `ValueError`). `except RagEngineError` does not catch what the engine lets through unchanged (an error of a parser, of the embedding backend or of the Qdrant client), nor the plain `ValueError` / `TypeError` of a bad argument.
+**Errors.** Every exception class the engine defines derives from `rag_engine.errors.RagEngineError`:
+
+| Class | Module | Raised when |
+|---|---|---|
+| `ConfigError` (also a `ValueError`) | `rag_engine.config` | a setting has an invalid value |
+| `StoreError` | `rag_engine.store` | base of the three below |
+| `QdrantAuthError` | `rag_engine.store` | Qdrant refuses the API key (HTTP 401 or 403) |
+| `CollectionMismatchError` | `rag_engine.store` | a collection is not one unnamed cosine vector of the expected dimension, or a payload field is indexed with another kind of index |
+| `CollectionNotFoundError` | `rag_engine.store` | `check_collection` is asked about a collection that does not exist |
+| `UnsupportedFormatError` (also a `ValueError`) | `rag_engine.chunking` | a file has an extension the engine does not read |
+| `SearchError` (also a `ValueError`) | `rag_engine.search` | a search argument or a filter cannot be used as it is |
+| `EvalError` (also a `ValueError`) | `rag_engine.eval` | a question file, a question or an evaluation parameter is unusable |
+| `ModelIntegrityError` | `rag_engine.embedding` | a pinned model file has another size or SHA-256 than the table |
+| `ModelDownloadError` | `rag_engine.embedding` | the pinned model files are not in the model cache and cannot be downloaded |
+
+**Errors that are not `RagEngineError`.** `except RagEngineError` does not catch what the engine lets through unchanged. A service built on the engine meets these:
+
+| Error | When |
+|---|---|
+| `qdrant_client.http.exceptions.UnexpectedResponse`, status 404 | a search, a write, a count or an index creation on a collection that does not exist; `check_collection` at start turns the case into a `CollectionNotFoundError` |
+| `UnexpectedResponse`, status 400 | a query vector, or the vector of a point written, of another dimension than the collection (`Vector dimension error`); `check_collection` at start turns the case into a `CollectionMismatchError` |
+| `UnexpectedResponse`, status 422 | a collection name the server does not accept (a `/` in it, more than 255 characters): the request is refused before anything is looked up, from `check_collection` as well |
+| `UnexpectedResponse`, another status | any other answer of the server (500, 503, ...); 401 and 403 alone become `QdrantAuthError` |
+| `qdrant_client.http.exceptions.ResponseHandlingException` | the server cannot be reached or does not answer in time (connection refused, DNS, TLS, the timeout of the store); it wraps the error of the HTTP client |
+| `ImportError` | an embedder or a parser is built without its extra installed: the message names the extra (`rag-engine[torch]`, `rag-engine[onnx]`, `rag-engine[ingest]`) |
+| `RuntimeError` | an embedder is used after `release()` or after the end of its `with` block |
+| `ValueError`, `TypeError` | a bad argument of the store, of an embedder or of `ingest_document` (a `batch_size` of 0, a blank `doc_id`, a model of another dimension than announced, a model unknown to the backend); `SearchFilters(**mapping)` with an unknown key — `SearchFilters.from_mapping` raises a `SearchError` instead |
+| the error of a parser | a file ChunkNorris or MarkItDown cannot read |
+
+In qdrant-client's local mode (`QdrantClient(":memory:")`, tests) a missing collection and a vector of another dimension are plain `ValueError`s of the client. `store.is_reachable()` never raises.
 
 ## Configuration
 
@@ -49,16 +87,19 @@ Errors. Every exception class the engine defines derives from `rag_engine.errors
 | `QDRANT_PORT` | `6333` | Qdrant HTTP port (1 to 65535) |
 | `QDRANT_API_KEY` | none | Qdrant API key; blank means no authentication |
 | `QDRANT_HTTPS` | `false` | Connect over TLS (`1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`) |
+| `RAG_ENGINE_QDRANT_TIMEOUT` | `60` | Seconds a request to Qdrant may take: a positive number. Read by `QdrantStore` when it is built from the settings; an explicit `QdrantStore(..., timeout=...)` wins. qdrant-client counts whole seconds and rounds a fraction up |
 | `RAG_ENGINE_MODEL` | `intfloat/multilingual-e5-base` | Embedding model |
 | `RAG_ENGINE_DIM` | `768` | Vector dimension of the model |
 | `RAG_ENGINE_PASSAGE_PREFIX` | `passage: ` (with the trailing space) | Text put before each chunk when embedding; `none` for no prefix |
 | `RAG_ENGINE_QUERY_PREFIX` | `query: ` (with the trailing space) | Text put before each query when embedding; `none` for no prefix |
-| `RAG_ENGINE_BACKEND` | `torch` | Embedding backend (case-insensitive). Only `torch` works: `onnx` is accepted by the settings but **not available yet**, and `make_embedder` raises `NotImplementedError` for it |
-| `RAG_ENGINE_MODEL_CACHE` | none | Directory for model files; unset leaves the backend default |
+| `RAG_ENGINE_BACKEND` | `torch` | Embedding backend, `torch` or `onnx` (case-insensitive); see [Embedding backends](#embedding-backends) |
+| `RAG_ENGINE_MODEL_CACHE` | none | Directory for model files. Unset leaves the backend default: the Hugging Face cache for `torch`; `FASTEMBED_CACHE_PATH`, or a folder under the system's temporary directory, for `onnx`. **Set it on a server**, to a directory of its own, read-only for the service once filled (see [Embedding backends](#embedding-backends)) |
+| `RAG_ENGINE_PARITY_MIN` | `0.999` | Smallest cosine accepted between the `torch` and `onnx` vectors of the same text (above 0, at most 1). Read by the parity test only |
+| `RAG_ENGINE_ONNX_THREADS` | none | Threads the `onnx` backend runs inference on (at least 1). Unset: the ONNX runtime decides, from the cores of the host. **In a container with a CPU limit, set it to the limit**; see [Embedding backends](#embedding-backends) |
 | `RAG_ENGINE_BATCH_SIZE` | `100` | Points sent to Qdrant per write (at least 1). It sizes the writes only: all the chunks of a document are embedded in one call |
 | `RAG_ENGINE_OCR_LANGUAGES` | `eng` | Tesseract languages joined by `+`, without whitespace, e.g. `eng+fra`. The caller passes it to `ingest_document` (see below) |
-| `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. Read and checked, but not used yet: search is not available |
-| `RAG_ENGINE_SEARCH_MAX_LIMIT` | `50` | Largest limit a caller may ask for; not below the default limit. Not used yet either |
+| `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. The caller passes it to `search` (see [Searching](#searching)) |
+| `RAG_ENGINE_SEARCH_MAX_LIMIT` | `50` | Largest limit a caller may ask for; not below the default limit. Passed to `search` by the caller too |
 
 An unset or blank variable gives the default, and surrounding whitespace is ignored. An invalid value raises `ConfigError` (a `ValueError`) naming the variable and the value as it was set, cut to 80 characters.
 
@@ -72,7 +113,50 @@ The two prefixes follow their own rule:
 
 The API key is never printed: `repr()` and `str()` of a `Settings` show `qdrant_api_key=<set>` or `<unset>`, and no error message echoes it. It stays a plain attribute, and `dataclasses.asdict()` returns it, so do not log that dictionary.
 
-`Settings(...)` can also be built directly with keyword arguments. The same range checks apply, but nothing is parsed or converted: integers must be `int` (not `bool`, `float` or a numeric string), `qdrant_https` must be a `bool`, `backend` must be exactly `"torch"` or `"onnx"`, and a prefix string is the prefix as it is (`""` for no prefix). An empty `qdrant_host` or `model_name` is refused; a blank `qdrant_api_key` or `model_cache` becomes `None`. A wrong type raises `ConfigError`.
+`Settings(...)` can also be built directly with keyword arguments. The same range checks apply, but nothing is parsed or converted: integers must be `int` (not `bool`, `float` or a numeric string), `qdrant_https` must be a `bool`, `parity_min` must be a `float`, `qdrant_timeout` an `int` or a `float`, `backend` must be exactly `"torch"` or `"onnx"`, and a prefix string is the prefix as it is (`""` for no prefix). An empty `qdrant_host` or `model_name` is refused; a blank `qdrant_api_key` or `model_cache` becomes `None`. A wrong type raises `ConfigError`.
+
+## Embedding backends
+
+`make_embedder(settings)` builds the backend named by `RAG_ENGINE_BACKEND`. Both apply the same prefixes (`RAG_ENGINE_PASSAGE_PREFIX`, `RAG_ENGINE_QUERY_PREFIX`) and return `float32` vectors of `RAG_ENGINE_DIM` dimensions.
+
+| Backend | Extra | Runs on | Meant for |
+|---|---|---|---|
+| `torch` | `rag-engine[torch]` | sentence-transformers, PyTorch (CUDA, MPS or CPU) | ingestion: the passages of a collection are embedded with it |
+| `onnx` | `rag-engine[onnx]` | fastembed, ONNX runtime (CPU), no PyTorch | search: a service embeds its queries without installing PyTorch |
+
+The intended setup is **passages embedded with `torch`, queries embedded with `onnx`**. It is valid only if both backends give the same vector for the same text, so this is measured, not assumed.
+
+**Measured parity** for `intfloat/multilingual-e5-base` (repository revision `d128750597153bb5987e10b1c3493a34e5a4502a`, file `onnx/model.onnx`, 1,110,059,084 bytes, SHA-256 `84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa`, with the tokenizer and configuration files listed below; fastembed 0.9.1, onnxruntime 1.32.0, torch 2.15.0 CPU, sentence-transformers 6.3.0), on 50 fixed texts in English, French, German, Spanish, Italian and Japanese — single words, an empty string, numbers and identifiers, composed and decomposed accents, texts of about 400 words and of about 900 words (cut at 512 tokens):
+
+| Vectors | Minimum cosine, torch against onnx | Mean |
+|---|---|---|
+| passages | 1 − 1.3 × 10⁻¹¹ | 1.000000 |
+| queries | 1 − 3.9 × 10⁻¹² | 1.000000 |
+
+On a corpus of 20 chunks and 5 queries, the five best chunks of every query are the same, in the same order, with `onnx` queries as with `torch` queries. The test (`tests/test_parity.py`, marker `models`) fails below `RAG_ENGINE_PARITY_MIN` (0.999) or on any difference of ranking; CI runs it in the `parity` job. The test loads the model exactly as production does, checks that the vectors came from the pinned files on the CPU provider, and checks that a copy with one byte changed — in the ONNX file, then in `tokenizer.json` — is refused. Run it again after changing the model or upgrading `fastembed`, `onnxruntime`, `torch` or `sentence-transformers`; `fastembed` is bounded to the tested minor version (`>=0.9,<0.10`), and the bound is raised only after this test has passed on the new version. `rag_engine.embedding.cosine_parity(a, b)` gives the cosine of each pair of rows of two arrays of vectors.
+
+What the `onnx` backend does, and why it matches:
+
+- **Model files, pinned and verified.** The table `rag_engine.embedding.ONNX_MODELS` names the one ONNX export the engine loads for `intfloat/multilingual-e5-base`: the full-precision `onnx/model.onnx` of the model's own Hugging Face repository (not a quantised variant), at one revision — and, in `OnnxModel.files`, the size and SHA-256 of **every file loaded for the model**: the ONNX file and the four files the tokenizer is built from, which decide the vectors just as much as the weights do. They are the files the parity above was measured with:
+
+  | File | Size (bytes) | SHA-256 |
+  |---|---|---|
+  | `onnx/model.onnx` | 1,110,059,084 | `84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa` |
+  | `config.json` | 694 | `9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4` |
+  | `special_tokens_map.json` | 280 | `06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f` |
+  | `tokenizer.json` | 17,082,660 | `62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626` |
+  | `tokenizer_config.json` | 418 | `efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15` |
+
+  The engine fetches these files at that revision itself (`huggingface_hub.snapshot_download`) and hands the directory to fastembed, which downloads nothing. **Before the model is built, every file is hashed and compared with the table**; a different size or hash raises `ModelIntegrityError`, naming the file and the expected and found hashes. A changed export or tokenizer can therefore not reach production unnoticed, whatever the head of the repository holds that day. The four small files (17 MB in all) are hashed every time an embedder is built. Hashing the 1.1 GB ONNX file takes about one second; it is done once per process, and the hash is kept for the same path, size and modification time. An `OnnxModel` cannot be written without a pin for the ONNX file and for each of the four other files (`files` maps a path in the repository to `(sha256, size)`; `sha256` and `size` are those of the ONNX file). To change a file, re-measure parity first, then update the table.
+
+- **ONNX model: what the check protects against, and what it does not.** It catches a download that was changed or damaged, on the way or on disk, and an export or a tokenizer other than the one parity was measured with: a repository whose files moved, a cache filled by another tool or by hand, a file cut short. It does **not** protect against someone who can write to the model cache while the service runs. The files are verified when an embedder is built, not while it is used; the ONNX runtime opens them after the check; and within one process the kept hash of the ONNX file is trusted as long as its path, size and modification time are the same. So the model cache of a server should be a **dedicated directory, set with `RAG_ENGINE_MODEL_CACHE`, mounted read-only for the service once it is filled** (fill it once, with a first load or by copying the directory of another host). Left unset, the cache is a directory under the system's temporary directory (`<tmp>/fastembed_cache`, or `FASTEMBED_CACHE_PATH`), which other users of the host may be able to write to and which a reboot may clear.
+- **Other models.** A model that is not in the table but that fastembed lists is used as fastembed defines and downloads it, with a warning in the log: its files are not pinned or verified by the engine, and its parity was not measured. Any other name raises a `ValueError`.
+- **CPU only.** The session is created with the CPU execution provider alone, also where the GPU build of onnxruntime is installed: parity was measured on CPU.
+- **Threads.** By default the ONNX runtime sizes its thread pool from the cores of the host. It does not see the CPU limit of a container (`docker run --cpus=2`, a Kubernetes CPU limit): with more threads than CPUs, inference gets slower, not faster. In a CPU-limited container set `RAG_ENGINE_ONNX_THREADS` to the limit (`OnnxEmbedder(..., threads=...)` does the same).
+- **Prefixes.** The engine adds the prefix once and calls fastembed's plain `embed`; fastembed adds none of its own.
+- **Long texts.** The tokenizer cuts at the limit declared by the model (512 tokens), as sentence-transformers does: both backends see the same tokens.
+- **Batches.** Texts are embedded 32 at a time (`OnnxEmbedder(..., batch_size=...)`, or `make_embedder(settings, batch_size=...)`). A batch is padded to its longest text and the padding is left out of the pooling, so the vector of a text does not depend on its neighbours.
+- **Files.** The first use downloads about 1.1 GB into `RAG_ENGINE_MODEL_CACHE`. Without it, the files go where fastembed puts its own (`FASTEMBED_CACHE_PATH`, or a folder under the system's temporary directory, which a reboot may clear): set the variable on a server. Once the files are there, loading makes no request to the Hugging Face Hub. When they are missing and cannot be downloaded, a `ModelDownloadError` says which files, from which repository and revision, and into which directory; on a host without access to huggingface.co, point `RAG_ENGINE_MODEL_CACHE` at a directory filled beforehand (the directory of a host where the model was loaded once can be copied as it is).
 
 ## Ingesting a document
 
@@ -116,6 +200,235 @@ What it guarantees:
 `IngestResult.pages` counts the distinct pages chunks start on (0 for a format without pages). The other arguments are `ocr`, `ocr_languages` and `chunking_options` (see below), and `batch_size` (points per write; left out, the batch size of the store, which is `RAG_ENGINE_BATCH_SIZE` when the store was built from the settings). The batch size does not bound memory or the embedding call: all the chunk texts of a document are embedded in one `encode_passage` call.
 
 The points are the ones the previous pipeline wrote: `tests/fixtures/golden/` holds points captured from it for two documents, and the tests require the same ids, payloads and vectors.
+
+## Payload indexes
+
+Search filters need payload indexes: Qdrant answers a filter on an indexed field without reading every point. The engine indexes the fields listed in `rag_engine.schema.PAYLOAD_INDEXES`:
+
+| Field | Index | Filter it serves |
+|---|---|---|
+| `doc_id`, `source_code`, `doc_type`, `language`, `corpus` | keyword | exact match, one value or several |
+| `year` | integer | exact match and range |
+| `date` | datetime | range |
+
+`QdrantStore.ensure_payload_indexes` creates the ones a collection does not have yet and returns the fields it created an index for:
+
+```python
+store = QdrantStore(settings=Settings.from_env())
+store.ensure_payload_indexes("central-bank-e5b-v1")
+# ['doc_id', 'source_code', 'doc_type', 'language', 'corpus', 'year', 'date'] the first time, [] afterwards
+```
+
+- **On an existing collection.** An index is built from the points already there; no point is rewritten, no document has to be ingested again. The call returns once every index is built and usable. Run it once per collection, before or after ingesting; running it again does nothing and returns `[]`.
+- **What the returned list says.** It lists the fields for which a create call succeeded in this call, no more. Two callers that run at the same moment may each find the indexes missing, each create them, and each report every field. In qdrant-client's local mode, which keeps no index, every call reports every field.
+- **Checking afterwards.** Do not read `get_collection(...).payload_schema[field].points` right after the creation on a large collection: that count has been seen to lag for a few seconds while the index is built. Count through a filter instead: `store.client.count(collection, count_filter=..., exact=True)`.
+- **Never replaces an index.** If a field is already indexed with another kind (a keyword index on `date`, say), the call raises `CollectionMismatchError` naming the field, the expected kind and the one found, and creates nothing. Qdrant itself would drop the existing index and build the other one; removing an index stays a decision of the operator (`store.client.delete_payload_index`).
+- **Errors.** A refused API key is a `QdrantAuthError`. A collection that does not exist is not created: the error of the client is raised, like any other failure. Indexes created before a failure stay, and a second call creates the rest.
+- **Another list.** `ensure_payload_indexes(collection, [("page", "integer")])` takes any list of `(field, kind)`, a kind being the name of a Qdrant payload index type.
+
+**A value an index cannot read.** No value is ever refused, neither when an index is built nor when a point is written: the point stays stored, and a search without a filter on that field still returns it. But **a filter on that field no longer sees it**. Checked on Qdrant 1.20:
+
+| Field | Values the index reads | Values it does not read: the point is invisible to a filter on the field |
+|---|---|---|
+| `year` (integer) | an integer (`2016`), a float with an integral value (`2016.0`) | a string (`"2016"`), a float such as `2016.5`, a boolean, a null, a missing key |
+| keyword fields | a string, a list of strings | a number, a boolean, a null, a missing key: a filter, which matches strings, never finds them |
+| `date` (datetime) | `2016-03-10` (taken as midnight UTC); with a time after `T` or a space (`2016-03-10T12:00:00`, `2016-03-10 12:00:00`, `2016-03-10T12:00`); with `Z` or an offset (`2016-03-10T12:00:00+02:00`); also the lenient `2016-3-10` | `2016-03`, `2016`, an empty string, a null, a missing key, an integer (`20160310`, a Unix timestamp), `10/03/2016` |
+
+The index changes the answer in one case: without an integer index, a range on `year` still matches `2016.5`; once the index exists it does not. A `year` stored as the string `"2016"` matches no integer range, with or without the index. **Before creating the indexes on a collection that already holds points, check the types of the stored values** of `year` and of the keyword fields (read a sample with `store.client.scroll(collection, with_payload=["year", "source_code", "doc_type", "language", "corpus", "doc_id"])`): a field written with another type has to be rewritten before its filter can be trusted.
+
+**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. A document without a date the index reads is left out as soon as a date bound is set, with or without the index; its `year` is indexed on its own, but `search` has no filter on `year` in this version.
+
+**Date bounds.** A bound must be a full date, and what happens to another value depends on how it reaches Qdrant:
+
+- through the REST API, Qdrant refuses `"2016"` and `"2016-03"` alike with HTTP 400 (not an RFC 3339 date);
+- through the Python client, `"2016-03"` never leaves the process: `models.DatetimeRange` raises a validation error;
+- through the Python client, **`"2016"` is accepted**: the client reads it as a Unix timestamp, 2016 seconds after the epoch (`1970-01-01T00:33:36Z`), and sends that. Nothing fails: as a lower bound it matches almost every dated point, as an upper bound almost none.
+
+This is why `rag_engine.search` accepts only a `datetime.date` or a `YYYY-MM-DD` string as a bound, and refuses everything else itself (see [Searching](#searching)).
+
+qdrant-client's local mode (`QdrantClient(":memory:")`) keeps no payload index: it accepts the creation with a warning and filters by reading every point, with the same answers.
+
+## Searching
+
+`search` (in `rag_engine.search`, base install) embeds a query, asks Qdrant for the closest chunks that pass the filters, and returns them as `Hit` objects, best first. It is one dense cosine search; several chunks of one document may come back, nothing is grouped.
+
+Like `ingest_document`, `search` reads no settings and no environment variable. The caller builds everything from `Settings.from_env()` and passes it on, the two limits included: without `limit=settings.search_limit` and `max_limit=settings.search_max_limit`, the limits are the built-in 10 and 50, whatever `RAG_ENGINE_SEARCH_LIMIT` and `RAG_ENGINE_SEARCH_MAX_LIMIT` say.
+
+```python
+from rag_engine.config import Settings
+from rag_engine.embedding import make_embedder
+from rag_engine.search import SearchFilters, search
+from rag_engine.store import QdrantStore
+
+settings = Settings.from_env()  # with RAG_ENGINE_BACKEND=onnx: queries are embedded without PyTorch
+store = QdrantStore(settings=settings)
+embedder = make_embedder(settings)  # same model, dimension and prefixes as the ingestion
+
+collection = "central-bank-e5b-v1"
+store.check_collection(collection, embedder.dim)  # once at start; reads only, creates nothing
+
+hits = search(
+    "What did the Governing Council decide on asset purchases?",
+    collection=collection,
+    store=store,
+    embedder=embedder,
+    filters=SearchFilters(
+        source_codes=["ecb", "fed"],  # ecb OR fed
+        doc_types=["monetary-policy-statement", "minutes"],  # AND one of these types
+        date_from="2016-01-01",  # AND published from this day...
+        date_to="2016-03-10",  # ...to this day, both included
+    ),
+    limit=settings.search_limit,  # RAG_ENGINE_SEARCH_LIMIT; not read otherwise
+    max_limit=settings.search_max_limit,  # RAG_ENGINE_SEARCH_MAX_LIMIT; not read otherwise
+)
+for hit in hits:
+    print(f"{hit.score:.3f}", hit.doc_id, hit.date, hit.page, hit.text[:80])
+```
+
+**Check the collection once, at start.** `search` itself sends one request and checks nothing: on a collection that does not exist, or that has another dimension, it raises the error of the Qdrant client, at the first query. A search service therefore calls `store.check_collection(collection, embedder.dim)` once when it starts. It sends two read requests and never creates or changes anything, so it works with a read-only API key, and it says what is wrong in the engine's own words:
+
+| `check_collection` raises | When |
+|---|---|
+| `CollectionNotFoundError` | the collection does not exist (it is not created) |
+| `CollectionMismatchError` | it is not one unnamed vector of that dimension compared by cosine: another dimension, another distance (Dot, Euclid, Manhattan), named vectors, no dense vector |
+| `QdrantAuthError` | the API key is refused (HTTP 401 or 403) |
+| the error of the Qdrant client | anything else: an unreachable server, a timeout, a server error |
+
+**`ensure_collection` and `ensure_payload_indexes` are for writers only**: whoever owns the collection (the ingestion) calls them once per run. `ensure_collection` creates the collection when it is missing, and `ensure_payload_indexes` creates the indexes that make the filters fast; with a read-only API key both are refused with a `QdrantAuthError` as soon as they have something to create. The answers of a search are the same with and without the indexes.
+
+**Hits.** A `Hit` is a frozen dataclass: `text`, `score` (the cosine, higher is closer), `doc_id`, `title`, `date`, `source_code`, `doc_type`, `language`, `page`, `chunk_number`, `corpus`, then `point_id` and `payload`, the whole payload for the keys that have no field (`year`, `filename`, `ingestion_date`, ...). A key the payload does not have gives `None`; `page` is `None` for a document without pages (and `0` is the first page). `date` is the publication date exactly as stored. `hit.to_dict()` returns the fields without `payload`, ready for `json.dumps`; `to_dict(include_payload=True)` adds it.
+
+**Limits.** `limit` is the largest number of hits wanted, `max_limit` the largest limit accepted. A `limit` above `max_limit` is refused with a `SearchError` that names the maximum; it is never lowered silently.
+
+**Filters.** A `SearchFilters` is built from keyword arguments, all optional, and checked when it is built. When the filters arrive as data — the arguments of a tool of an MCP server, a JSON body, the `filters` of a question file — build it with `SearchFilters.from_mapping`:
+
+```python
+import json
+
+arguments = json.loads('{"source_codes": ["ecb"], "date_from": "2016-01-01", "languages": null}')
+filters = SearchFilters.from_mapping(arguments)  # SearchFilters(source_codes=["ecb"], date_from="2016-01-01")
+
+SearchFilters.from_mapping({"source": ["ecb"]})
+# SearchError: unknown filter 'source' (the filters are: source_codes, doc_types, languages, doc_ids,
+# date_from, date_to, corpus)
+```
+
+The keys are the field names below. A missing key and a `null` both mean "not set"; a key that is not a field is a `SearchError` naming it and listing the fields (`SearchFilters(**arguments)` would raise a bare `TypeError`); the values are checked exactly as the constructor checks them.
+
+| Field | Payload field | Value |
+|---|---|---|
+| `source_codes`, `doc_types`, `languages`, `doc_ids` | `source_code`, `doc_type`, `language`, `doc_id` | a list (or tuple, or set) of non-blank strings, matched exactly |
+| `date_from`, `date_to` | `date` | a `datetime.date`, or a string written exactly `YYYY-MM-DD` |
+| `corpus` | `corpus` | one non-blank string |
+
+- Fields are combined with **AND**; the values of one list with **OR**.
+- `None` (the default) is the only way to write "no restriction". **An empty list is refused**: it could mean "match nothing" as well as "match everything", and the two give opposite results.
+- A bare string where a list is expected (`source_codes="ecb"`) is refused: it would be read letter by letter. Write `["ecb"]`.
+- A value no chunk carries is not an error: the search returns `[]`. Values are compared as they are, case included.
+- A string that cannot be encoded as UTF-8 is refused, in a list and as `corpus`: a lone surrogate, which `json.loads('"\\ud800"')` returns and a client may therefore send. The error names the field, instead of the serialisation error the Qdrant client would raise later.
+- There is no filter on `year` in this version.
+
+**Dates.** Both bounds are inclusive, and a bound is a whole day in UTC: `date_to="2016-03-10"` keeps a document stored as `2016-03-10` and one stored as `2016-03-10T15:30:00Z`. (The upper bound is sent to Qdrant as "before the next day at 00:00 UTC", so it does not depend on the time of day a date was stored with.) Only a full date is a bound: `"2016"`, `"2016-03"`, `"10/03/2016"`, a date with a time, a `datetime.datetime` or a number raise a `SearchError`, and so does `date_from` after `date_to`. The check is the engine's own, on purpose: handed the string `"2016"`, qdrant-client reads a Unix timestamp and the filter matches almost everything. **As soon as one bound is set, a chunk without a full date is left out**: no `date`, a null, an empty string, or an imprecise date such as `2016-03` (see [Payload indexes](#payload-indexes)).
+
+**Queries.** A query must hold something to search for: at least one letter, number, symbol or punctuation mark (Unicode general categories L, N, S, P), in any script. `"2016"`, `"€"` and `"$AAPL"` are queries, and so is punctuation alone (`"???"`): degenerate, but typed. A query made only of combining marks, zero-width or other invisible characters, control characters and spaces is refused with a `SearchError` ("the query has no searchable character") instead of returning a full ranked list for a question that asks nothing. The rule holds for the normalised query too: an isolated accent such as `"¨"` or `"´"`, which NFKD writes as a space and a combining mark, is refused when it is the whole query. A query or a collection name that cannot be encoded as UTF-8 (a lone surrogate) is refused as well.
+
+**Query normalisation.** The chunker stores the text of the chunks in Unicode NFKD (accents and other marks as separate characters), and that text is what was embedded. `search` therefore puts the query in NFKD too before embedding it (`normalize_query=True`, the default). For French, German, Spanish or Greek the tokenizer of `intfloat/multilingual-e5-base` gives the same tokens for both forms, so nothing changes. For Japanese (voiced kana), Korean and Vietnamese it does not: typed as usual (NFC), `デフレ脱却` is cut into `デ`, `フレ`, `脱`, `却`, while the stored text was cut into `テ`, `゙`, `フレ`, `脱`, `却`; only the NFKD query gives the tokens of the passages. `normalize_query=False` embeds the query as typed; it is for a collection whose passages were embedded in another form. This is a parameter of `search`, not a setting.
+
+**Errors.** `SearchError` (a `ValueError` and a `RagEngineError`) for a bad argument or filter, raised before anything is embedded or sent. A refused API key is a `QdrantAuthError`. Everything else — an error of the embedder, a missing collection, an unreachable server — reaches the caller unchanged: see "Errors that are not `RagEngineError`" under [Public API](#public-api). A request waits at most the timeout of the store (`RAG_ENGINE_QDRANT_TIMEOUT`, 60 seconds by default; a search service usually wants less).
+
+**Versions.** Search uses Qdrant's query API: qdrant-client 1.10 or later, and a Qdrant server 1.10 or later.
+
+## Evaluating search quality
+
+`rag-engine eval` runs the search on a file of questions whose answers are known, and reports how well the expected documents are ranked.
+
+```bash
+export QDRANT_HOST=localhost QDRANT_PORT=6333   # the connection and the model come from the environment
+export RAG_ENGINE_BACKEND=onnx                  # the model must be the one the collection was embedded with
+export RAG_ENGINE_MODEL_CACHE=/var/cache/rag-engine-models   # where the model files are kept
+rag-engine eval --questions eval/known_item_v1.jsonl --collection documents
+rag-engine eval --questions eval/known_item_v1.jsonl --collection documents \
+    --k 10 --chunk-limit 50 --backend torch --output report.json --fail-under-hit-at-k 0.9
+```
+
+| Option | Meaning |
+|---|---|
+| `--questions FILE` | The question file (JSON Lines). Required. |
+| `--collection NAME` | The Qdrant collection to search. Required; it must exist, with one unnamed vector of the dimension of the model (`RAG_ENGINE_DIM`), compared by cosine. |
+| `--k N` | Number of documents the metrics look at. Default 10. |
+| `--chunk-limit N` | Number of chunks asked to the search per question. Default 50; at most `RAG_ENGINE_SEARCH_MAX_LIMIT`. |
+| `--backend torch\|onnx` | Embedding backend. Default: `RAG_ENGINE_BACKEND`. |
+| `--output FILE` | Also write the full report as JSON: parameters, metrics, every question with its first documents. |
+| `--fail-under-hit-at-k X` | Exit with code 1 when the **headline** hit@k is below `X` (between 0 and 1): the hit@k of the kinds of question asked without filters, averaged per document. Not the pooled mean of all questions. |
+| `--bootstrap-resamples N` | Number of times the documents are drawn again for the 95% intervals. Default 1000. |
+| `--allow-empty` | Run even when the collection holds none of the expected documents. Without it, that is an error (exit code 2). |
+
+The command is the one place of the engine that reads the settings by itself (`Settings.from_env()`; a `.env` file is not read). It prints the report on the standard output. Exit codes: **0** when the evaluation ran, **1** when `--fail-under-hit-at-k` is given and not met, **2** when the evaluation could not run to its end (bad arguments or settings, an unusable question file, an unreachable server or a refused key, a missing collection, a collection of another dimension, of another distance than cosine or with named vectors, a collection that holds none of the expected documents, a missing embedding backend, a failure midway). `rag-engine --version` prints the version.
+
+**Model files.** The first run with the `onnx` backend downloads about 1.1 GB (the pinned ONNX export and its tokenizer) from the Hugging Face Hub; the `torch` backend downloads the weights of the model, about as much, into the Hugging Face cache. Set `RAG_ENGINE_MODEL_CACHE` to a directory that stays: unset, the ONNX files go under the system's temporary directory and are downloaded again after a reboot. The later runs make no request to the Hub.
+
+What is cheap is checked before the embedding model is loaded: the question file, the server, the collection (`QdrantStore.check_collection`, which only reads: the dimension of its vectors against `RAG_ENGINE_DIM`, and their distance, which must be cosine — a Dot or Euclid collection is refused, its scores are not the cosines the report is about), then the presence of the expected documents. A collection in which none of them is found is almost always the wrong collection, so the command stops there instead of printing an empty report and exiting with 0; `--allow-empty` runs it all the same, with a warning.
+
+**The question file** is JSON Lines, one question per line: `id` (unique), `question`, `expected_doc_ids` (the `doc_id` of every document that answers it, at least one), and optionally `filters` (an object with the field names and the rules of `SearchFilters`), `kind` and `tags` (labels the report groups by), `language` and `rationale` (kept, not used). It is checked strictly when read: a duplicate id, an empty `expected_doc_ids`, an unknown field or filter (`SearchFilters.from_mapping` reads the filters), a bad date, a question that holds nothing to search for once put in NFKD raise an `EvalError` naming the line. One question file is kept under [`eval/`](eval/README.md):
+
+- `eval/known_item_v1.jsonl`: 797 automatic questions that ask for a document by its title or its catalogue label, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`. The words follow what a doc type is at each bank, a date is never stated more precisely than the manifest knows it nor presented as a meeting date when it is a publication date, and a question expects every document that holds the text asked for (the ECB publishes its decision and its statement a second time as one combined document). [`eval/README.md`](eval/README.md) has the tables and the evidence.
+
+A second file, `eval/analytical_v1.jsonl`, with questions on the content of the documents written by hand, is to come: it does not exist yet, and is added once its questions are validated.
+
+How to read the numbers of the known-item batch: it is a stratified sample, 12 documents per (bank, doc type) cell, so its averages weigh the 18 cells equally and are not weighted like the corpus; and all the documents are English, so its French questions measure cross-lingual retrieval.
+
+**Scoring is done on documents.** The search returns chunks, and several may come from one document, while an expected answer is a document. For each question the search is asked for `chunk_limit` chunks, which are collapsed into documents: a document takes the place and the score of its best chunk. The metrics look at the first `k` documents of that ranking:
+
+| Metric | Meaning |
+|---|---|
+| hit@1 | Share of questions whose first document is an expected one. |
+| hit@k | Share of questions with an expected document among the first `k`. |
+| MRR | Mean of `1 / rank` of the best-placed expected document; a rank beyond `k` counts for 0. |
+| recall@k | Mean share of the expected documents found among the first `k`. |
+
+**The report.** One line per `kind`, then the headline, then all questions pooled, then one line per tag:
+
+```
+                  questions  documents  hit@1              hit@10             MRR                recall@10
+kind: filtered *          5          6  0.83 [0.50, 1.00]  0.83 [0.50, 1.00]  0.83 [0.50, 1.00]  0.67
+kind: second *            1          1  0.00               1.00               0.50               1.00       (few documents)
+kind: verbatim            6          4  0.92 [0.75, 1.00]  1.00 [1.00, 1.00]  0.96 [0.88, 1.00]  1.00
+headline                  6          4  0.92 [0.75, 1.00]  1.00 [1.00, 1.00]  0.96 [0.88, 1.00]  1.00
+overall (pooled)         12         11  0.75               0.92               0.83               0.88
+```
+
+(The test fixture of `eval/fixtures/`, with the minimum number of documents for an interval lowered to 4. No measurement of the production collection is recorded here.)
+
+- Every line gives the number of questions and of **distinct expected documents**. The lines of the kinds, of the headline and of the tags are **per-document means**: the questions that expect one document are averaged first, then the documents, because the questions of one document are correlated.
+- `[low, high]` is a 95% interval of that mean, from 1000 resamples of the documents with a fixed seed (`--bootstrap-resamples`; standard library `random`, so the same results always give the same interval). A line with fewer than 20 documents gets none and is marked `(few documents)`. The kinds and the headline have intervals, the tags do not.
+- **`headline`** is the kinds asked without filters, per document. It is what `--fail-under-hit-at-k` looks at.
+- A kind marked `*` is asked with filters and kept out of the headline: where the filters leave fewer than `k` documents, hit@k and recall@k are true by construction, and only hit@1 and MRR are informative.
+- **`overall (pooled)`** is the plain mean over all scored questions, every kind, each question counted once. It is kept, and labelled as pooled in the JSON as well; it is not the headline.
+- Rates are printed to two decimals, which is what their uncertainty allows; the JSON report holds the exact values.
+
+The questions without any expected document among the first `k` are listed as **misses**, with the three best documents returned and their titles.
+
+**Equal scores.** Two chunks with the same text have exactly the same score, and Qdrant returns them in an order that can change from one request to the next. The chunks returned are put in one order (score, then `doc_id`, then `chunk_number`) before they become documents, so the same chunks always give the same ranking. A question whose hit@1 or hit@k hangs on the order of equal scores is marked `tied_at_decision`, and the report counts them. Ties at the edge of the chunk budget stay outside the harness: which of the tied chunks Qdrant returns is its choice.
+
+`chunk_limit` chunks may hold fewer than `k` documents, when the best chunks come from a few long documents. The report does not hide it: it counts the questions for which fewer than `k` documents were ranked and, among them, those whose search returned the whole chunk budget, for which a larger `--chunk-limit` could have ranked more. The budget is bounded by the search maximum (`RAG_ENGINE_SEARCH_MAX_LIMIT`, default 50), so that the evaluation measures the search a caller gets; raise both to look deeper.
+
+**Documents that are not in the collection.** Before any search, the expected documents of all the questions are looked up in the collection (`QdrantStore.existing_doc_ids`, a filter on `doc_id`). A question none of whose expected documents is there is reported under `not_in_collection` and left out of every metric: counting it as a miss would blame the search for a document that was never ingested. A question with only some of its documents absent is scored; the absent ones are listed, and its recall is the share of the documents that are there.
+
+From Python, with a store and an embedder the caller already has:
+
+```python
+from rag_engine.eval import evaluate, format_report, load_questions
+
+questions = load_questions("eval/known_item_v1.jsonl")
+report = evaluate(questions, collection="documents", store=store, embedder=embedder, k=10, chunk_limit=50)
+print(format_report(report))
+report.headline.per_document.hit_at_k  # the headline; also .hit_at_1, .mrr, .recall_at_k
+report.headline.intervals  # {"hit_at_1": (low, high), "hit_at_k": ..., "mrr": ...}, or None with few documents
+report.by_kind, report.by_tag, report.overall  # an Aggregate each; overall is pooled over the questions
+report.tied_at_decision  # questions whose hit@1 or hit@k hangs on the order of equal scores
+report.misses  # the questions without an expected document among the first k
+report.to_json()  # everything, as JSON
+```
 
 ## Supported formats and OCR
 
@@ -181,14 +494,19 @@ The tests that parse real documents need the `ingest` extra (`pip install -e ".[
 
 Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
+The default suite also runs the evaluation harness end to end, in qdrant-client's local mode, on the fixture of `eval/fixtures/` (13 documents, 13 questions with known answers), and checks the committed question file `eval/known_item_v1.jsonl`.
+
+The tests do not read the settings of the host: `tests/conftest.py` takes `QDRANT_*`, `RAG_ENGINE_*`, `ENABLE_OCR` and `TESSDATA_PREFIX` out of the environment for the run (and puts them back afterwards), so a `QDRANT_PORT` or a `RAG_ENGINE_BACKEND` set for other work changes nothing. Only the variables meant for the tests get through, to the tests of their marker: `RAG_ENGINE_IT_QDRANT_URL` and `RAG_ENGINE_IT_QDRANT_API_KEY` (`integration`), `RAG_ENGINE_MODEL_CACHE` and `RAG_ENGINE_PARITY_MIN` (`models`). The caches of the model libraries (`HF_HOME`, `FASTEMBED_CACHE_PATH`) are left alone. The tests do not depend on their order either (`pytest -p randomly` with `pytest-randomly` installed).
+
 Two test markers are deselected by default:
 
 - `integration`: needs a real Qdrant, given by `RAG_ENGINE_IT_QDRANT_URL`.
-- `models`: downloads embedding models.
+- `models`: downloads embedding models. It holds the test of the real torch model, the parity test of the two backends and the checks of the pinned model files (`tests/test_parity.py`); it needs `pip install -e ".[dev,torch,onnx]"`, and about 1.2 GB of free space in the temporary directory for the altered copy of the ONNX file, which the test removes when it ends. CI runs it in its own job, `parity`, with the model files cached under a key that carries the pinned revision.
 
 ```bash
 docker run --rm -p 6333:6333 qdrant/qdrant:v1.20.0
 RAG_ENGINE_IT_QDRANT_URL=http://localhost:6333 pytest -m integration -q
+pytest -m models -q -s  # -s prints the measured parity
 ```
 
 The integration tests of ingestion parse real documents, so they also need the `ingest` extra and skip without it; the CI integration job installs it and fails if the parsers cannot be imported.

@@ -4,6 +4,7 @@ import pytest
 
 from rag_engine.chunking import UnsupportedFormatError
 from rag_engine.config import ConfigError, Settings
+from rag_engine.embedding import ModelDownloadError, ModelIntegrityError
 from rag_engine.errors import RagEngineError
 from rag_engine.store import CollectionMismatchError, QdrantAuthError, StoreError
 
@@ -13,7 +14,16 @@ def test_the_base_is_a_plain_exception():
 
 
 @pytest.mark.parametrize(
-    "error", [ConfigError, StoreError, QdrantAuthError, CollectionMismatchError, UnsupportedFormatError]
+    "error",
+    [
+        ConfigError,
+        StoreError,
+        QdrantAuthError,
+        CollectionMismatchError,
+        UnsupportedFormatError,
+        ModelIntegrityError,
+        ModelDownloadError,
+    ],
 )
 def test_every_error_of_the_engine_derives_from_the_base(error):
     assert issubclass(error, RagEngineError)

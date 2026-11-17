@@ -10,7 +10,7 @@ from qdrant_client import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from rag_engine.config import Settings
-from rag_engine.store import CollectionMismatchError, QdrantStore
+from rag_engine.store import CollectionMismatchError, CollectionNotFoundError, QdrantStore
 
 QDRANT_URL = os.environ.get("RAG_ENGINE_IT_QDRANT_URL", "").strip()
 
@@ -78,6 +78,98 @@ def test_a_collection_with_another_distance_is_refused(store, collection):
     )
     with pytest.raises(CollectionMismatchError, match="Dot"):
         store.ensure_collection(collection, DIM)
+
+
+# --- check_collection: the read-only check -----------------------------------------------
+def _names(store) -> list[str]:
+    return sorted(entry.name for entry in store.client.get_collections().collections)
+
+
+def test_check_collection_of_a_missing_collection_creates_nothing(store, collection):
+    before = _names(store)
+    with pytest.raises(CollectionNotFoundError, match=collection):
+        store.check_collection(collection, DIM)
+    assert not store.client.collection_exists(collection_name=collection)
+    assert _names(store) == before  # as many collections as before
+
+
+def test_check_collection_accepts_the_collection_of_a_writer_and_changes_nothing(store, collection):
+    store.ensure_collection(collection, DIM)
+    store.upsert(collection, _points(3))
+    before, names = store.client.get_collection(collection_name=collection), _names(store)
+    assert store.check_collection(collection, DIM) is None
+    after = store.client.get_collection(collection_name=collection)
+    assert after.config == before.config and after.payload_schema == before.payload_schema
+    assert store.count(collection) == 3
+    assert _names(store) == names
+
+
+def test_check_collection_refuses_another_dimension(store, collection):
+    store.ensure_collection(collection, DIM * 2)
+    with pytest.raises(CollectionMismatchError, match=f"found {DIM * 2}-d"):
+        store.check_collection(collection, DIM)
+
+
+@pytest.mark.parametrize("distance", [models.Distance.DOT, models.Distance.EUCLID, models.Distance.MANHATTAN])
+def test_check_collection_refuses_another_distance(store, collection, distance):
+    store.client.create_collection(
+        collection_name=collection, vectors_config=models.VectorParams(size=DIM, distance=distance)
+    )
+    with pytest.raises(CollectionMismatchError, match=f"found {distance.value} distance"):
+        store.check_collection(collection, DIM)
+
+
+def test_check_collection_refuses_named_vectors(store, collection):
+    store.client.create_collection(
+        collection_name=collection,
+        vectors_config={"text": models.VectorParams(size=DIM, distance=models.Distance.COSINE)},
+    )
+    with pytest.raises(CollectionMismatchError, match="named vectors \\('text'\\)"):
+        store.check_collection(collection, DIM)
+
+
+def test_check_collection_refuses_a_collection_without_a_dense_vector(store, collection):
+    store.client.create_collection(
+        collection_name=collection,
+        vectors_config={},
+        sparse_vectors_config={"sparse": models.SparseVectorParams()},
+    )
+    with pytest.raises(CollectionMismatchError, match="no dense vector"):
+        store.check_collection(collection, DIM)
+
+
+def test_a_refused_check_leaves_the_collection_as_it_was(store, collection):
+    store.ensure_collection(collection, DIM * 2)
+    store.upsert(collection, [models.PointStruct(id=1, vector=[0.5] * (DIM * 2), payload={"n": 1})])
+    before, names = store.client.get_collection(collection_name=collection).config, _names(store)
+    with pytest.raises(CollectionMismatchError):
+        store.check_collection(collection, DIM)
+    assert store.client.get_collection(collection_name=collection).config == before
+    assert store.count(collection) == 1 and _names(store) == names
+
+
+@pytest.mark.parametrize("name", ["with/a-slash", "x" * 300], ids=["slash", "too-long"])
+def test_a_name_the_server_does_not_accept_is_raised_as_the_client_raises_it(store, name):
+    # Not a "collection not found": the server refuses the request before it looks anything up.
+    with pytest.raises(UnexpectedResponse) as info:
+        store.check_collection(name, DIM)
+    assert info.value.status_code == 422
+    with pytest.raises(UnexpectedResponse) as info:
+        store.query(name, [0.1] * DIM, limit=1)
+    assert info.value.status_code == 422
+
+
+def test_an_unreachable_server_is_raised_as_the_client_raises_it(monkeypatch):
+    from qdrant_client.http.exceptions import ResponseHandlingException
+    from qdrant_client.qdrant_remote import QdrantRemote
+
+    # The client looks at the version of the server in a thread, and would warn during a later test.
+    monkeypatch.setattr(QdrantRemote, "_check_compatibility", staticmethod(lambda *args: None))
+    dead = QdrantStore("127.0.0.1", 1, timeout=2, settings=Settings())  # nothing listens on port 1
+    with pytest.raises(ResponseHandlingException):
+        dead.check_collection("anything", DIM)
+    assert dead.is_reachable() is False
+    dead.client.close()
 
 
 def test_creating_a_collection_that_exists_is_survived_as_a_lost_race(store, collection):

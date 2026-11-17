@@ -65,3 +65,40 @@ jobs:
           echo "Qdrant did not become ready" >&2
           exit 1
       - run: python -m pytest -m integration -q
+  # The real embedding model, through both backends: the test of the torch backend, and the
+  # parity test that allows queries embedded with onnx against passages embedded with torch.
+  parity:
+    runs-on: ubuntu-latest
+    # About 3 minutes with the model cache, about 10 without. The limit stops a download that
+    # hangs long before the 6 hours GitHub allows a job.
+    timeout-minutes: 30
+    env:
+      HF_HOME: ${{ github.workspace }}/.model-cache/huggingface
+      FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.model-cache/fastembed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # The CPU build of PyTorch first: the default wheel carries the CUDA libraries.
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e ".[dev,torch,onnx]"
+      - name: Check that both backends are importable
+        run: python -c "import fastembed, onnxruntime, sentence_transformers, torch; print(torch.__version__)"
+      # The cache key carries the revision the engine pins for the ONNX file: when the table
+      # ONNX_MODELS changes, the cache starts empty and the new file is really downloaded.
+      - name: Read the pinned revision of the ONNX model
+        id: pin
+        run: |
+          python -c "from rag_engine.embedding import ONNX_MODELS; print('revision=' + ONNX_MODELS['intfloat/multilingual-e5-base'].revision)" >> "$GITHUB_OUTPUT"
+      # About 2.2 GB: the weights for sentence-transformers and the ONNX file for fastembed.
+      - uses: actions/cache@v4
+        with:
+          path: .model-cache
+          key: models-intfloat-multilingual-e5-base-${{ steps.pin.outputs.revision }}
+      # The import guarantee is checked here too: this is the only job where torch and
+      # fastembed are both installed, the install in which a stray import would show.
+      - run: python -m pytest tests/test_packaging.py -q
+      - run: python -m pytest -m models -q -s

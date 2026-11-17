@@ -1,17 +1,25 @@
-"""Embedders: the shared prefix rule, the deterministic fake, and the torch backend.
+"""Embedders: the shared prefix rule, the deterministic fake, the torch and onnx backends.
 
 The torch backend is tested without torch: stub ``torch`` and ``sentence_transformers`` modules
-are placed in ``sys.modules``, so the constructor's lazy imports find them. One test, marked
-``models``, loads the real model; it runs only where the ``torch`` extra is installed.
+are placed in ``sys.modules``, so the constructor's lazy imports find them. The onnx backend is
+tested the same way, with a stub ``fastembed`` and a stub ``huggingface_hub``. One test, marked
+``models``, loads the real model; it runs only where the ``torch`` extra is installed. The
+comparison of the two real backends, and the check of the pinned ONNX file, are in
+``test_parity.py``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import types
+from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
@@ -22,8 +30,12 @@ from rag_engine.config import Settings
 from rag_engine.embedding import (
     Embedder,
     FakeEmbedder,
+    ModelDownloadError,
+    ModelIntegrityError,
     ModelSpec,
+    OnnxEmbedder,
     TorchEmbedder,
+    cosine_parity,
     detect_device,
     make_embedder,
 )
@@ -623,6 +635,957 @@ def test_module_import_and_fake_do_not_load_torch():
 
 
 # ---------------------------------------------------------------------------
+# OnnxEmbedder against a stub fastembed
+# ---------------------------------------------------------------------------
+E5 = "intfloat/multilingual-e5-base"
+E5_SPEC = ModelSpec(name=E5, dim=8, passage_prefix="passage: ", query_prefix="query: ")
+LISTED_SPEC = ModelSpec(name="listed/model", dim=8, passage_prefix="passage: ", query_prefix="query: ")
+CPU_ONLY = ["CPUExecutionProvider"]
+REVISION = "0123456789abcdef0123456789abcdef01234567"
+ONNX_BYTES = b"the bytes of a stub ONNX export"
+# The files fastembed reads next to the ONNX file, in the order the engine asks for them.
+SUPPORT_FILES = ["config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json"]
+SUPPORT_BYTES = {name: f'{{"stub of": "{name}"}}'.encode() for name in SUPPORT_FILES}
+PINNED_FILES = ["onnx/model.onnx", *SUPPORT_FILES]
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def pin(data: bytes) -> tuple[str, int]:
+    return sha256(data), len(data)
+
+
+def pinned(*, repin=None, **changes):
+    """A table entry that pins the stub files; ``changes`` replace fields.
+
+    ``repin`` replaces the pin of some files: ``{file: (sha256, size)}``.
+    """
+    content = {changes.get("model_file", "onnx/model.onnx"): ONNX_BYTES, **SUPPORT_BYTES}
+    files = {**{name: pin(data) for name, data in content.items()}, **(repin or {})}
+    fields = {"dim": 8, "revision": REVISION, "files": files}
+    return embedding_mod.OnnxModel(**{**fields, **changes})
+
+
+class StubHub:
+    """Stands in for ``huggingface_hub``: a Hub that holds ``content`` at every revision asked.
+
+    ``snapshot_download`` writes into the directory layout of the real one,
+    ``<cache_dir>/models--<owner>--<name>/snapshots/<revision>/``, and records its calls.
+    """
+
+    def __init__(self):
+        self.content = {"onnx/model.onnx": ONNX_BYTES, **SUPPORT_BYTES}
+        self.online = True
+        self.calls: list[dict] = []
+
+    @property
+    def downloads(self) -> list[dict]:
+        return [call for call in self.calls if not call["local_files_only"]]
+
+    def snapshot_download(self, repo_id, *, revision, allow_patterns, cache_dir, local_files_only=False):
+        self.calls.append(
+            {
+                "repo_id": repo_id,
+                "revision": revision,
+                "allow_patterns": list(allow_patterns),
+                "cache_dir": cache_dir,
+                "local_files_only": local_files_only,
+            }
+        )
+        directory = Path(cache_dir) / f"models--{repo_id.replace('/', '--')}" / "snapshots" / revision
+        if local_files_only:
+            if not directory.is_dir():
+                raise FileNotFoundError("Cannot find an appropriate cached snapshot folder")
+            return str(directory)
+        if not self.online:
+            raise ConnectionError("the Hub is unreachable")
+        for name in allow_patterns:
+            if name in self.content:
+                (directory / name).parent.mkdir(parents=True, exist_ok=True)
+                (directory / name).write_bytes(self.content[name])
+        return str(directory)
+
+
+def snapshot(cache_dir, repo=E5, revision=REVISION) -> Path:
+    return Path(cache_dir) / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
+
+
+class StubPooling:
+    """Stands in for fastembed's ``PoolingType`` enumeration."""
+
+    MEAN = "pooling:MEAN"
+    CLS = "pooling:CLS"
+
+    def __class_getitem__(cls, name):
+        return getattr(cls, name)
+
+
+class StubSource:
+    def __init__(self, hf=None):
+        self.hf = hf
+
+
+class StubTextEmbedding:
+    """Stands in for ``fastembed.TextEmbedding``; records how it is built and called."""
+
+    listed: ClassVar[list[dict]] = []
+    registrations: ClassVar[list[dict]] = []
+    instances: ClassVar[list[StubTextEmbedding]] = []
+    hold = 0.0  # seconds spent producing each batch
+    width = 8  # size of the rows produced
+
+    @classmethod
+    def list_supported_models(cls):
+        return [dict(description) for description in cls.listed]
+
+    @classmethod
+    def add_custom_model(cls, **kwargs):
+        if any(entry["model"].lower() == kwargs["model"].lower() for entry in cls.listed):
+            raise ValueError(f"Model {kwargs['model']} is already registered")
+        cls.registrations.append(kwargs)
+        cls.listed.append({"model": kwargs["model"], "dim": kwargs["dim"]})
+
+    def __init__(self, *args, **kwargs):
+        self.init_args = args
+        self.init_kwargs = kwargs
+        self.embed_calls: list[tuple[list[str], dict]] = []
+        self.other_calls: list[str] = []
+        self.active = 0
+        self.max_active = 0
+        self._guard = threading.Lock()
+        StubTextEmbedding.instances.append(self)
+
+    def embed(self, documents, **kwargs):
+        # A generator, as in fastembed: nothing runs before it is read.
+        with self._guard:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.embed_calls.append((list(documents), kwargs))
+        try:
+            if type(self).hold:
+                time.sleep(type(self).hold)
+            for document in documents:
+                row = np.zeros(type(self).width, dtype=np.float32)
+                row[0] = len(document)
+                yield row
+        finally:
+            with self._guard:
+                self.active -= 1
+
+    def query_embed(self, *args, **kwargs):
+        self.other_calls.append("query_embed")
+        raise AssertionError("the engine applies the prefixes itself and calls embed only")
+
+    def passage_embed(self, *args, **kwargs):
+        self.other_calls.append("passage_embed")
+        raise AssertionError("the engine applies the prefixes itself and calls embed only")
+
+
+@pytest.fixture
+def fastembed_stub(monkeypatch, tmp_path):
+    """A fake ``fastembed`` package that lists one model of its own, ``listed/model``.
+
+    With it come a fake ``huggingface_hub`` (``fastembed_stub.hub``), a default model directory
+    under ``tmp_path`` (``fastembed_stub.default_cache``), and a table entry for the real model
+    name that pins the stub files.
+    """
+    fastembed = types.ModuleType("fastembed")
+    fastembed.TextEmbedding = StubTextEmbedding
+    common = types.ModuleType("fastembed.common")
+    description = types.ModuleType("fastembed.common.model_description")
+    description.PoolingType = StubPooling
+    description.ModelSource = StubSource
+    fastembed.common = common
+    common.model_description = description
+    monkeypatch.setitem(sys.modules, "fastembed", fastembed)
+    monkeypatch.setitem(sys.modules, "fastembed.common", common)
+    monkeypatch.setitem(sys.modules, "fastembed.common.model_description", description)
+    monkeypatch.setattr(StubTextEmbedding, "listed", [{"model": "listed/model", "dim": 8}])
+    monkeypatch.setattr(StubTextEmbedding, "registrations", [])
+    monkeypatch.setattr(StubTextEmbedding, "instances", [])
+    monkeypatch.setattr(StubTextEmbedding, "hold", 0.0)
+    monkeypatch.setattr(StubTextEmbedding, "width", 8)
+    hub = StubHub()
+    hub_module = types.ModuleType("huggingface_hub")
+    hub_module.snapshot_download = hub.snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub_module)
+    monkeypatch.setattr(StubTextEmbedding, "hub", hub, raising=False)
+    default_cache = str(tmp_path / "default-model-cache")
+    monkeypatch.setenv("FASTEMBED_CACHE_PATH", default_cache)
+    monkeypatch.setattr(StubTextEmbedding, "default_cache", default_cache, raising=False)
+    monkeypatch.setattr(embedding_mod, "_sha256_cache", {})
+    # The table entry of the real model, with the small dimension of the stub rows and the
+    # hashes of the stub files.
+    monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {E5: pinned()})
+    return StubTextEmbedding
+
+
+def test_the_table_pins_the_export_of_e5_base_whose_parity_was_measured():
+    known = embedding_mod.ONNX_MODELS[E5]
+    # The full-precision export, mean pooling over the attention mask, unit-length vectors;
+    # the revision, and the hash and size of every file the parity numbers of the README were
+    # measured with: the ONNX file, and the tokenizer and configuration files.
+    assert known == embedding_mod.OnnxModel(
+        dim=768,
+        revision="d128750597153bb5987e10b1c3493a34e5a4502a",
+        files={
+            "onnx/model.onnx": (
+                "84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa",
+                1_110_059_084,
+            ),
+            "config.json": ("9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4", 694),
+            "special_tokens_map.json": (
+                "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+                280,
+            ),
+            "tokenizer.json": (
+                "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+                17_082_660,
+            ),
+            "tokenizer_config.json": (
+                "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15",
+                418,
+            ),
+        },
+        model_file="onnx/model.onnx",
+        pooling="mean",
+        normalization=True,
+        hf=None,
+    )
+    assert known.sha256 == "84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa"
+    assert known.size == 1_110_059_084
+    with pytest.raises(TypeError):
+        embedding_mod.ONNX_MODELS["other/model"] = known  # type: ignore[index]
+
+
+def test_a_table_entry_pins_every_file_the_engine_requires():
+    for known in embedding_mod.ONNX_MODELS.values():
+        assert set(known.files) == {known.model_file, *SUPPORT_FILES}
+    assert set(embedding_mod._ONNX_SUPPORT_FILES) == set(SUPPORT_FILES)
+
+
+def test_a_table_entry_cannot_be_written_without_its_pin():
+    with pytest.raises(TypeError):
+        embedding_mod.OnnxModel(dim=8)
+    with pytest.raises(TypeError):
+        embedding_mod.OnnxModel(dim=8, revision=REVISION)
+    with pytest.raises(TypeError):
+        embedding_mod.OnnxModel(dim=8, files=pinned().files)
+
+
+@pytest.mark.parametrize("revision", ["main", REVISION[:12], REVISION.upper(), None])
+def test_a_table_entry_refuses_a_revision_that_is_not_a_full_commit_hash(revision):
+    with pytest.raises(ValueError, match=r"OnnxModel: revision "):
+        pinned(revision=revision)
+
+
+@pytest.mark.parametrize("files", [None, [], "onnx/model.onnx", [("onnx/model.onnx", pin(ONNX_BYTES))], {}])
+def test_a_table_entry_refuses_files_that_are_not_a_mapping_with_entries(files):
+    with pytest.raises(ValueError, match=r"OnnxModel: files must be a non-empty mapping"):
+        pinned(files=files)
+
+
+@pytest.mark.parametrize("missing", PINNED_FILES)
+def test_a_table_entry_refuses_to_leave_a_required_file_without_a_pin(missing):
+    files = dict(pinned().files)
+    del files[missing]
+    with pytest.raises(ValueError, match=rf"OnnxModel: files has no entry for {re.escape(repr(missing))}"):
+        pinned(files=files)
+
+
+def test_a_table_entry_must_pin_the_onnx_file_it_names():
+    with pytest.raises(ValueError, match=r"OnnxModel: files has no entry for 'onnx/other\.onnx'"):
+        embedding_mod.OnnxModel(dim=8, revision=REVISION, files=pinned().files, model_file="onnx/other.onnx")
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "  ", "/etc/passwd", "../tokenizer.json", "onnx/../../x", "onnx\\model.onnx", "onnx//x", 5, None],
+)
+def test_a_table_entry_refuses_a_file_name_that_is_not_a_path_inside_the_repository(name):
+    with pytest.raises(ValueError, match=r"OnnxModel: files: .* is not the path of a file"):
+        pinned(repin={name: pin(b"x")})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa",
+        ("0" * 64,),
+        ("0" * 64, 5, 5),
+        ("84a4d426", 5),
+        ("g" * 64, 5),
+        ("A" * 64, 5),
+        (5, 5),
+        (5, "0" * 64),
+        ("0" * 64, 0),
+        ("0" * 64, -1),
+        ("0" * 64, True),
+        ("0" * 64, 1.5),
+        ("0" * 64, "1110059084"),
+    ],
+    ids=repr,
+)
+@pytest.mark.parametrize("file", ["onnx/model.onnx", "tokenizer.json"])
+def test_a_table_entry_refuses_a_pin_of_another_form(file, value):
+    with pytest.raises(ValueError, match=rf"OnnxModel: files\[{re.escape(repr(file))}\] must be"):
+        pinned(repin={file: value})
+
+
+def test_a_table_entry_keeps_its_own_read_only_copy_of_the_files():
+    given = dict(pinned().files)
+    entry = pinned(files=given)
+    given["tokenizer.json"] = ("0" * 64, 1)
+    given["extra.json"] = ("0" * 64, 1)
+    assert entry.files["tokenizer.json"] == pin(SUPPORT_BYTES["tokenizer.json"])
+    assert "extra.json" not in entry.files
+    with pytest.raises(TypeError):
+        entry.files["tokenizer.json"] = ("0" * 64, 1)  # type: ignore[index]
+    assert all(type(value) is tuple for value in entry.files.values())
+
+
+def test_a_table_entry_does_not_depend_on_the_order_the_files_were_written_in():
+    files = pinned().files
+    backwards = pinned(files=dict(reversed(list(files.items()))))
+    assert backwards == pinned()
+    assert hash(backwards) == hash(pinned())
+    assert repr(backwards) == repr(pinned())
+    # The ONNX file first, then the others by name.
+    assert list(backwards.files) == PINNED_FILES
+    assert pinned(repin={"tokenizer.json": ("0" * 64, 1)}) != pinned()
+    assert (pinned().sha256, pinned().size) == pin(ONNX_BYTES)
+
+
+def test_a_table_entry_may_pin_more_files_than_the_required_ones(fastembed_stub, monkeypatch):
+    extra = b"weights kept outside the ONNX file"
+    entry = pinned(repin={"onnx/model.onnx_data": pin(extra)})
+    assert list(entry.files) == ["onnx/model.onnx", *sorted([*SUPPORT_FILES, "onnx/model.onnx_data"])]
+    monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {E5: entry})
+    fastembed_stub.hub.content["onnx/model.onnx_data"] = extra
+    OnnxEmbedder(E5_SPEC)
+    assert fastembed_stub.hub.calls[-1]["allow_patterns"] == list(entry.files)
+    # It is downloaded with the others, and verified like them.
+    path = snapshot(fastembed_stub.default_cache) / "onnx/model.onnx_data"
+    path.write_bytes(extra[:-1] + b"?")
+    with pytest.raises(ModelIntegrityError, match=r"'onnx/model\.onnx_data'"):
+        OnnxEmbedder(E5_SPEC)
+
+
+def test_onnx_embedder_satisfies_the_protocol(fastembed_stub):
+    embedder = OnnxEmbedder(E5_SPEC)
+    assert isinstance(embedder, Embedder)
+    assert (embedder.spec, embedder.dim, embedder.model_name) == (E5_SPEC, 8, E5)
+
+
+def test_onnx_registers_a_pinned_model_under_a_name_of_the_engine(fastembed_stub):
+    OnnxEmbedder(E5_SPEC)
+    (registration,) = fastembed_stub.registrations
+    source = registration.pop("sources")
+    assert isinstance(source, StubSource) and source.hf == E5
+    name = registration.pop("model")
+    assert name.startswith(f"rag-engine/{E5}@") and name != E5
+    assert registration == {
+        "pooling": StubPooling.MEAN,
+        "normalization": True,
+        "dim": 8,
+        "model_file": "onnx/model.onnx",
+    }
+    assert fastembed_stub.instances[0].init_args == (name,)
+
+
+def test_onnx_registration_follows_the_table(fastembed_stub, monkeypatch):
+    entry = pinned(model_file="onnx/other.onnx", pooling="cls", normalization=False, hf="mirror/repo")
+    monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {"acme/model": entry})
+    assert list(entry.files) == ["onnx/other.onnx", *SUPPORT_FILES]
+    fastembed_stub.hub.content["onnx/other.onnx"] = ONNX_BYTES
+    embedder = OnnxEmbedder(ModelSpec("acme/model", 8, "", ""))
+    (registration,) = fastembed_stub.registrations
+    assert registration["sources"].hf == "mirror/repo"
+    assert (registration["model_file"], registration["pooling"], registration["normalization"]) == (
+        "onnx/other.onnx",
+        StubPooling.CLS,
+        False,
+    )
+    # The files come from the repository of the entry, and the ONNX file is the one it names.
+    assert {call["repo_id"] for call in fastembed_stub.hub.calls} == {"mirror/repo"}
+    assert fastembed_stub.hub.calls[0]["allow_patterns"][0] == "onnx/other.onnx"
+    assert embedder.model_path == snapshot(fastembed_stub.default_cache, "mirror/repo") / "onnx/other.onnx"
+
+
+def test_onnx_registers_a_model_once_for_several_embedders(fastembed_stub):
+    OnnxEmbedder(E5_SPEC)
+    OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.registrations) == 1
+    assert len(fastembed_stub.instances) == 2
+    assert fastembed_stub.instances[0].init_args == fastembed_stub.instances[1].init_args
+
+
+def test_onnx_two_entries_for_one_name_never_share_a_registration(fastembed_stub, monkeypatch):
+    # The registry of fastembed outlives a change of the table (a test, a reload): the entry
+    # that runs is the one of the table now, not the one registered first under that name.
+    OnnxEmbedder(E5_SPEC)
+    monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {E5: pinned(pooling="cls")})
+    OnnxEmbedder(E5_SPEC)
+    first, second = fastembed_stub.registrations
+    assert first["model"] != second["model"]
+    assert (first["pooling"], second["pooling"]) == (StubPooling.MEAN, StubPooling.CLS)
+    assert fastembed_stub.instances[1].init_args == (second["model"],)
+
+
+def test_onnx_a_pinned_model_is_loaded_from_the_table_even_when_fastembed_lists_the_name(
+    fastembed_stub, caplog
+):
+    # A later fastembed could ship the same name with another file, pooling or dimension.
+    fastembed_stub.listed.append({"model": E5, "dim": 999})
+    with caplog.at_level(logging.WARNING, logger="rag_engine.embedding"):
+        embedder = OnnxEmbedder(E5_SPEC)
+    (registration,) = fastembed_stub.registrations
+    (model,) = fastembed_stub.instances
+    assert model.init_args == (registration["model"],) != (E5,)
+    assert model.init_kwargs["specific_model_path"] == str(snapshot(fastembed_stub.default_cache))
+    assert embedder.model_sha256 == sha256(ONNX_BYTES)
+    assert caplog.records == []
+
+
+def test_onnx_the_table_is_read_whatever_the_case_of_the_name(fastembed_stub):
+    # fastembed compares names without their case: so does the table, or a name in capitals
+    # would fall through to whatever fastembed lists.
+    fastembed_stub.listed.append({"model": E5, "dim": 8})
+    embedder = OnnxEmbedder(ModelSpec(E5.upper(), 8, "", ""))
+    assert embedder.model_sha256 == sha256(ONNX_BYTES)
+    assert fastembed_stub.instances[0].init_args == (fastembed_stub.registrations[0]["model"],)
+
+
+def test_onnx_a_model_only_fastembed_lists_is_used_as_listed_with_a_warning(fastembed_stub, caplog):
+    with caplog.at_level(logging.WARNING, logger="rag_engine.embedding"):
+        embedder = OnnxEmbedder(LISTED_SPEC)
+    assert fastembed_stub.registrations == []
+    assert fastembed_stub.instances[0].init_args == ("listed/model",)
+    assert fastembed_stub.instances[0].init_kwargs == {"providers": CPU_ONLY}
+    assert fastembed_stub.hub.calls == []  # fastembed downloads it itself
+    assert (embedder.model_path, embedder.model_sha256) == (None, None)
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING
+    assert "listed/model" in record.getMessage()
+    assert "not pinned or verified" in record.getMessage()
+
+
+# --- the pinned files: cache, download, hash ----------------------------------
+
+
+def test_onnx_downloads_the_pinned_revision_when_the_cache_is_empty(fastembed_stub):
+    embedder = OnnxEmbedder(E5_SPEC)
+    cache = fastembed_stub.default_cache
+    wanted = {
+        "repo_id": E5,
+        "revision": REVISION,
+        "allow_patterns": PINNED_FILES,
+        "cache_dir": cache,
+    }
+    # The cache is asked first, without the network; then the Hub, for the same files.
+    assert fastembed_stub.hub.calls == [
+        {**wanted, "local_files_only": True},
+        {**wanted, "local_files_only": False},
+    ]
+    assert embedder.model_path == snapshot(cache) / "onnx/model.onnx"
+    assert embedder.model_path.read_bytes() == ONNX_BYTES
+    assert embedder.model_sha256 == sha256(ONNX_BYTES)
+    # fastembed is handed the directory, so it downloads nothing itself, and runs on CPU.
+    assert fastembed_stub.instances[0].init_kwargs == {
+        "providers": CPU_ONLY,
+        "cache_dir": cache,
+        "specific_model_path": str(snapshot(cache)),
+    }
+
+
+def test_onnx_a_filled_cache_is_used_without_any_request_to_the_hub(fastembed_stub):
+    OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.hub.downloads) == 1
+    fastembed_stub.hub.online = False
+    embedder = OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.hub.downloads) == 1
+    assert embedder.model_sha256 == sha256(ONNX_BYTES)
+
+
+@pytest.mark.parametrize("lost", ["onnx/model.onnx", "tokenizer.json", "special_tokens_map.json"])
+def test_onnx_a_cache_that_lacks_a_file_is_completed(fastembed_stub, lost):
+    OnnxEmbedder(E5_SPEC)
+    (snapshot(fastembed_stub.default_cache) / lost).unlink()
+    OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.hub.downloads) == 2
+    assert (snapshot(fastembed_stub.default_cache) / lost).is_file()
+
+
+def test_onnx_download_failure_says_what_from_where_and_how_to_do_without(fastembed_stub, tmp_path):
+    fastembed_stub.hub.online = False
+    with pytest.raises(ModelDownloadError) as caught:
+        OnnxEmbedder(E5_SPEC, cache_dir=tmp_path / "models")
+    message = str(caught.value)
+    for part in (
+        repr(E5),
+        "onnx/model.onnx",
+        "tokenizer.json",
+        "Hugging Face",
+        REVISION,
+        f"https://huggingface.co/{E5}/tree/{REVISION}",
+        str(tmp_path / "models"),
+        "RAG_ENGINE_MODEL_CACHE",
+        "ConnectionError: the Hub is unreachable",
+    ):
+        assert part in message
+    assert isinstance(caught.value.__cause__, ConnectionError)
+    assert fastembed_stub.instances == []
+    assert fastembed_stub.registrations == []
+
+
+def test_onnx_a_download_that_leaves_a_file_out_is_an_error(fastembed_stub):
+    del fastembed_stub.hub.content["tokenizer_config.json"]
+    with pytest.raises(ModelDownloadError, match=r"tokenizer_config\.json missing"):
+        OnnxEmbedder(E5_SPEC)
+    assert fastembed_stub.instances == []
+
+
+def test_onnx_without_huggingface_hub_tells_which_extra_to_install(fastembed_stub, monkeypatch):
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    with pytest.raises(ImportError, match=r"rag-engine\[onnx\]"):
+        OnnxEmbedder(E5_SPEC)
+
+
+def altered_bytes(file: str) -> bytes:
+    """The content of a stub file with its last byte changed: same size, another hash."""
+    original = StubHub().content[file]
+    return original[:-1] + (b"?" if original[-1:] != b"?" else b"!")
+
+
+@pytest.mark.parametrize("file", PINNED_FILES)
+def test_onnx_a_file_with_another_hash_is_refused_before_the_model_is_loaded(fastembed_stub, file):
+    original, altered = fastembed_stub.hub.content[file], altered_bytes(file)
+    fastembed_stub.hub.content[file] = altered
+    with pytest.raises(ModelIntegrityError) as caught:
+        OnnxEmbedder(E5_SPEC)
+    message = str(caught.value)
+    assert repr(E5) in message
+    # The file is named, as it is in the table and where it is on disk.
+    assert f"the file {file!r}" in message
+    assert str(snapshot(fastembed_stub.default_cache) / file) in message
+    assert f"Expected sha256 {sha256(original)}" in message
+    assert f"found sha256 {sha256(altered)}" in message
+    assert REVISION in message
+    assert "parity must be re-measured" in message and "ONNX_MODELS" in message
+    # No other file is blamed.
+    assert [name for name in PINNED_FILES if f"the file {name!r}" in message] == [file]
+    # Nothing was registered with fastembed, and no model was built: no inference is possible.
+    assert fastembed_stub.registrations == []
+    assert fastembed_stub.instances == []
+
+
+@pytest.mark.parametrize("file", PINNED_FILES)
+def test_onnx_a_file_altered_in_the_cache_is_refused_on_the_next_load(fastembed_stub, file):
+    OnnxEmbedder(E5_SPEC)
+    path = snapshot(fastembed_stub.default_cache) / file
+    path.write_bytes(altered_bytes(file))
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    with pytest.raises(ModelIntegrityError, match=re.escape(f"the file {file!r}")):
+        OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.instances) == 1
+
+
+@pytest.mark.parametrize("file", PINNED_FILES)
+def test_onnx_a_file_of_another_size_is_refused(fastembed_stub, file):
+    size = len(fastembed_stub.hub.content[file])
+    fastembed_stub.hub.content[file] += b"\0"
+    with pytest.raises(ModelIntegrityError, match=rf"\({size} bytes\).*\({size + 1} bytes\)") as caught:
+        OnnxEmbedder(E5_SPEC)
+    assert f"the file {file!r}" in str(caught.value)
+    assert fastembed_stub.instances == []
+
+
+@pytest.mark.parametrize("file", PINNED_FILES)
+def test_onnx_the_expected_hash_is_the_one_of_the_table(fastembed_stub, monkeypatch, file):
+    size = len(fastembed_stub.hub.content[file])
+    monkeypatch.setattr(embedding_mod, "ONNX_MODELS", {E5: pinned(repin={file: ("0" * 64, size)})})
+    with pytest.raises(ModelIntegrityError, match=f"Expected sha256 {'0' * 64}") as caught:
+        OnnxEmbedder(E5_SPEC)
+    assert f"the file {file!r}" in str(caught.value)
+    assert fastembed_stub.instances == []
+
+
+def test_onnx_the_small_files_are_hashed_at_every_load_and_the_onnx_file_once_per_process(
+    fastembed_stub, monkeypatch
+):
+    hashed: list[str] = []
+    real_open = open
+
+    def recording_open(path, *args, **kwargs):
+        hashed.append(os.fspath(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(embedding_mod, "open", recording_open, raising=False)
+    first = OnnxEmbedder(E5_SPEC)
+    directory = snapshot(fastembed_stub.default_cache)
+    expected = [os.path.realpath(directory / file) for file in PINNED_FILES]
+    assert hashed == expected
+    # Only the hash of the large file is kept.
+    onnx_file = os.path.realpath(directory / "onnx/model.onnx")
+    assert [key[0] for key in embedding_mod._sha256_cache] == [onnx_file]
+    del hashed[:]
+    second = OnnxEmbedder(E5_SPEC)
+    assert hashed == [path for path in expected if path != onnx_file]
+    assert len(hashed) == len(PINNED_FILES) - 1
+    assert first.model_sha256 == second.model_sha256 == sha256(ONNX_BYTES)
+
+
+def alter_keeping_size_and_mtime(path: Path, content: bytes) -> None:
+    """Replace the content of ``path`` and put its modification time back: only a hash can tell."""
+    before = path.stat()
+    assert len(content) == before.st_size
+    path.write_bytes(content)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
+@pytest.mark.parametrize("file", sorted(SUPPORT_BYTES))
+def test_onnx_a_small_file_altered_with_its_mtime_restored_is_refused_on_the_next_load(fastembed_stub, file):
+    # Same path, same size, same modification time as the file that passed the check: a cache
+    # keyed on those three would accept it. The small files are read again at every load.
+    OnnxEmbedder(E5_SPEC)
+    path = snapshot(fastembed_stub.default_cache) / file
+    alter_keeping_size_and_mtime(path, altered_bytes(file))
+    with pytest.raises(ModelIntegrityError, match=re.escape(f"the file {file!r}")) as caught:
+        OnnxEmbedder(E5_SPEC)
+    assert f"found sha256 {sha256(altered_bytes(file))}" in str(caught.value)
+    assert len(fastembed_stub.instances) == 1
+    # Put back, it loads again.
+    alter_keeping_size_and_mtime(path, SUPPORT_BYTES[file])
+    OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.instances) == 2
+
+
+def test_onnx_the_kept_hash_of_the_onnx_file_is_trusted_for_the_same_path_size_and_mtime(fastembed_stub):
+    """The documented limit of the check: within one process, the large file is hashed once.
+
+    Whoever can write to the model cache while the service runs, and puts the modification
+    time back, is not detected for this file: the cache directory must not be writable.
+    """
+    OnnxEmbedder(E5_SPEC)
+    path = snapshot(fastembed_stub.default_cache) / "onnx/model.onnx"
+    alter_keeping_size_and_mtime(path, altered_bytes("onnx/model.onnx"))
+    OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.instances) == 2
+    # A process that starts afterwards has no kept hash, and refuses the file.
+    embedding_mod._sha256_cache.clear()
+    with pytest.raises(ModelIntegrityError, match="onnx/model.onnx"):
+        OnnxEmbedder(E5_SPEC)
+
+
+def test_onnx_the_log_says_how_many_files_were_verified(fastembed_stub, caplog):
+    with caplog.at_level(logging.INFO, logger="rag_engine.embedding"):
+        OnnxEmbedder(E5_SPEC)
+    (line,) = [record.getMessage() for record in caplog.records if "verified" in record.getMessage()]
+    assert REVISION in line and sha256(ONNX_BYTES) in line and "5 files" in line
+
+
+def test_the_hash_of_a_file_is_computed_once_for_a_path_size_and_mtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(embedding_mod, "_sha256_cache", {})
+    path = tmp_path / "model.onnx"
+    path.write_bytes(b"first")
+    before = path.stat()
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"first"), 5)
+    # Same path, size and modification time: the file is not read again.
+    path.write_bytes(b"other")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"first"), 5)
+    # Asked without the cache, it is read, and the kept hash is left as it is.
+    assert embedding_mod._file_sha256(path) == (sha256(b"other"), 5)
+    assert embedding_mod._file_sha256(path, cached=False) == (sha256(b"other"), 5)
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"first"), 5)
+    # A newer modification time, or another size: it is hashed again.
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"other"), 5)
+    path.write_bytes(b"longer")
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"longer"), 6)
+
+
+def test_a_hash_computed_without_the_cache_is_not_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(embedding_mod, "_sha256_cache", {})
+    path = tmp_path / "tokenizer.json"
+    path.write_bytes(b"first")
+    assert embedding_mod._file_sha256(path) == (sha256(b"first"), 5)
+    assert embedding_mod._sha256_cache == {}
+
+
+def test_the_hash_cache_follows_a_link_to_the_file_it_points_to(tmp_path, monkeypatch):
+    # The Hugging Face cache stores a snapshot as links into a blob directory.
+    monkeypatch.setattr(embedding_mod, "_sha256_cache", {})
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"first")
+    link = tmp_path / "model.onnx"
+    link.symlink_to(blob)
+    assert embedding_mod._file_sha256(link, cached=True) == (sha256(b"first"), 5)
+    assert [key[0] for key in embedding_mod._sha256_cache] == [os.path.realpath(blob)]
+
+
+def test_onnx_unknown_model_names_the_models_it_can_register(fastembed_stub):
+    with pytest.raises(ValueError, match=r"'nobody/unknown'.*intfloat/multilingual-e5-base") as caught:
+        OnnxEmbedder(ModelSpec("nobody/unknown", 8, "", ""))
+    assert "RAG_ENGINE_MODEL" in str(caught.value)
+    assert fastembed_stub.registrations == []
+    assert fastembed_stub.instances == []
+
+
+def test_onnx_passage_and_query_get_their_prefix_once_through_plain_embed(fastembed_stub):
+    embedder = OnnxEmbedder(E5_SPEC)
+    vectors = embedder.encode_passage(["ab", "abcd"])
+    vector = embedder.encode_query("ab")
+    (model,) = fastembed_stub.instances
+    assert [call[0] for call in model.embed_calls] == [["passage: ab", "passage: abcd"], ["query: ab"]]
+    assert model.other_calls == []
+    assert vectors.shape == (2, 8) and vectors.dtype == np.float32
+    assert vectors[:, 0].tolist() == [len("passage: ab"), len("passage: abcd")]
+    assert vector.shape == (8,) and vector.dtype == np.float32
+
+
+def test_onnx_prefixes_come_from_the_spec(fastembed_stub):
+    embedder = OnnxEmbedder(ModelSpec(E5, 8, "doc> ", ""))
+    embedder.encode_passage(["a"])
+    embedder.encode_query("b")
+    assert [call[0] for call in fastembed_stub.instances[0].embed_calls] == [["doc> a"], ["b"]]
+
+
+def test_onnx_generator_is_read_before_the_lock_is_left(fastembed_stub):
+    embedder = OnnxEmbedder(E5_SPEC)
+    raw = embedder._embed(["passage: a", "passage: b"])
+    assert isinstance(raw, list) and len(raw) == 2
+    assert fastembed_stub.instances[0].active == 0  # the generator has run to its end
+
+
+def test_onnx_batch_size_is_passed_to_fastembed(fastembed_stub):
+    OnnxEmbedder(E5_SPEC).encode_passage(["a"])
+    OnnxEmbedder(E5_SPEC, batch_size=4).encode_passage(["a"])
+    first, second = fastembed_stub.instances
+    assert first.embed_calls[0][1] == {"batch_size": embedding_mod.ONNX_BATCH_SIZE} == {"batch_size": 32}
+    assert second.embed_calls[0][1] == {"batch_size": 4}
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, True, 2.0, "8", None])
+def test_onnx_refuses_a_batch_size_that_is_not_an_integer_of_at_least_one(fastembed_stub, batch_size):
+    with pytest.raises(ValueError, match="batch_size"):
+        OnnxEmbedder(E5_SPEC, batch_size=batch_size)
+    assert fastembed_stub.instances == []
+
+
+def test_onnx_runs_on_the_cpu_provider_only_and_leaves_the_threads_to_the_runtime(fastembed_stub):
+    OnnxEmbedder(E5_SPEC)
+    OnnxEmbedder(LISTED_SPEC)
+    for model in fastembed_stub.instances:
+        assert model.init_kwargs["providers"] == CPU_ONLY
+        assert "cuda" not in model.init_kwargs and "device_ids" not in model.init_kwargs
+        assert "threads" not in model.init_kwargs
+
+
+def test_onnx_cache_dir_and_threads_are_passed_to_fastembed(fastembed_stub, tmp_path):
+    OnnxEmbedder(E5_SPEC, cache_dir=tmp_path, threads=2)
+    assert fastembed_stub.instances[0].init_kwargs == {
+        "providers": CPU_ONLY,
+        "cache_dir": str(tmp_path),
+        "specific_model_path": str(snapshot(tmp_path)),
+        "threads": 2,
+    }
+    assert fastembed_stub.hub.calls[0]["cache_dir"] == str(tmp_path)
+    assert not Path(fastembed_stub.default_cache).exists()
+
+
+def test_onnx_cache_dir_and_threads_reach_a_model_only_fastembed_lists(fastembed_stub, tmp_path):
+    OnnxEmbedder(LISTED_SPEC, cache_dir=tmp_path, threads=2)
+    assert fastembed_stub.instances[0].init_kwargs == {
+        "providers": CPU_ONLY,
+        "cache_dir": str(tmp_path),
+        "threads": 2,
+    }
+
+
+@pytest.mark.parametrize("threads", [0, -1, True, 2.0, "2"])
+def test_onnx_refuses_threads_that_are_not_an_integer_of_at_least_one(fastembed_stub, threads):
+    with pytest.raises(ValueError, match="threads must be None or an integer of at least 1"):
+        OnnxEmbedder(E5_SPEC, threads=threads)
+    assert fastembed_stub.instances == []
+
+
+def test_onnx_empty_sequence_does_not_call_the_model(fastembed_stub):
+    embedder = OnnxEmbedder(E5_SPEC)
+    assert embedder.encode_passage([]).shape == (0, 8)
+    assert fastembed_stub.instances[0].embed_calls == []
+
+
+@pytest.mark.parametrize("spec", [ModelSpec(E5, 16, "", ""), ModelSpec("listed/model", 16, "", "")])
+def test_onnx_dimension_mismatch_raises_before_the_model_is_loaded(fastembed_stub, spec):
+    with pytest.raises(ValueError, match=rf"{spec.name}.*8.*16") as caught:
+        OnnxEmbedder(spec)
+    assert "RAG_ENGINE_DIM" in str(caught.value)
+    assert fastembed_stub.instances == []
+    assert fastembed_stub.hub.calls == []  # refused before anything is looked up or downloaded
+
+
+def test_onnx_model_without_a_declared_dimension_is_checked_on_the_first_vectors(fastembed_stub):
+    fastembed_stub.listed.append({"model": "bare/model"})
+    embedder = OnnxEmbedder(ModelSpec("bare/model", 16, "", ""))
+    with pytest.raises(ValueError, match=r"\(1, 8\).*\(1, 16\)"):
+        embedder.encode_passage(["a"])
+
+
+def test_onnx_rows_of_the_wrong_size_get_the_shape_message(fastembed_stub):
+    embedder = OnnxEmbedder(E5_SPEC)
+    fastembed_stub.width = 5
+    with pytest.raises(ValueError, match=r"\(2, 5\).*\(2, 8\)"):
+        embedder.encode_passage(["a", "b"])
+
+
+def test_onnx_release_then_use_raises_a_clear_error(fastembed_stub):
+    embedder = OnnxEmbedder(E5_SPEC)
+    embedder.release()
+    assert embedder._model is None
+    embedder.release()  # a second release does nothing
+    with pytest.raises(RuntimeError, match="OnnxEmbedder.*released.*new"):
+        embedder.encode_passage(["a"])
+    with pytest.raises(RuntimeError, match="released"):
+        embedder.encode_query("a")
+    assert (embedder.dim, embedder.model_name) == (8, E5)
+
+
+def test_onnx_context_manager_releases_on_exit_even_on_error(fastembed_stub):
+    with pytest.raises(KeyError), OnnxEmbedder(E5_SPEC) as embedder:
+        assert embedder.encode_query("a").shape == (8,)
+        raise KeyError("boom")
+    with pytest.raises(RuntimeError, match="released"):
+        embedder.encode_query("a")
+
+
+def test_onnx_inference_is_never_concurrent(fastembed_stub):
+    fastembed_stub.hold = 0.02
+    embedder = OnnxEmbedder(E5_SPEC)
+    barrier = threading.Barrier(4)
+    errors: list[BaseException] = []
+
+    def work(index: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            for _ in range(3):
+                if index % 2:
+                    embedder.encode_passage(["a", "b"])
+                else:
+                    embedder.encode_query("a")
+        except BaseException as exc:  # noqa: BLE001 - reported by the main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(index,)) for index in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert errors == []
+    (model,) = fastembed_stub.instances
+    assert len(model.embed_calls) == 12
+    assert model.max_active == 1
+
+
+def test_the_fastembed_stub_does_detect_concurrent_calls(fastembed_stub):
+    # Guards the test above: without a lock, the same workload overlaps.
+    fastembed_stub.hold = 0.05
+    model = fastembed_stub()
+    barrier = threading.Barrier(2)
+
+    def work() -> None:
+        barrier.wait(timeout=5)
+        list(model.embed(["a"]))
+
+    threads = [threading.Thread(target=work) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert model.max_active == 2
+
+
+def test_onnx_release_waits_for_a_running_inference(fastembed_stub):
+    embedder = OnnxEmbedder(E5_SPEC)
+    (model,) = fastembed_stub.instances
+    entered, gate, released = threading.Event(), threading.Event(), threading.Event()
+    results: list[np.ndarray] = []
+
+    def blocking_embed(documents, **_):
+        entered.set()
+        gate.wait(timeout=10)
+        yield from (np.zeros(8, dtype=np.float32) for _ in documents)
+
+    def do_release() -> None:
+        embedder.release()
+        released.set()
+
+    model.embed = blocking_embed
+    encoder = threading.Thread(target=lambda: results.append(embedder.encode_query("a")), daemon=True)
+    releaser = threading.Thread(target=do_release, daemon=True)
+    try:
+        encoder.start()
+        assert entered.wait(timeout=5)
+        releaser.start()
+        assert not released.wait(timeout=0.2)  # release() is still waiting for the inference
+    finally:
+        gate.set()
+    encoder.join(timeout=5)
+    releaser.join(timeout=5)
+    assert released.is_set()
+    assert len(results) == 1  # the running call finished with its vector
+
+
+def test_onnx_missing_dependency_tells_which_extra_to_install(monkeypatch):
+    monkeypatch.setitem(sys.modules, "fastembed", None)  # makes ``import fastembed`` fail
+    with pytest.raises(ImportError, match=r"rag-engine\[onnx\]") as caught:
+        OnnxEmbedder(E5_SPEC)
+    assert isinstance(caught.value.__cause__, ImportError)
+
+
+def test_onnx_backend_does_not_load_torch(fastembed_stub, monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", None)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+    assert OnnxEmbedder(E5_SPEC).encode_query("a").shape == (8,)
+
+
+# ---------------------------------------------------------------------------
+# cosine_parity
+# ---------------------------------------------------------------------------
+def test_cosine_parity_is_the_cosine_of_each_pair_of_rows():
+    a = np.array([[1.0, 0.0], [1.0, 0.0], [3.0, 4.0], [1.0, 0.0]], dtype=np.float32)
+    b = np.array([[2.0, 0.0], [0.0, 5.0], [4.0, 3.0], [-1.0, 0.0]], dtype=np.float32)
+    result = cosine_parity(a, b)
+    assert result.shape == (4,) and result.dtype == np.float64
+    np.testing.assert_allclose(result, [1.0, 0.0, 0.96, -1.0], atol=1e-12)
+
+
+def test_cosine_parity_accepts_lists_and_does_not_need_unit_vectors():
+    np.testing.assert_allclose(cosine_parity([[10.0, 0.0]], [[0.1, 0.0]]), [1.0])
+
+
+def test_cosine_parity_of_a_zero_row_is_not_a_number():
+    result = cosine_parity([[0.0, 0.0], [1.0, 0.0]], [[1.0, 0.0], [1.0, 0.0]])
+    assert np.isnan(result[0]) and result[1] == 1.0
+    assert not (result >= 0.999).all()  # a comparison with a tolerance fails, it does not pass
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [([[1.0, 0.0]], [[1.0, 0.0], [0.0, 1.0]]), ([1.0, 0.0], [1.0, 0.0]), ([[1.0, 0.0]], [[1.0, 0.0, 0.0]])],
+)
+def test_cosine_parity_refuses_arrays_that_are_not_two_matching_tables(a, b):
+    with pytest.raises(ValueError, match="cosine_parity"):
+        cosine_parity(a, b)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 def test_factory_builds_the_torch_backend_from_settings(stubs, tmp_path):
@@ -651,9 +1614,56 @@ def test_factory_keyword_arguments_reach_the_backend_and_win(stubs, tmp_path):
     assert StubModel.instances[0].init_kwargs == {"device": "mps", "cache_folder": str(tmp_path)}
 
 
-def test_factory_onnx_backend_is_not_available_yet():
-    with pytest.raises(NotImplementedError, match="onnx.*RAG_ENGINE_BACKEND=torch"):
-        make_embedder(Settings(backend="onnx"))
+def test_factory_builds_the_onnx_backend_from_settings(fastembed_stub, tmp_path):
+    settings = Settings(
+        backend="onnx",
+        model_name=E5,
+        model_dim=8,
+        passage_prefix="P ",
+        query_prefix="Q ",
+        model_cache=str(tmp_path),
+    )
+    embedder = make_embedder(settings)
+    assert type(embedder) is OnnxEmbedder
+    assert embedder.spec == ModelSpec(E5, 8, "P ", "Q ")
+    assert fastembed_stub.instances[0].init_kwargs == {
+        "providers": CPU_ONLY,
+        "cache_dir": str(tmp_path),
+        "specific_model_path": str(snapshot(tmp_path)),
+    }
+
+
+def test_factory_onnx_without_a_model_cache_leaves_the_default_of_fastembed(fastembed_stub):
+    make_embedder(Settings(backend="onnx", model_name=E5, model_dim=8))
+    assert fastembed_stub.instances[0].init_kwargs["cache_dir"] == fastembed_stub.default_cache
+    make_embedder(Settings(backend="onnx", model_name="listed/model", model_dim=8))
+    assert fastembed_stub.instances[1].init_kwargs == {"providers": CPU_ONLY}
+
+
+def test_factory_passes_the_onnx_threads_of_the_settings(fastembed_stub):
+    make_embedder(Settings(backend="onnx", model_name=E5, model_dim=8, onnx_threads=2))
+    assert fastembed_stub.instances[0].init_kwargs["threads"] == 2
+    make_embedder(Settings(backend="onnx", model_name=E5, model_dim=8))
+    assert "threads" not in fastembed_stub.instances[1].init_kwargs
+
+
+def test_factory_does_not_give_the_onnx_threads_to_the_torch_backend(stubs):
+    embedder = make_embedder(Settings(backend="torch", model_name="stub/model", model_dim=8, onnx_threads=2))
+    assert type(embedder) is TorchEmbedder
+
+
+def test_factory_keyword_arguments_reach_the_onnx_backend_and_win(fastembed_stub, tmp_path):
+    settings = Settings(
+        backend="onnx", model_name=E5, model_dim=8, model_cache="/from/settings", onnx_threads=8
+    )
+    embedder = make_embedder(settings, cache_dir=str(tmp_path), threads=3, batch_size=4)
+    assert fastembed_stub.instances[0].init_kwargs == {
+        "providers": CPU_ONLY,
+        "cache_dir": str(tmp_path),
+        "specific_model_path": str(snapshot(tmp_path)),
+        "threads": 3,
+    }
+    assert embedder.batch_size == 4
 
 
 def test_factory_refuses_an_unknown_backend():
@@ -694,3 +1704,30 @@ def test_real_model_gives_the_vectors_of_sentence_transformers_with_the_e5_prefi
     # The two prefixes give different vectors, and the truncated text is not a degenerate row.
     assert not np.allclose(passages, np.stack(queries), atol=1e-4)
     assert not np.allclose(passages[3], passages[2], atol=1e-4)
+
+
+@pytest.mark.models
+def test_real_model_loaded_from_a_cache_directory_reports_no_deprecated_argument(caplog, capfd):
+    # The torch backend hands its cache_dir to SentenceTransformer as cache_folder. Checked on
+    # the real library: it takes that name, and loading the model through it reports nothing
+    # deprecated (the bound on sentence-transformers is raised only after this has passed).
+    sentence_transformers = pytest.importorskip("sentence_transformers")
+    import inspect
+    import warnings
+
+    from huggingface_hub import constants
+
+    parameters = inspect.signature(sentence_transformers.SentenceTransformer.__init__).parameters
+    assert "cache_folder" in parameters
+    spec = ModelSpec.from_settings(Settings())
+    with warnings.catch_warnings(record=True) as caught, caplog.at_level(logging.WARNING):
+        warnings.simplefilter("always")
+        # The directory the model of the other tests is in: nothing is downloaded a second time.
+        with TorchEmbedder(spec, cache_dir=constants.HF_HUB_CACHE) as embedder:
+            vector = embedder.encode_query("a query")
+    assert vector.shape == (768,)
+    said = [record.getMessage() for record in caplog.records] + [str(warning.message) for warning in caught]
+    said.append(capfd.readouterr().err)
+    print(f"\nsentence-transformers {sentence_transformers.__version__}, cache_folder given: ", end="")
+    print("nothing reported as deprecated" if not any("deprecat" in text.lower() for text in said) else said)
+    assert not [text for text in said if "cache" in text.lower() and "deprecat" in text.lower()]

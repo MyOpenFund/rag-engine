@@ -3,13 +3,18 @@
 The store never guesses. A collection is created only when Qdrant answers that it does not
 exist; a refused API key is reported as such; every other failure (connection refused,
 timeout, server error) is raised as the client raised it.
+
+This module imports ``qdrant-client`` and nothing else outside the engine. qdrant-client
+itself imports ``fastembed`` when that package is installed (the ``onnx`` extra), which loads
+the ONNX runtime, ``huggingface_hub`` and ``tokenizers``: in such an install, importing the
+store loads them, although the engine does not ask for them.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,6 +22,7 @@ from qdrant_client import QdrantClient, models
 
 from rag_engine.config import Settings
 from rag_engine.errors import RagEngineError
+from rag_engine.schema import PAYLOAD_INDEXES
 
 __all__ = [
     "AUTH_STATUSES",
@@ -24,6 +30,7 @@ __all__ = [
     "DEFAULT_URL_PORT",
     "DISTANCE",
     "CollectionMismatchError",
+    "CollectionNotFoundError",
     "QdrantAuthError",
     "QdrantStore",
     "StoreError",
@@ -33,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 AUTH_STATUSES = (401, 403)
 DISTANCE = models.Distance.COSINE
+#: Seconds a request may take when nothing else is said: the default of ``Settings.qdrant_timeout``.
 DEFAULT_TIMEOUT = 60
 DEFAULT_URL_PORT = 6333
 
@@ -46,7 +54,20 @@ class QdrantAuthError(StoreError):
 
 
 class CollectionMismatchError(StoreError):
-    """An existing collection does not have the vector configuration the caller needs."""
+    """An existing collection is not what the caller needs.
+
+    Its vector configuration differs, or one of its payload fields is indexed with another
+    kind of index.
+    """
+
+
+class CollectionNotFoundError(StoreError):
+    """The collection asked about does not exist on the server.
+
+    Raised by :meth:`QdrantStore.check_collection`, the check that never creates. The other
+    methods of the store do not ask first: on a missing collection they raise what the
+    Qdrant client raises.
+    """
 
 
 def _raise_auth(exc: BaseException) -> None:
@@ -64,6 +85,29 @@ def _positive_int(name: str, value: object) -> int:
     if type(value) is not int or value < 1:  # a bool is an int subclass, and is not a count
         raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
     return value
+
+
+def _index_kinds(indexes: Iterable[Any]) -> list[tuple[str, models.PayloadSchemaType]]:
+    """``indexes`` as ``(field, kind)`` pairs with the kind as Qdrant's enum; ``ValueError`` otherwise."""
+    kinds = ", ".join(kind.value for kind in models.PayloadSchemaType)
+    wanted: list[tuple[str, models.PayloadSchemaType]] = []
+    seen: set[str] = set()
+    for entry in indexes:
+        if isinstance(entry, str) or not isinstance(entry, Iterable) or len(pair := tuple(entry)) != 2:
+            raise ValueError(f"a payload index must be a (field, kind) pair, got {entry!r}")
+        field, kind = pair
+        if not isinstance(field, str) or not field:
+            raise ValueError(f"the field of a payload index must be a non-empty string, got {field!r}")
+        if field in seen:
+            raise ValueError(f"payload field {field!r} is listed more than once")
+        seen.add(field)
+        try:
+            wanted.append((field, models.PayloadSchemaType(kind)))
+        except ValueError:
+            raise ValueError(
+                f"unknown kind of payload index for field {field!r}: {kind!r} (one of: {kinds})"
+            ) from None
+    return wanted
 
 
 def _port(value: object) -> int:
@@ -100,6 +144,12 @@ class QdrantStore:
     ``https`` is always passed to the client: left undecided, qdrant-client turns TLS on as
     soon as an API key is set.
 
+    ``timeout`` is the number of seconds a request may take. Given explicitly, it wins;
+    left out (``None``), it is the ``qdrant_timeout`` of the settings
+    (``RAG_ENGINE_QDRANT_TIMEOUT``, default :data:`DEFAULT_TIMEOUT`, 60). qdrant-client counts
+    in whole seconds and rounds a fraction up. It is not used with an injected client, which
+    has its own.
+
     ``client`` injects a ready client (tests, qdrant-client's local mode); no connection is
     then built, and ``host`` / ``port`` are the ones given explicitly, else ``None``: the store
     cannot know where an injected client points to. With an injected client and no
@@ -120,7 +170,7 @@ class QdrantStore:
         port: int | None = None,
         api_key: str | None = None,
         https: bool | None = None,
-        timeout: int = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         *,
         settings: Settings | None = None,
         client: Any = None,
@@ -145,7 +195,7 @@ class QdrantStore:
             port=self._port,
             api_key=(api_key or "").strip() or settings.qdrant_api_key,
             https=self._https,
-            timeout=timeout,
+            timeout=timeout if timeout is not None else settings.qdrant_timeout,
         )
 
     @classmethod
@@ -153,7 +203,7 @@ class QdrantStore:
         cls,
         url: str,
         api_key: str | None = None,
-        timeout: int = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         *,
         settings: Settings | None = None,
     ) -> QdrantStore:
@@ -162,8 +212,8 @@ class QdrantStore:
         The scheme decides TLS, whatever the settings say; the port defaults to 6333. An IPv6
         address is written in square brackets (``http://[::1]:6333``). A URL with a path, a
         query or credentials, with a whitespace or control character anywhere, or with port 0
-        is refused with a ``ValueError`` that never echoes the URL. ``api_key`` and
-        ``settings`` are as in the constructor.
+        is refused with a ``ValueError`` that never echoes the URL. ``api_key``, ``timeout``
+        and ``settings`` are as in the constructor.
         """
         problem = "a Qdrant URL must look like http://host:port or https://host:port"
         # Checked on the raw text: urlsplit silently drops tabs and line breaks.
@@ -218,8 +268,50 @@ class QdrantStore:
             return False
         return True
 
+    def _read_collection(self, name: str) -> Any:
+        """What the server says of collection ``name``; ``None`` when it answers that it does not exist."""
+        try:
+            exists = self._client.collection_exists(collection_name=name)
+            return self._client.get_collection(collection_name=name) if exists else None
+        except Exception as exc:
+            _raise_auth(exc)
+            raise
+
+    def check_collection(self, name: str, dim: int) -> None:
+        """Check that ``name`` exists with one unnamed cosine vector of size ``dim``. Reads only.
+
+        The check of a reader: a search service calls it once when it starts, with the
+        dimension of its embedder, and then knows that its queries can be answered. It
+        sends two read requests and **never creates or changes anything**, so it works with
+        a read-only API key. :meth:`ensure_collection` is the method of a writer.
+
+        * The collection matches: returns ``None``.
+        * Qdrant answers that it does not exist: :class:`CollectionNotFoundError`.
+        * It exists and is not a single unnamed vector of size ``dim`` with cosine distance
+          (another dimension, another distance, named vectors, no dense vector):
+          :class:`CollectionMismatchError`, with the words of :meth:`ensure_collection`.
+        * HTTP 401 or 403: :class:`QdrantAuthError`.
+        * Anything else (connection refused, timeout, server error, a name the server does
+          not accept, a collection deleted between the two requests) is raised as the client
+          raised it. No failure is ever read as "the collection is absent".
+
+        ``dim`` must be an integer >= 1, else ``ValueError``, raised before any request.
+        """
+        _positive_int("dim", dim)
+        info = self._read_collection(name)
+        if info is None:
+            raise CollectionNotFoundError(
+                f"collection {name!r} does not exist on the Qdrant server (a writer creates it with "
+                "ensure_collection; this check never does)"
+            )
+        _check_vectors(name, dim, info.config.params.vectors)
+
     def ensure_collection(self, name: str, dim: int) -> None:
         """Make sure ``name`` exists with one unnamed cosine vector of size ``dim``.
+
+        The method of a writer: it creates the collection when it is missing, which a
+        read-only API key is refused (:class:`QdrantAuthError`). A reader calls
+        :meth:`check_collection` instead.
 
         * The collection exists: its vector configuration is checked, and
           :class:`CollectionMismatchError` is raised when it is not a single unnamed vector of
@@ -238,12 +330,7 @@ class QdrantStore:
         1.8: an older server answers 404, which is raised like any other error.
         """
         _positive_int("dim", dim)
-        try:
-            exists = self._client.collection_exists(collection_name=name)
-            info = self._client.get_collection(collection_name=name) if exists else None
-        except Exception as exc:
-            _raise_auth(exc)
-            raise
+        info = self._read_collection(name)
         if info is not None:
             _check_vectors(name, dim, info.config.params.vectors)
             return
@@ -321,6 +408,190 @@ class QdrantStore:
             _raise_auth(exc)
             raise
         return len(batch)
+
+    def ensure_payload_indexes(self, collection: str, indexes: Iterable[Any] | None = None) -> list[str]:
+        """Create the payload indexes ``collection`` does not have yet; returns the fields created now.
+
+        ``indexes`` is a list of ``(field, kind)`` pairs, ``kind`` being the name of a Qdrant
+        payload index type (``"keyword"``, ``"integer"``, ``"datetime"``, ...) or the matching
+        ``models.PayloadSchemaType``; it defaults to :data:`rag_engine.schema.PAYLOAD_INDEXES`.
+        A list that is not made of such pairs, or that names a field twice, is a
+        ``ValueError`` raised before anything is sent.
+
+        * A field without an index: the index is created, and the call waits until Qdrant
+          has built it (``wait=True``), so it is usable when the method returns. The field is
+          in the returned list, in the order of ``indexes``.
+        * A field already indexed with the same kind: nothing is done, whatever the options
+          that index was created with. When every index exists the list is empty, so the
+          call can be repeated at will.
+        * A field indexed with another kind: :class:`CollectionMismatchError` naming the
+          field, the expected kind and the one found, raised before any index is created.
+          The existing index is never replaced nor deleted: asked to create it, Qdrant would
+          drop it and build the other kind without a word. Removing it is the operator's
+          decision.
+        * HTTP 401 or 403: :class:`QdrantAuthError`.
+        * A collection that does not exist, and any other error, is raised as the client
+          raised it; the collection is never created here. Indexes created before a failure
+          stay, and a second call creates the remaining ones.
+
+        **The returned list** names the fields for which a create call succeeded during
+        this call, and says no more than that. The existing indexes are read once, before
+        creating: two callers that run at the same moment may each find the indexes missing,
+        each create them, and each return every field (and two that ask for different kinds
+        for the same field are not told apart). qdrant-client's local mode keeps no payload
+        index: it accepts the creation, warns that it has no effect, and reports none
+        afterwards, so there every call returns the whole list.
+
+        Creating an index never rewrites a point, and works on a collection that already
+        holds points. A payload value the index cannot read is not an error, neither here nor
+        when a point is written: the point stays stored, and a search without a filter on
+        that field still returns it, but **a filter on that field no longer sees it**. An
+        integer index reads integers (and floats with an integral value): a ``year`` stored
+        as the string ``"2016"`` or as ``2016.5`` matches no integer range once indexed. A
+        keyword index reads strings: a ``source_code`` stored as a number is not matched. A
+        datetime index reads the forms listed with :data:`rag_engine.schema.PAYLOAD_INDEXES`.
+        Before creating indexes on a collection that already holds points, check the types
+        of the stored values of ``year`` and of the keyword fields.
+
+        To check the result afterwards, count through a filter
+        (``client.count(collection, count_filter=..., exact=True)``). Do not rely on
+        ``get_collection(...).payload_schema[field].points`` right after the creation on a
+        large collection: that count has been seen to lag for a few seconds while the index
+        is built.
+        """
+        wanted = _index_kinds(PAYLOAD_INDEXES if indexes is None else indexes)
+        try:
+            existing = self._client.get_collection(collection_name=collection).payload_schema or {}
+        except Exception as exc:
+            _raise_auth(exc)
+            raise
+        missing: list[tuple[str, models.PayloadSchemaType]] = []
+        mismatches: list[str] = []
+        for field, kind in wanted:
+            if field not in existing:
+                missing.append((field, kind))
+                continue
+            data_type = getattr(existing[field], "data_type", None)
+            found = getattr(data_type, "value", data_type)
+            if found != kind.value:
+                mismatches.append(f"field {field!r}: expected a {kind.value} index, found a {found} index")
+        if mismatches:
+            raise CollectionMismatchError(
+                f"collection {collection!r}: {'; '.join(mismatches)} (an existing index is never replaced)"
+            )
+        created: list[str] = []
+        for field, kind in missing:
+            logger.info(
+                "Creating %s payload index on %r in Qdrant collection %r", kind.value, field, collection
+            )
+            try:
+                self._client.create_payload_index(
+                    collection_name=collection, field_name=field, field_schema=kind, wait=True
+                )
+            except Exception as exc:
+                _raise_auth(exc)
+                raise
+            created.append(field)
+        return created
+
+    def query(
+        self,
+        collection: str,
+        vector: Sequence[float],
+        *,
+        query_filter: models.Filter | None = None,
+        limit: int,
+    ) -> list[Any]:
+        """The ``limit`` points of ``collection`` closest to ``vector``, best first.
+
+        One request: a dense search on the unnamed vector, restricted to the points that pass
+        ``query_filter`` when one is given. The points come with their payload and their
+        score, without their vector. ``limit`` must be an integer >= 1, else ``ValueError``.
+
+        HTTP 401 or 403 is a :class:`QdrantAuthError`; a collection that does not exist, a
+        vector of another dimension, and any other error is raised as the client raised it.
+        Nothing is checked beforehand: this is one request, not two.
+
+        It uses the query API (``query_points``): qdrant-client 1.10 or later, and a server
+        of 1.10 or later.
+        """
+        _positive_int("limit", limit)
+        try:
+            response = self._client.query_points(
+                collection_name=collection,
+                query=list(vector),
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:
+            _raise_auth(exc)
+            raise
+        return list(response.points)
+
+    def existing_doc_ids(
+        self,
+        collection: str,
+        doc_ids: Iterable[str],
+        *,
+        batch_size: int = 100,
+        page_size: int = 256,
+    ) -> set[str]:
+        """Which of ``doc_ids`` have at least one point in ``collection``.
+
+        ``doc_ids`` is a list (or tuple, or set) of non-empty strings, compared exactly with
+        the payload field ``doc_id``; a bare string or anything else is a ``ValueError``,
+        raised before anything is sent. Duplicates are asked once. The answer is the subset
+        found, as a new set; it is empty for an empty list, without any request.
+
+        How it asks. The ids are taken ``batch_size`` at a time. For a batch, one request
+        reads up to ``page_size`` points whose ``doc_id`` is one of the batch (a filter on the
+        keyword field, which the payload index on ``doc_id`` makes fast), with the ``doc_id``
+        of their payload only and without vectors. The ids seen are found; the request is
+        repeated for the others until it brings nothing new. A batch therefore costs one
+        request more than the number of pages that found something: two when every document
+        shows up in the first page, and never more than one per document plus one. Points
+        come in the order of their ids, which mixes the documents, so a first page of 256
+        points usually holds every document of a batch of 100.
+
+        Both sizes must be integers >= 1, else ``ValueError``. HTTP 401 or 403 is a
+        :class:`QdrantAuthError`; a collection that does not exist, and any other error, is
+        raised as the client raised it.
+        """
+        if isinstance(doc_ids, (str, bytes)) or not isinstance(doc_ids, (list, tuple, set, frozenset)):
+            # A ValueError, as for every other bad argument of the store.
+            raise ValueError(f"doc_ids must be a list of strings, got {type(doc_ids).__name__}")  # noqa: TRY004
+        for doc_id in doc_ids:
+            if not isinstance(doc_id, str):
+                raise ValueError(f"doc_ids must hold strings, got {doc_id!r}")  # noqa: TRY004
+            if not doc_id:
+                raise ValueError("doc_ids must hold non-empty strings, got an empty one")
+        _positive_int("batch_size", batch_size)
+        _positive_int("page_size", page_size)
+        wanted = sorted(set(doc_ids))
+        found: set[str] = set()
+        for start in range(0, len(wanted), batch_size):
+            remaining = set(wanted[start : start + batch_size])
+            while remaining:
+                condition = models.FieldCondition(key="doc_id", match=models.MatchAny(any=sorted(remaining)))
+                try:
+                    points, _next = self._client.scroll(
+                        collection_name=collection,
+                        scroll_filter=models.Filter(must=[condition]),
+                        limit=page_size,
+                        with_payload=["doc_id"],
+                        with_vectors=False,
+                    )
+                except Exception as exc:
+                    _raise_auth(exc)
+                    raise
+                seen = {(point.payload or {}).get("doc_id") for point in points} & remaining
+                if not seen:
+                    break
+                found |= seen
+                remaining -= seen
+        return found
 
     def count(self, collection: str) -> int:
         """Exact number of points in ``collection``."""
