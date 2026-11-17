@@ -16,7 +16,8 @@ dependencies = ["qdrant-client", "numpy"]
 [project.optional-dependencies]
 onnx = ["fastembed"]
 torch = ["sentence-transformers"]
-ingest = ["chunknorris", "markitdown[pptx]"]
+# psutil: imported by chunknorris (1.5.0) without being declared in its dependencies.
+ingest = ["chunknorris", "markitdown[pptx]", "psutil"]
 dev = ["pytest>=8.3", "ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]

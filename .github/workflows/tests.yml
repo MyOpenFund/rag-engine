@@ -18,7 +18,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      - run: pip install -e ".[dev]"
+      # The ingest extra (document parsers) is installed on one version only: the tests that
+      # need the real libraries run there and skip elsewhere.
+      - run: pip install -e ".[dev${{ matrix.python-version == '3.12' && ',ingest' || '' }}]"
+      - name: Check that the document parsers are importable
+        if: matrix.python-version == '3.12'
+        run: python -c "import chunknorris.chunkers, chunknorris.parsers, markitdown, pptx, pymupdf"
       - run: ruff check .
       - run: python -m pytest -q
   integration:

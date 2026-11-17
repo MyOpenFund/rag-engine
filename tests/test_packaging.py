@@ -16,7 +16,14 @@ def test_version():
 
 @pytest.mark.parametrize(
     "modules",
-    ["rag_engine", "rag_engine.config", "rag_engine.schema", "rag_engine.store", "rag_engine.embedding"],
+    [
+        "rag_engine",
+        "rag_engine.config",
+        "rag_engine.schema",
+        "rag_engine.store",
+        "rag_engine.embedding",
+        "rag_engine.chunking",
+    ],
 )
 def test_import_pulls_no_heavy_dependency(modules):
     code = (
