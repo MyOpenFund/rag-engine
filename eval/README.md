@@ -7,9 +7,10 @@ Question files for `rag-engine eval`, the script that builds the automatic one, 
 | `known_item_v1.jsonl` | 797 automatic questions on the policy core of the central-bank corpus, built from the manifests by `make_known_item.py`. |
 | `make_known_item.py` | Builds a known-item file from manifest files. Standard library only; not part of the installed package. |
 | `fixtures/corpus.json`, `fixtures/questions.jsonl` | 13 small documents (32 chunks) and 13 questions with known answers, in the first version of the format. The test suite loads them into a collection and checks the exact metrics. |
+| `analytical_v2.jsonl` | 79 questions on the content of the policy core, written by hand and checked against the documents: 71 that the corpus answers, 4 whose premise is false, 4 that the corpus cannot answer. |
 | `fixtures/questions_v2.jsonl` | 11 questions on the same 13 documents that use every field of the second version of the format: essential and acceptable documents, expected behaviour, a second run without filters, questions that expect no document. |
 
-To come: `analytical_v1.jsonl`, questions on the content of the documents, written and checked by hand. The file does not exist yet; it is added once its questions are validated. It will use the second version of the format, described below, which the harness already reads. Until then the only committed questions are the known-item ones, and they measure one thing: whether a document that a user can describe is found.
+`analytical_v2.jsonl` holds 79 questions on the content of the documents (see "The analytical batch" below). Unlike the known-item questions, which measure whether a document a user can describe is found, they ask what an analyst would ask, and they use the second version of the format.
 
 ## Question file format
 
@@ -63,7 +64,7 @@ A question written the old way, with `expected_doc_ids` alone, does not say whic
 ## Checking a question file
 
 ```bash
-rag-engine eval-check --questions eval/analytical_v1.jsonl \
+rag-engine eval-check --questions eval/analytical_v2.jsonl \
     --manifests '/path/to/central-bank-corpus/data/manifest/*.jsonl' \
     --doc-types A1 A2 A3 B1 E1 F1 --mime application/pdf
 ```
@@ -413,6 +414,28 @@ For 183 of the 210 questions at most ten documents pass: with `k = 10` the expec
 ### What was skipped
 
 Among the 237 documents looked at to draw 214: 22 `title` questions for a missing title and 1 for a title that is a file name; 20 `label` questions for a label spelling out a placeholder date; the descriptions of 21 documents whose date is shared by more than three documents of their cell; the descriptions of 3 documents without a usable title and without a date known to the month, and of 3 documents that only a catalogue label describes; the French description of 27 documents that only an English title describes.
+
+## The analytical batch
+
+`analytical_v2.jsonl`: 79 questions on what the documents say, for the same scope as the known-item batch (PDF documents of types A1, A2, A3, B1, E1, F1 of the central-bank corpus, six banks, all in English).
+
+| | |
+|---|---|
+| Questions | 79: `an-01` to `an-20` (20 questions and 9 variants, suffix `a` for an easier wording, `b` for an extra variant) and 50 from the candidates `an-21` to `an-70` |
+| Expected behaviour | 71 `answer`, 4 `correct_premise`, 4 `abstain` |
+| Language | 71 English, 8 French (the documents are English: the French questions measure cross-lingual retrieval) |
+| Documents named | 400 distinct, all in the scope |
+| Kinds | `analytical` (74, no filter) and `analytical+filters` (5, each also scored without its filters) |
+
+What the questions cover, by tag: chains over several meetings (`chain`), comparisons between banks (`comparative`), a detail in the middle of a long document (`buried-detail`), votes (`votes`), a cell of a projections table (`table`), counts over several documents (`aggregation`), a bank that the question does not name (`unnamed-bank`), a false premise (`false-premise`), a negative answer (`negation`), a document or a bank that the corpus does not hold (`out-of-corpus`), a keyword query (`short-query`) and a vague one (`vague`).
+
+**How they were checked.** For every question the documents were found in the corpus manifests, fetched from the catalogue URL and read; the expected answer was corrected wherever a document said otherwise; one verbatim quote per expected document was matched word for word against the extracted text by a script. A document that could not be read (a catalogue URL that returns only a contents page) is never an expected document. Questions whose document is not in the scope were rewritten onto what the scope holds, turned into `abstain` questions, or dropped.
+
+**Essential and acceptable.** `essential_ids` are the documents without which the question cannot be answered; `acceptable_ids` are relevant without being needed. When several documents of one day carry the same text (a decision release, the statement, a transcript), one is essential and its siblings are acceptable: `essential_recall@k` is therefore strict, and a search that returns the sibling scores lower on it than it deserves; `recall@k` over all expected documents is the lenient view. One question (`an-23`) has 11 essential documents: run with `--k` above 10 to give it a chance.
+
+**What is not scored.** `must_include` and `must_not_include` describe a correct answer, in English and in the form the documents use (`"1/2 percentage point"`, `"6-1/2 percent"`): they are for a scorer of generated answers, which is not part of this harness, and a literal string comparison would be too strict for them. For the `abstain` questions the harness reports what the search returns and at what score; whether a client then declines to answer is not measured here.
+
+**Limits of the scope that the questions met.** No Bank of Canada rate-decision release, and its summaries of deliberations only from March 2025; Bank of Japan minutes for 2015–2017 and from October 2025 only; the ECB's combined "decisions and statement" documents carry no questions and answers (the statement pages do); Bank of England documents are dated 1 January of their year in the manifests. Questions that needed a missing document say so in their `rationale`.
 
 ## The fixtures
 

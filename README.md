@@ -375,7 +375,7 @@ What is cheap is checked before the embedding model is loaded: the question file
 
 - `eval/known_item_v1.jsonl`: 797 automatic questions that ask for a document by its title or its catalogue label, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`. The words follow what a doc type is at each bank, a date is never stated more precisely than the manifest knows it nor presented as a meeting date when it is a publication date, and a question expects every document that holds the text asked for (the ECB publishes its decision and its statement a second time as one combined document). [`eval/README.md`](eval/README.md) has the tables and the evidence.
 
-A second file, `eval/analytical_v1.jsonl`, with questions on the content of the documents written by hand, is to come: it does not exist yet, and is added once its questions are validated.
+A second file, `eval/analytical_v2.jsonl`, holds 79 questions on the content of the documents, written by hand and checked against them: chains over several meetings, comparisons between banks, buried details, false premises and questions the corpus cannot answer. It uses the second version of the question format (essential and acceptable documents, expected behaviour, a second run without filters); see `eval/README.md`.
 
 **Format v2.** A question may say more, and a file that says none of it is read and scored exactly as before:
 
