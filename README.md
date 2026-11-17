@@ -1,6 +1,6 @@
 # rag-engine
 
-**Status: ingestion is delivered; search and the ONNX backend arrive in the next release.**
+**Status: ingestion and both embedding backends (PyTorch, ONNX) are delivered; search arrives in the next release.**
 
 rag-engine is built to do two things:
 
@@ -17,7 +17,7 @@ Python 3.10 or later. The base install is light; each consumer adds only the ext
 |---|---|---|
 | `rag-engine` | `qdrant-client` (1.8 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, writes) |
 | `rag-engine[torch]` | `sentence-transformers` | PyTorch embedding backend |
-| `rag-engine[onnx]` | `fastembed` | ONNX embedding backend: **not available yet**. The extra installs the library, but this release has no code that uses it. |
+| `rag-engine[onnx]` | `fastembed` (ONNX runtime) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
 | `rag-engine[ingest]` | `chunknorris`, `markitdown[pptx]`, `psutil` | document parsing and chunking |
 | `rag-engine[dev]` | `pytest`, `ruff` | development |
 
@@ -32,7 +32,7 @@ The package root exposes only `__version__`. Everything else is imported from it
 | `rag_engine.config` | `Settings`, `ConfigError`, `valid_ocr_languages` |
 | `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `RESERVED_KEYS` |
 | `rag_engine.store` | `QdrantStore`, `StoreError`, `QdrantAuthError`, `CollectionMismatchError` |
-| `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device` |
+| `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE` |
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
 | `rag_engine.errors` | `RagEngineError` |
@@ -53,8 +53,9 @@ Errors. Every exception class the engine defines derives from `rag_engine.errors
 | `RAG_ENGINE_DIM` | `768` | Vector dimension of the model |
 | `RAG_ENGINE_PASSAGE_PREFIX` | `passage: ` (with the trailing space) | Text put before each chunk when embedding; `none` for no prefix |
 | `RAG_ENGINE_QUERY_PREFIX` | `query: ` (with the trailing space) | Text put before each query when embedding; `none` for no prefix |
-| `RAG_ENGINE_BACKEND` | `torch` | Embedding backend (case-insensitive). Only `torch` works: `onnx` is accepted by the settings but **not available yet**, and `make_embedder` raises `NotImplementedError` for it |
-| `RAG_ENGINE_MODEL_CACHE` | none | Directory for model files; unset leaves the backend default |
+| `RAG_ENGINE_BACKEND` | `torch` | Embedding backend, `torch` or `onnx` (case-insensitive); see [Embedding backends](#embedding-backends) |
+| `RAG_ENGINE_MODEL_CACHE` | none | Directory for model files. Unset leaves the backend default: the Hugging Face cache for `torch`; `FASTEMBED_CACHE_PATH`, or a folder under the system's temporary directory, for `onnx` |
+| `RAG_ENGINE_PARITY_MIN` | `0.999` | Smallest cosine accepted between the `torch` and `onnx` vectors of the same text (above 0, at most 1). Read by the parity test only |
 | `RAG_ENGINE_BATCH_SIZE` | `100` | Points sent to Qdrant per write (at least 1). It sizes the writes only: all the chunks of a document are embedded in one call |
 | `RAG_ENGINE_OCR_LANGUAGES` | `eng` | Tesseract languages joined by `+`, without whitespace, e.g. `eng+fra`. The caller passes it to `ingest_document` (see below) |
 | `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. Read and checked, but not used yet: search is not available |
@@ -72,7 +73,35 @@ The two prefixes follow their own rule:
 
 The API key is never printed: `repr()` and `str()` of a `Settings` show `qdrant_api_key=<set>` or `<unset>`, and no error message echoes it. It stays a plain attribute, and `dataclasses.asdict()` returns it, so do not log that dictionary.
 
-`Settings(...)` can also be built directly with keyword arguments. The same range checks apply, but nothing is parsed or converted: integers must be `int` (not `bool`, `float` or a numeric string), `qdrant_https` must be a `bool`, `backend` must be exactly `"torch"` or `"onnx"`, and a prefix string is the prefix as it is (`""` for no prefix). An empty `qdrant_host` or `model_name` is refused; a blank `qdrant_api_key` or `model_cache` becomes `None`. A wrong type raises `ConfigError`.
+`Settings(...)` can also be built directly with keyword arguments. The same range checks apply, but nothing is parsed or converted: integers must be `int` (not `bool`, `float` or a numeric string), `qdrant_https` must be a `bool`, `parity_min` must be a `float`, `backend` must be exactly `"torch"` or `"onnx"`, and a prefix string is the prefix as it is (`""` for no prefix). An empty `qdrant_host` or `model_name` is refused; a blank `qdrant_api_key` or `model_cache` becomes `None`. A wrong type raises `ConfigError`.
+
+## Embedding backends
+
+`make_embedder(settings)` builds the backend named by `RAG_ENGINE_BACKEND`. Both apply the same prefixes (`RAG_ENGINE_PASSAGE_PREFIX`, `RAG_ENGINE_QUERY_PREFIX`) and return `float32` vectors of `RAG_ENGINE_DIM` dimensions.
+
+| Backend | Extra | Runs on | Meant for |
+|---|---|---|---|
+| `torch` | `rag-engine[torch]` | sentence-transformers, PyTorch (CUDA, MPS or CPU) | ingestion: the passages of a collection are embedded with it |
+| `onnx` | `rag-engine[onnx]` | fastembed, ONNX runtime (CPU), no PyTorch | search: a service embeds its queries without installing PyTorch |
+
+The intended setup is **passages embedded with `torch`, queries embedded with `onnx`**. It is valid only if both backends give the same vector for the same text, so this is measured, not assumed.
+
+**Measured parity** for `intfloat/multilingual-e5-base` (repository revision `d1287505`, file `onnx/model.onnx`; fastembed 0.9.1, onnxruntime 1.32.0, torch 2.15.0 CPU, sentence-transformers 6.3.0), on 50 fixed texts in English, French, German, Spanish, Italian and Japanese — single words, an empty string, numbers and identifiers, composed and decomposed accents, texts of about 400 words and of about 900 words (cut at 512 tokens):
+
+| Vectors | Minimum cosine, torch against onnx | Mean |
+|---|---|---|
+| passages | 1 − 1.3 × 10⁻¹¹ | 1.000000 |
+| queries | 1 − 3.9 × 10⁻¹² | 1.000000 |
+
+On a corpus of 20 chunks and 5 queries, the five best chunks of every query are the same, in the same order, with `onnx` queries as with `torch` queries. The test (`tests/test_parity.py`, marker `models`) fails below `RAG_ENGINE_PARITY_MIN` (0.999) or on any difference of ranking; CI runs it in the `parity` job. Run it again after changing the model or upgrading `fastembed`, `onnxruntime`, `torch` or `sentence-transformers`. `rag_engine.embedding.cosine_parity(a, b)` gives the cosine of each pair of rows of two arrays of vectors.
+
+What the `onnx` backend does, and why it matches:
+
+- **Model file.** fastembed does not ship `intfloat/multilingual-e5-base`; the engine registers it from the table `rag_engine.embedding.ONNX_MODELS`: the full-precision `onnx/model.onnx` of the model's own Hugging Face repository (not a quantised variant), mean pooling over the attention mask, then normalisation — the pipeline of sentence-transformers for this model. A model that fastembed lists itself is used as fastembed defines it. Any other name raises a `ValueError`.
+- **Prefixes.** The engine adds the prefix once and calls fastembed's plain `embed`; fastembed adds none of its own.
+- **Long texts.** The tokenizer cuts at the limit declared by the model (512 tokens), as sentence-transformers does: both backends see the same tokens.
+- **Batches.** Texts are embedded 32 at a time (`OnnxEmbedder(..., batch_size=...)`, or `make_embedder(settings, batch_size=...)`). A batch is padded to its longest text and the padding is left out of the pooling, so the vector of a text does not depend on its neighbours.
+- **Files.** The first use downloads about 1.1 GB into `RAG_ENGINE_MODEL_CACHE`. Without it, fastembed stores them under the system's temporary directory, which a reboot may clear: set the variable (or `FASTEMBED_CACHE_PATH`) on a server.
 
 ## Ingesting a document
 
@@ -184,11 +213,12 @@ Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 Two test markers are deselected by default:
 
 - `integration`: needs a real Qdrant, given by `RAG_ENGINE_IT_QDRANT_URL`.
-- `models`: downloads embedding models.
+- `models`: downloads embedding models. It holds the test of the real torch model and the parity test of the two backends (`tests/test_parity.py`); it needs `pip install -e ".[dev,torch,onnx]"`. CI runs it in its own job, `parity`, with the model files cached.
 
 ```bash
 docker run --rm -p 6333:6333 qdrant/qdrant:v1.20.0
 RAG_ENGINE_IT_QDRANT_URL=http://localhost:6333 pytest -m integration -q
+pytest -m models -q -s  # -s prints the measured parity
 ```
 
 The integration tests of ingestion parse real documents, so they also need the `ingest` extra and skip without it; the CI integration job installs it and fails if the parsers cannot be imported.

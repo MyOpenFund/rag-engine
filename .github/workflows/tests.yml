@@ -65,3 +65,28 @@ jobs:
           echo "Qdrant did not become ready" >&2
           exit 1
       - run: python -m pytest -m integration -q
+  # The real embedding model, through both backends: the test of the torch backend, and the
+  # parity test that allows queries embedded with onnx against passages embedded with torch.
+  parity:
+    runs-on: ubuntu-latest
+    env:
+      HF_HOME: ${{ github.workspace }}/.model-cache/huggingface
+      FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.model-cache/fastembed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # The CPU build of PyTorch first: the default wheel carries the CUDA libraries.
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e ".[dev,torch,onnx]"
+      - name: Check that both backends are importable
+        run: python -c "import fastembed, onnxruntime, sentence_transformers, torch; print(torch.__version__)"
+      # About 2.2 GB: the weights for sentence-transformers and the ONNX file for fastembed.
+      - uses: actions/cache@v4
+        with:
+          path: .model-cache
+          key: models-intfloat-multilingual-e5-base-v1
+      - run: python -m pytest -m models -q -s
