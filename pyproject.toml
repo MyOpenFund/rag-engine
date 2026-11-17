@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rag-engine"
+version = "0.1.0"
+description = "Ingest one document into Qdrant and search what was ingested."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+authors = [{ name = "Marc Jeulin" }]
+dependencies = ["qdrant-client", "numpy"]
+
+[project.optional-dependencies]
+onnx = ["fastembed"]
+torch = ["sentence-transformers"]
+ingest = ["chunknorris", "markitdown[pptx]"]
+dev = ["pytest>=8.3", "ruff>=0.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rag_engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: needs a real Qdrant (RAG_ENGINE_IT_QDRANT_URL)",
+  "models: downloads embedding models",
+]
+addopts = "-m 'not integration and not models'"
+
+[tool.ruff]
+line-length = 110
