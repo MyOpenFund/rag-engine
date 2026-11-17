@@ -28,6 +28,8 @@ def test_version():
         "rag_engine.chunking",
         "rag_engine.ingest",
         "rag_engine.search",
+        "rag_engine.eval",
+        "rag_engine.cli",
     ],
 )
 def test_import_pulls_no_heavy_dependency(modules):
@@ -91,6 +93,24 @@ PUBLIC_NAMES = {
     },
     "rag_engine.ingest": {"IngestResult", "ingest_document"},
     "rag_engine.search": {"QUERY_NORMALIZATION", "Hit", "SearchError", "SearchFilters", "search"},
+    "rag_engine.eval": {
+        "DEFAULT_CHUNK_LIMIT",
+        "DEFAULT_K",
+        "FILTER_FIELDS",
+        "QUESTION_FIELDS",
+        "Aggregate",
+        "EvalError",
+        "EvalReport",
+        "NotInCollection",
+        "Question",
+        "QuestionResult",
+        "QuestionSet",
+        "RankedDocument",
+        "evaluate",
+        "format_report",
+        "load_questions",
+    },
+    "rag_engine.cli": {"main"},
 }
 
 
@@ -150,3 +170,31 @@ def test_the_sdist_leaves_out_the_tools_and_the_ci_files_and_keeps_the_tests(pyp
     excluded = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"]
     assert {"/tools", "/.github"} <= set(excluded)
     assert not any("tests" in entry for entry in excluded)
+
+
+def test_the_sdist_keeps_the_evaluation_files_and_the_wheel_holds_the_package_only(pyproject):
+    targets = pyproject["tool"]["hatch"]["build"]["targets"]
+    # Nothing under eval/ is excluded: the tests read eval/fixtures/ from the source distribution.
+    assert not any("eval" in entry for entry in targets["sdist"]["exclude"])
+    assert "include" not in targets["sdist"] and "only-include" not in targets["sdist"]
+    assert targets["wheel"]["packages"] == ["src/rag_engine"]
+    root = PYPROJECT.parent
+    for name in ("corpus.json", "questions.jsonl"):
+        assert (root / "eval" / "fixtures" / name).is_file(), name
+
+
+def test_the_console_script_is_declared(pyproject):
+    assert pyproject["project"]["scripts"] == {"rag-engine": "rag_engine.cli:main"}
+    from rag_engine.cli import main
+
+    assert callable(main)
+
+
+def test_the_package_does_not_need_the_evaluation_files():
+    # eval.py and cli.py read the files they are given, never a file of the repository.
+    import rag_engine.cli
+    import rag_engine.eval
+
+    for module in (rag_engine.eval, rag_engine.cli):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "__file__" not in source

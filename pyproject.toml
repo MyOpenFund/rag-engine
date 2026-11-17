@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "rag-engine"
 version = "0.1.0"
-description = "Ingest one document into Qdrant with deterministic point ids, and search what was ingested."
+description = "Ingest one document into Qdrant with deterministic point ids, search what was ingested, and measure the search."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
@@ -42,10 +42,15 @@ ingest = ["chunknorris>=1.3.7,<1.6", "markitdown[pptx]", "psutil"]
 # ruff is bounded: CI runs "ruff format --check", and a new ruff release may change its style.
 dev = ["pytest>=8.3", "ruff>=0.17,<0.18"]
 
+[project.scripts]
+rag-engine = "rag_engine.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/rag_engine"]
 
-# The source distribution keeps the tests; the capture tool and the CI files stay in the repository.
+# The source distribution keeps the tests and eval/ (the evaluation fixture the tests read, the
+# question files and the script that builds them); the capture tool and the CI files stay in
+# the repository. The wheel holds the package only.
 [tool.hatch.build.targets.sdist]
 exclude = ["/tools", "/.github"]
 
