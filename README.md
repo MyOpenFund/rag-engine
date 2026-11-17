@@ -60,7 +60,7 @@ The API key is never printed: `repr()` and `str()` of a `Settings` show `qdrant_
 
 ## Supported formats and OCR
 
-`chunk_file(path, *, ocr="auto", ocr_languages="eng")` (in `rag_engine.chunking`, extra `ingest`) reads one file and returns its chunks in document order, each with its `text` and its `page`. The format is chosen by the file extension, whatever its case; `SUPPORTED_EXTENSIONS` lists them.
+`chunk_file(path, *, ocr="auto", ocr_languages="eng", options=None)` (in `rag_engine.chunking`, extra `ingest`) reads one file and returns its chunks in document order, each with its `text` and its `page`. The format is chosen by the file extension, whatever its case; `SUPPORTED_EXTENSIONS` lists them.
 
 | Extension | Read by | `page` |
 |---|---|---|
@@ -69,7 +69,21 @@ The API key is never printed: `repr()` and `str()` of a `Settings` show `qdrant_
 | `.pptx` | MarkItDown, then ChunkNorris | `None` |
 | `.txt`, `.md` | read as UTF-8, then ChunkNorris | `None` |
 
-Any other extension raises `ValueError`. Every format is turned into markdown and split by the same chunker with its default sizes, which drop chunks of fewer than 15 words. Chunks with no text are left out, and a document with no extractable text (an empty text file, a scanned PDF read without OCR) gives an empty list, not an error. A file the parser cannot open, such as a zero-byte PDF, raises the parser's own error.
+Any other extension raises `UnsupportedFormatError`, a `ValueError`. A file the parser cannot read raises the parser's own error, unchanged: a zero-byte PDF, or an empty `.csv`, whose error is a plain `ValueError` and not an `UnsupportedFormatError`. Chunks with no text are left out, and a document with no extractable text (an empty text file, a scanned PDF read without OCR) gives an empty list, not an error.
+
+Every format is turned into markdown and split by the same chunker. Its sizes, counted in words, are the `options` argument, a `ChunkingOptions`:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_headers_to_use` | `"h4"` | Deepest header level a document is split on. |
+| `max_chunk_word_count` | `200` | Soft maximum: a longer chunk is split only where it has deeper headers. |
+| `hard_max_chunk_word_count` | `400` | Hard maximum: a longer chunk is always split. |
+| `min_chunk_word_count` | `15` | A chunk with fewer words is dropped. |
+
+The defaults are the values the old engine ran with (ChunkNorris's own defaults), and `chunk_file` passes them to ChunkNorris by name, as it does for the PDF parser's options (tables extracted, headers detected; the `PDF_*` constants of the module). The text of a chunk determines the id of its point, so one collection should be ingested with one set of options, and for the same reason:
+
+- the `ingest` extra accepts `chunknorris>=1.3.7,<1.6`: 1.3.7 and 1.5.0 give identical chunks, and a newer minor version must be compared before the bound is raised;
+- `chunk_file` replaces ChunkNorris's private line-spacing measure for PDFs with the one the old engine used. The two do not cut every PDF into the same chunks, so this replacement must stay as long as points ingested with it are in use.
 
 A `.txt` or `.md` file that is not valid UTF-8 is still read: each invalid byte sequence becomes `�` (U+FFFD) and a warning is logged.
 
@@ -78,12 +92,20 @@ OCR applies to PDF only, with one of three modes:
 | `ocr` | Behaviour |
 |---|---|
 | `auto` (default) | If OCR is available on the host, ChunkNorris decides page by page whether to run it. If not, no OCR. |
-| `always` | OCR on every page, whether or not the host is declared OCR-capable. |
+| `always` | OCR on every page, whatever `ENABLE_OCR` says. The language data must still be found through `TESSDATA_PREFIX`. |
 | `never` | No OCR. |
 
-OCR is available on the host when `ENABLE_OCR=true` and `TESSDATA_PREFIX` is set (`ocr_available()`); these are the two variables the old engine used, read here at each call. `TESSDATA_PREFIX` is the folder that holds Tesseract's `*.traineddata` files; if it is set to the parent of a `tessdata` folder, it is corrected for the running process.
+OCR is available on the host when `ENABLE_OCR=true` and `TESSDATA_PREFIX` is set (`ocr_available()`); these are the two variables the old engine used, read here at each call. `ocr_available()` only reads the environment. `ENABLE_OCR` only decides what `auto` does: `always` does not look at it.
 
-The OCR languages are a setting: `RAG_ENGINE_OCR_LANGUAGES`, default `eng`, passed by the caller as `ocr_languages=settings.ocr_languages`. **This differs from the old engine**, which used every language found in the tessdata directory. To keep the old result on a host with several languages installed, list them, for example `RAG_ENGINE_OCR_LANGUAGES=eng+fra`. Each language listed must be installed.
+`TESSDATA_PREFIX` is the folder that holds Tesseract's `*.traineddata` files. If it is set to the parent of a `tessdata` folder, `chunk_file` corrects it for the running process whenever OCR may run on the PDF it reads: with `always`, or with `auto` on a host where OCR is available. It is never changed with `never`, with `auto` on a host without OCR, or for another format.
+
+The OCR languages are a setting: `RAG_ENGINE_OCR_LANGUAGES`, default `eng`, passed by the caller as `ocr_languages=settings.ocr_languages`. Each language listed must be installed.
+
+Differences from the old engine:
+
+- **OCR languages.** The old engine used every language found in the tessdata directory. To keep the old result on a host with several languages installed, list them, for example `RAG_ENGINE_OCR_LANGUAGES=eng+fra`.
+- **Invalid UTF-8 in `.txt` and `.md` files.** Invalid bytes are now replaced by `�` (U+FFFD); the old engine dropped them silently. The text of such a file therefore differs slightly from what was ingested before, and so do the chunks that contain those bytes.
+- **`ocr="always"` and `TESSDATA_PREFIX`.** The old engine corrected a `TESSDATA_PREFIX` set to the parent folder only when `ENABLE_OCR=true`; it is now also corrected for a forced `always`.
 
 ## Development
 
@@ -93,7 +115,7 @@ ruff check .
 pytest -q
 ```
 
-The tests that parse real documents need the `ingest` extra (`pip install -e ".[dev,ingest]"`) and skip without it; the OCR test also needs Tesseract with the `eng` language data.
+The tests that parse real documents need the `ingest` extra (`pip install -e ".[dev,ingest]"`) and skip without it; the OCR test also needs Tesseract with the `eng` language data (`apt-get install tesseract-ocr`), which CI installs on the Python 3.12 job.
 
 Two test markers are deselected by default:
 

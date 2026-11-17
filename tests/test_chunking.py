@@ -6,7 +6,9 @@ second (bottom of the file) needs the real libraries and skips when they are not
 """
 
 import importlib.util
+import inspect
 import logging
+import os
 import random
 import shutil
 import subprocess
@@ -16,7 +18,14 @@ import types
 import pytest
 
 from rag_engine import chunking
-from rag_engine.chunking import SUPPORTED_EXTENSIONS, Chunk, chunk_file, ocr_available
+from rag_engine.chunking import (
+    SUPPORTED_EXTENSIONS,
+    Chunk,
+    ChunkingOptions,
+    UnsupportedFormatError,
+    chunk_file,
+    ocr_available,
+)
 
 # ---------------------------------------------------------------------------
 # Layer 1: stub libraries
@@ -81,6 +90,9 @@ def _install_stubs(monkeypatch, *, with_line_spacing=True):
         return Parser
 
     class MarkdownChunker:
+        def __init__(self, **kwargs):
+            stubs.calls.append(("MarkdownChunker", "init", kwargs))
+
         def chunk(self, doc):
             stubs.calls.append(("MarkdownChunker", "chunk", doc))
             if stubs.chunk_error is not None:
@@ -129,7 +141,22 @@ def _file(tmp_path, name, data=b"content"):
 
 
 def _inits(stubs):
-    return [(name, arg) for name, what, arg in stubs.calls if what == "init"]
+    """The parsers built, with their arguments (the chunker is not a parser)."""
+    return [(name, arg) for name, what, arg in stubs.calls if what == "init" and name != "MarkdownChunker"]
+
+
+def _chunker_kwargs(stubs):
+    (kwargs,) = [arg for name, what, arg in stubs.calls if (name, what) == ("MarkdownChunker", "init")]
+    return kwargs
+
+
+#: What PdfParser receives besides the OCR mode and languages.
+PDF_FIXED_KWARGS = {
+    "extract_tables": True,
+    "add_headers": True,
+    "body_line_spacing": None,
+    "enable_ml_features": False,
+}
 
 
 def _pdf_kwargs(stubs):
@@ -208,8 +235,9 @@ def test_a_string_path_is_accepted(stubs, tmp_path):
 @pytest.mark.parametrize("name", ["page.html", "data.json", "old.doc", "noextension", "archive.pdf.zip"])
 def test_unsupported_extension_is_refused_by_name(stubs, tmp_path, name):
     path = _file(tmp_path, name)
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(UnsupportedFormatError) as error:
         chunk_file(path)
+    assert isinstance(error.value, ValueError)
     suffix = path.suffix
     assert repr(suffix) in str(error.value)
     assert stubs.calls == []
@@ -219,6 +247,107 @@ def test_unsupported_extension_is_refused_without_the_ingest_extra(monkeypatch, 
     monkeypatch.setitem(sys.modules, "chunknorris", None)
     with pytest.raises(ValueError, match="'.html'"):
         chunk_file(_file(tmp_path, "page.html"))
+
+
+def test_bad_arguments_are_plain_value_errors_not_unsupported_format(stubs, tmp_path):
+    assert issubclass(UnsupportedFormatError, ValueError)
+    for kwargs in ({"ocr": "sometimes"}, {"ocr_languages": ""}, {"options": {"min_chunk_word_count": 1}}):
+        with pytest.raises(ValueError) as error:
+            chunk_file(_file(tmp_path, "a.pdf"), **kwargs)
+        assert type(error.value) is ValueError
+
+
+def test_a_value_error_of_the_parser_is_not_turned_into_unsupported_format(stubs, tmp_path):
+    error = ValueError("Could not determine delimiter")
+    stubs.parse_error = error
+    with pytest.raises(ValueError) as raised:
+        chunk_file(_file(tmp_path, "empty.csv"))
+    assert raised.value is error
+    assert not isinstance(raised.value, UnsupportedFormatError)
+
+
+# -- chunking options ---------------------------------------------------------
+
+
+def test_default_options_are_the_values_the_old_engine_ran_with():
+    options = ChunkingOptions()
+    assert (
+        options.max_headers_to_use,
+        options.max_chunk_word_count,
+        options.hard_max_chunk_word_count,
+        options.min_chunk_word_count,
+    ) == ("h4", 200, 400, 15)
+    with pytest.raises(AttributeError):
+        options.min_chunk_word_count = 1
+
+
+@pytest.mark.parametrize("name", ["a.pdf", "a.docx", "a.xlsx", "a.csv", "a.pptx", "a.txt", "a.md"])
+@pytest.mark.parametrize("options", [None, ChunkingOptions()])
+def test_the_chunker_receives_every_sizing_option_explicitly(stubs, tmp_path, name, options):
+    chunk_file(_file(tmp_path, name), options=options)
+    assert _chunker_kwargs(stubs) == {
+        "max_headers_to_use": "h4",
+        "max_chunk_word_count": 200,
+        "hard_max_chunk_word_count": 400,
+        "min_chunk_word_count": 15,
+        "hard_max_chunk_token_count": None,
+    }
+
+
+def test_given_options_reach_the_chunker(stubs, tmp_path):
+    options = ChunkingOptions(
+        max_headers_to_use="h2", max_chunk_word_count=50, hard_max_chunk_word_count=80, min_chunk_word_count=3
+    )
+    chunk_file(_file(tmp_path, "a.md"), options=options)
+    assert _chunker_kwargs(stubs) == {
+        "max_headers_to_use": "h2",
+        "max_chunk_word_count": 50,
+        "hard_max_chunk_word_count": 80,
+        "min_chunk_word_count": 3,
+        "hard_max_chunk_token_count": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_headers_to_use": "h7"},
+        {"max_headers_to_use": "H4"},
+        {"max_headers_to_use": 4},
+        {"min_chunk_word_count": -1},
+        {"min_chunk_word_count": 1.5},
+        {"min_chunk_word_count": True},
+        {"max_chunk_word_count": 0},
+        {"hard_max_chunk_word_count": 0},
+        {"max_chunk_word_count": "200"},
+        {"max_chunk_word_count": 300, "hard_max_chunk_word_count": 200},
+    ],
+)
+def test_invalid_options_are_refused_when_built(kwargs):
+    with pytest.raises(ValueError):
+        ChunkingOptions(**kwargs)
+
+
+def test_a_minimum_of_zero_words_and_equal_maxima_are_accepted():
+    ChunkingOptions(min_chunk_word_count=0, max_chunk_word_count=100, hard_max_chunk_word_count=100)
+
+
+@pytest.mark.parametrize("options", [{"min_chunk_word_count": 1}, "h4", 15])
+def test_options_must_be_a_chunking_options_value(stubs, tmp_path, options):
+    with pytest.raises(ValueError, match="options"):
+        chunk_file(_file(tmp_path, "a.md"), options=options)
+    assert stubs.calls == []
+
+
+def test_the_pdf_parser_options_are_named_constants_passed_explicitly(stubs, tmp_path):
+    assert {
+        "extract_tables": chunking.PDF_EXTRACT_TABLES,
+        "add_headers": chunking.PDF_ADD_HEADERS,
+        "body_line_spacing": chunking.PDF_BODY_LINE_SPACING,
+        "enable_ml_features": chunking.PDF_ENABLE_ML_FEATURES,
+    } == PDF_FIXED_KWARGS
+    chunk_file(_file(tmp_path, "a.pdf"))
+    assert _pdf_kwargs(stubs) == {"use_ocr": "never", "ocr_language": "eng", **PDF_FIXED_KWARGS}
 
 
 # -- OCR mode and languages ---------------------------------------------------
@@ -245,7 +374,7 @@ def test_ocr_languages_must_be_a_non_blank_string(stubs, tmp_path, languages):
 
 def test_auto_is_never_when_ocr_is_not_available(stubs, tmp_path):
     chunk_file(_file(tmp_path, "a.pdf"))
-    assert _pdf_kwargs(stubs) == {"use_ocr": "never", "ocr_language": "eng"}
+    assert _pdf_kwargs(stubs) == {"use_ocr": "never", "ocr_language": "eng", **PDF_FIXED_KWARGS}
 
 
 def test_auto_is_auto_when_ocr_is_available(stubs, tmp_path, monkeypatch):
@@ -280,7 +409,7 @@ def test_languages_are_not_read_from_the_environment(stubs, tmp_path, monkeypatc
     monkeypatch.setenv("TESSDATA_PREFIX", str(tessdata))
     monkeypatch.setenv("RAG_ENGINE_OCR_LANGUAGES", "spa")
     chunk_file(_file(tmp_path, "a.pdf"))
-    assert _pdf_kwargs(stubs) == {"use_ocr": "auto", "ocr_language": "eng"}
+    assert _pdf_kwargs(stubs) == {"use_ocr": "auto", "ocr_language": "eng", **PDF_FIXED_KWARGS}
 
 
 def test_only_the_pdf_parser_receives_ocr_arguments(stubs, tmp_path):
@@ -327,25 +456,81 @@ def test_the_switch_is_read_at_call_time(monkeypatch, tmp_path):
     assert ocr_available() is True
 
 
-def test_tessdata_prefix_pointing_at_the_parent_is_moved_to_the_tessdata_folder(monkeypatch, tmp_path):
-    import os
+@pytest.mark.parametrize("switch", [None, "false", "true"])
+def test_ocr_available_never_changes_the_environment(monkeypatch, tmp_path, switch):
+    (tmp_path / "tessdata").mkdir()
+    if switch is None:
+        monkeypatch.delenv("ENABLE_OCR", raising=False)
+    else:
+        monkeypatch.setenv("ENABLE_OCR", switch)
+    monkeypatch.setenv("TESSDATA_PREFIX", str(tmp_path))
+    before = dict(os.environ)
+    assert ocr_available() is (switch == "true")
+    assert dict(os.environ) == before
 
+
+# -- TESSDATA_PREFIX correction -----------------------------------------------
+
+# For each OCR mode and each state of the ENABLE_OCR switch: the mode PdfParser receives, and
+# whether a TESSDATA_PREFIX set to the parent of a ``tessdata`` folder is corrected.
+PREFIX_CASES = [
+    ("auto", None, "never", False),
+    ("auto", "false", "never", False),
+    ("auto", "true", "auto", True),
+    ("always", None, "always", True),
+    ("always", "false", "always", True),
+    ("always", "true", "always", True),
+    ("never", None, "never", False),
+    ("never", "false", "never", False),
+    ("never", "true", "never", False),
+]
+
+
+@pytest.mark.parametrize(("ocr", "switch", "use_ocr", "corrected"), PREFIX_CASES)
+def test_tessdata_prefix_is_corrected_only_when_ocr_may_run(
+    stubs, tmp_path, monkeypatch, ocr, switch, use_ocr, corrected
+):
+    parent = tmp_path / "share"
+    (parent / "tessdata").mkdir(parents=True)
+    if switch is not None:
+        monkeypatch.setenv("ENABLE_OCR", switch)
+    monkeypatch.setenv("TESSDATA_PREFIX", str(parent))
+    before = dict(os.environ)
+    chunk_file(_file(tmp_path, "a.pdf"), ocr=ocr)
+    assert _pdf_kwargs(stubs)["use_ocr"] == use_ocr
+    if corrected:
+        assert os.environ["TESSDATA_PREFIX"] == str(parent / "tessdata")
+        # Idempotent: a second file does not descend further.
+        chunk_file(_file(tmp_path, "b.pdf"), ocr=ocr)
+        assert os.environ["TESSDATA_PREFIX"] == str(parent / "tessdata")
+    else:
+        assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("ocr", ["auto", "always"])
+def test_tessdata_prefix_already_on_the_language_data_is_left_alone(stubs, tmp_path, monkeypatch, ocr):
+    monkeypatch.setenv("ENABLE_OCR", "true")
+    monkeypatch.setenv("TESSDATA_PREFIX", str(tmp_path))
+    before = dict(os.environ)
+    chunk_file(_file(tmp_path, "a.pdf"), ocr=ocr)
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("switch", [None, "true"])
+def test_always_without_tessdata_prefix_sets_nothing(stubs, tmp_path, monkeypatch, switch):
+    if switch is not None:
+        monkeypatch.setenv("ENABLE_OCR", switch)
+    chunk_file(_file(tmp_path, "a.pdf"), ocr="always")
+    assert "TESSDATA_PREFIX" not in os.environ
+    assert _pdf_kwargs(stubs)["use_ocr"] == "always"
+
+
+@pytest.mark.parametrize("name", ["a.docx", "a.xlsx", "a.csv", "a.md", "a.txt", "a.pptx"])
+def test_tessdata_prefix_is_never_touched_for_a_format_without_ocr(stubs, tmp_path, monkeypatch, name):
     (tmp_path / "tessdata").mkdir()
     monkeypatch.setenv("ENABLE_OCR", "true")
     monkeypatch.setenv("TESSDATA_PREFIX", str(tmp_path))
-    assert ocr_available() is True
-    assert os.environ["TESSDATA_PREFIX"] == str(tmp_path / "tessdata")
-    assert ocr_available() is True
-    assert os.environ["TESSDATA_PREFIX"] == str(tmp_path / "tessdata")
-
-
-def test_tessdata_prefix_is_left_alone_when_the_switch_is_off(monkeypatch, tmp_path):
-    import os
-
-    (tmp_path / "tessdata").mkdir()
-    monkeypatch.delenv("ENABLE_OCR", raising=False)
-    monkeypatch.setenv("TESSDATA_PREFIX", str(tmp_path))
-    assert ocr_available() is False
+    chunk_file(_file(tmp_path, name), ocr="always")
     assert os.environ["TESSDATA_PREFIX"] == str(tmp_path)
 
 
@@ -442,6 +627,17 @@ def test_invalid_utf8_is_replaced_with_a_warning(stubs, tmp_path, caplog, name):
     assert "UTF-8" in record.getMessage()
 
 
+def test_the_invalid_utf8_warning_gives_no_count(stubs, tmp_path, caplog):
+    """U+FFFD characters already in the file are not invalid bytes: nothing is counted."""
+    data = "d\ufffdj\ufffd \ufffd ".encode() + "caf\xe9".encode("latin-1")
+    path = _file(tmp_path, "mixed.txt", data)
+    with caplog.at_level(logging.WARNING, logger="rag_engine.chunking"):
+        chunk_file(path)
+    assert ("MarkdownParser", "parse_string", "d\ufffdj\ufffd \ufffd caf\ufffd") in stubs.calls
+    (record,) = caplog.records
+    assert record.getMessage() == f"{path} is not valid UTF-8: its invalid bytes were replaced by U+FFFD"
+
+
 def test_valid_utf8_logs_nothing(stubs, tmp_path, caplog):
     path = _file(tmp_path, "ok.txt", "résumé de l'année, 日本語".encode())
     with caplog.at_level(logging.WARNING, logger="rag_engine.chunking"):
@@ -512,7 +708,7 @@ def test_the_pdf_parser_line_spacing_is_patched_on_first_use(stubs, tmp_path):
     assert stubs.pdf_parser._get_line_spacing([]) == "original"
     chunk_file(_file(tmp_path, "a.pdf"))
     patched = stubs.pdf_parser._get_line_spacing
-    # The case the original crashed on: fewer than two lines, nothing to count.
+    # Fewer than two lines, nothing to count.
     assert patched([]) == 0.0
     assert patched([_Line(0, 10)]) == 0.0
     # Otherwise the most common gap between consecutive lines.
@@ -700,7 +896,7 @@ def test_real_pdf_in_auto_mode_without_ocr_on_the_host(real, tmp_path):
 
 @needs_ingest
 def test_real_pdf_with_a_single_line_does_not_crash(real, tmp_path):
-    """The input the line-spacing patch exists for: one line, no gap to measure."""
+    """One line, no gap to measure: ChunkNorris 1.3.7's own line spacing fails on it."""
     line = "Only one line of text on this page, long enough to pass the fifteen word minimum of the chunker."
     path = _pdf(tmp_path / "one-line.pdf", [[line]])
     assert chunk_file(path, ocr="never") == [Chunk(line, 0)]
@@ -740,10 +936,187 @@ def test_real_empty_or_corrupt_pdf_raises_the_parser_error(real, tmp_path, data)
 
 @needs_ingest
 def test_real_empty_csv_raises_the_parser_error(real, tmp_path):
+    """The parser's own ValueError, which is not the one for an unsupported extension."""
     path = tmp_path / "empty.csv"
     path.write_bytes(b"")
-    with pytest.raises(ValueError, match="delimiter"):
+    with pytest.raises(ValueError, match="delimiter") as error:
         chunk_file(path)
+    assert not isinstance(error.value, UnsupportedFormatError)
+    html = tmp_path / "page.html"
+    html.write_text("<p>text</p>", encoding="utf-8")
+    with pytest.raises(UnsupportedFormatError):
+        chunk_file(html)
+
+
+# -- the line-spacing pin -----------------------------------------------------
+
+
+def _pristine_pdf_parser():
+    """A second, untouched copy of ChunkNorris's ``PdfParser`` class.
+
+    ``chunk_file`` replaces ``_get_line_spacing`` on the class everybody imports, for the whole
+    process. To compare with the library's own method, its module is executed again under
+    another name (and not registered): that copy's class has the original method, and its code
+    looks the method up on that copy, so the engine's replacement never reaches it.
+    """
+    import chunknorris.parsers.pdf.pdf_parser as live
+
+    spec = importlib.util.spec_from_file_location("chunknorris.parsers.pdf._pristine_pdf_parser", live.__file__)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.PdfParser
+
+
+def _list_then_paragraphs_pdf(path, items=60, paragraphs=40):
+    """Large-font lines, one per item and widely spaced, then two-line body paragraphs.
+
+    The body font (10 pt) has the most lines, so ChunkNorris's own line spacing only looks at
+    body lines and finds the gap inside a paragraph. The engine's line spacing looks at every
+    line and finds the gap between two items, the most frequent of all, which is wider than the
+    gap between two paragraphs: paragraphs then merge into one block.
+    """
+    import pymupdf
+
+    rng = random.Random(7)
+    document = pymupdf.open()
+    state = {"page": document.new_page(), "y": 80}
+
+    def put(text, fontsize, step):
+        if state["y"] > 760:
+            state["page"], state["y"] = document.new_page(), 80
+        state["page"].insert_text((72, state["y"]), text, fontsize=fontsize)
+        state["y"] += step
+
+    for i in range(items):
+        put(f"Item {i} " + " ".join(rng.choice(WORDS) for _ in range(4)), 14, 30)
+    for i in range(paragraphs):
+        put(f"B{i}a " + " ".join(rng.choice(WORDS) for _ in range(9)), 10, 12)
+        put(f"B{i}b " + " ".join(rng.choice(WORDS) for _ in range(9)) + ".", 10, 20)
+    document.save(str(path))
+    document.close()
+    return path
+
+
+def _library_pdf_chunks(pdf_parser_class, path):
+    from chunknorris.chunkers import MarkdownChunker
+
+    document = pdf_parser_class(use_ocr="never", ocr_language="eng").parse_file(str(path))
+    return [Chunk(c.get_text(), c.start_page) for c in MarkdownChunker().chunk(document)]
+
+
+@needs_ingest
+def test_real_pdf_chunks_depend_on_the_line_spacing_pin(real, tmp_path):
+    """Fails if ``chunk_file`` stops installing its line spacing on ``PdfParser``.
+
+    The replacement is what production ran, and it does not give the same chunks as the
+    library's own method: this is a document on which they differ.
+    """
+    path = _list_then_paragraphs_pdf(tmp_path / "list.pdf")
+    chunks = chunk_file(path, ocr="never")
+    assert len(chunks) >= 3
+
+    library = _library_pdf_chunks(_pristine_pdf_parser(), path)
+    pinned_class = _pristine_pdf_parser()
+    pinned_class._get_line_spacing = staticmethod(chunking._safe_line_spacing)
+    pinned = _library_pdf_chunks(pinned_class, path)
+
+    assert [c.text for c in pinned] != [c.text for c in library], "the fixture no longer separates the two"
+    assert chunks == pinned
+    assert chunks != library
+
+
+@needs_ingest
+def test_real_pdf_parser_carries_the_engine_line_spacing_after_a_pdf(real, tmp_path):
+    from chunknorris.parsers import PdfParser
+
+    chunk_file(_pdf(tmp_path / "report.pdf", [_page_lines(1)]), ocr="never")
+    assert PdfParser._get_line_spacing is chunking._safe_line_spacing
+    assert isinstance(PdfParser.__dict__["_get_line_spacing"], staticmethod)
+
+
+# -- explicit options: same result as the library's defaults --------------------
+
+
+@needs_ingest
+def test_real_library_defaults_are_the_values_passed_explicitly(real):
+    """A release that changes a default shows up here, before it changes a chunk."""
+    from chunknorris.chunkers import MarkdownChunker
+    from chunknorris.parsers import PdfParser
+
+    def defaults(callable_):
+        return {name: p.default for name, p in inspect.signature(callable_).parameters.items() if name != "self"}
+
+    chunker = defaults(MarkdownChunker.__init__)
+    options = ChunkingOptions()
+    assert chunker.pop("tokenizer") is None
+    assert chunker == {
+        "max_headers_to_use": options.max_headers_to_use,
+        "max_chunk_word_count": options.max_chunk_word_count,
+        "hard_max_chunk_word_count": options.hard_max_chunk_word_count,
+        "min_chunk_word_count": options.min_chunk_word_count,
+        "hard_max_chunk_token_count": None,
+    }
+    parser = defaults(PdfParser.__init__)
+    # Decided per call (use_ocr, ocr_language) or left to the library (table_finder, an object).
+    for name in ("use_ocr", "ocr_language", "table_finder"):
+        parser.pop(name)
+    assert parser == PDF_FIXED_KWARGS
+
+
+@needs_ingest
+def test_real_markdown_default_chunks_are_those_of_the_library_defaults(real, tmp_path):
+    from chunknorris.chunkers import MarkdownChunker
+    from chunknorris.parsers import MarkdownParser
+
+    sections = [f"## Section {i}\n\n" + " ".join(_page_lines(i, 12)) + "\n" for i in range(1, 9)]
+    text = "# Report\n\nShort intro.\n\n" + "\n".join(sections) + "\n### Tail\n\nToo short to keep.\n"
+    path = tmp_path / "report.md"
+    path.write_text(text, encoding="utf-8")
+
+    expected = [
+        Chunk(c.get_text(), c.start_page) for c in MarkdownChunker().chunk(MarkdownParser().parse_string(text))
+    ]
+    assert len(expected) >= 3
+    assert chunk_file(path) == expected
+    assert chunk_file(path, options=ChunkingOptions()) == expected
+
+
+@needs_ingest
+def test_real_pdf_default_chunks_are_those_of_the_library_defaults(real, tmp_path):
+    from chunknorris.parsers import PdfParser
+
+    for path in (
+        _pdf(tmp_path / "report.pdf", [_page_lines(1), _page_lines(2), _page_lines(3, 8)]),
+        _list_then_paragraphs_pdf(tmp_path / "list.pdf"),
+    ):
+        chunks = chunk_file(path, ocr="never")
+        assert len(chunks) >= 3
+        # PdfParser has the engine's line spacing by now (chunk_file ran); everything else is
+        # the library's defaults.
+        assert chunks == _library_pdf_chunks(PdfParser, path)
+        assert chunks == chunk_file(path, ocr="never", options=ChunkingOptions())
+
+
+@needs_ingest
+@pytest.mark.parametrize("name", ["short.md", "short.pdf"])
+def test_real_lower_minimum_keeps_a_chunk_dropped_by_default(real, tmp_path, name):
+    path = tmp_path / name
+    if name.endswith(".pdf"):
+        _pdf(path, [["Too short to keep."]])
+    else:
+        path.write_text("Too short to keep.\n", encoding="utf-8")
+    assert chunk_file(path, ocr="never") == []
+    kept = chunk_file(path, ocr="never", options=ChunkingOptions(min_chunk_word_count=1))
+    assert [c.text.strip() for c in kept] == ["Too short to keep."]
+
+
+@needs_ingest
+def test_real_lower_maximum_gives_more_chunks(real, tmp_path):
+    path = tmp_path / "long.txt"
+    path.write_text("\n\n".join(" ".join(_page_lines(i, 6)) for i in range(1, 9)) + "\n", encoding="utf-8")
+    default = chunk_file(path)
+    smaller = chunk_file(path, options=ChunkingOptions(max_chunk_word_count=60, hard_max_chunk_word_count=120))
+    assert len(smaller) > len(default)
 
 
 @needs_ingest
@@ -780,10 +1153,16 @@ def _tessdata_dir():
 
 
 @needs_ingest
-def test_real_scanned_pdf_is_read_with_ocr_always(real, tmp_path, monkeypatch):
+@pytest.mark.parametrize("switch", [None, "false", "true"])
+@pytest.mark.parametrize("prefix", ["folder", "parent"])
+def test_real_scanned_pdf_is_read_with_ocr_always(real, tmp_path, monkeypatch, prefix, switch):
+    """``always`` reads a scan whatever ENABLE_OCR says, TESSDATA_PREFIX being the language
+    data folder or its parent."""
     tessdata = _tessdata_dir()
     if tessdata is None:
         pytest.skip("needs tesseract with the eng language data")
+    if prefix == "parent" and os.path.basename(tessdata) != "tessdata":
+        pytest.skip("the language data is not in a folder named tessdata")
     import pymupdf
 
     source = _pdf(
@@ -805,9 +1184,14 @@ def test_real_scanned_pdf_is_read_with_ocr_always(real, tmp_path, monkeypatch):
     scan.save(str(path))
     scan.close()
 
+    given = tessdata if prefix == "folder" else os.path.dirname(tessdata)
+    monkeypatch.setenv("TESSDATA_PREFIX", given)
+    if switch is not None:
+        monkeypatch.setenv("ENABLE_OCR", switch)
     assert chunk_file(path, ocr="never") == []
-    monkeypatch.setenv("TESSDATA_PREFIX", tessdata)
+    assert os.environ["TESSDATA_PREFIX"] == given
     chunks = chunk_file(path, ocr="always", ocr_languages="eng")
+    assert os.environ["TESSDATA_PREFIX"] == tessdata
     assert chunks
     assert [c.page for c in chunks] == [0] * len(chunks)
     text = " ".join(" ".join(c.text for c in chunks).lower().split())

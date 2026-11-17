@@ -16,8 +16,12 @@ dependencies = ["qdrant-client", "numpy"]
 [project.optional-dependencies]
 onnx = ["fastembed"]
 torch = ["sentence-transformers"]
+# chunknorris is bounded because the text of a chunk determines the id of its point: a release
+# that cuts documents differently would, on re-ingestion, write new points and leave the old
+# ones behind. 1.3.7 and 1.5.0 were compared and gave identical chunks. Before raising the
+# upper bound, compare the chunks of the new minor version with those of 1.5.0 on real documents.
 # psutil: imported by chunknorris (1.5.0) without being declared in its dependencies.
-ingest = ["chunknorris", "markitdown[pptx]", "psutil"]
+ingest = ["chunknorris>=1.3.7,<1.6", "markitdown[pptx]", "psutil"]
 dev = ["pytest>=8.3", "ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]
