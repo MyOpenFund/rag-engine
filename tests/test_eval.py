@@ -1184,3 +1184,16 @@ def test_the_report_reads_the_resampling_parameters():
     few = report_of(results, bootstrap_resamples=1)
     assert few.headline.intervals["hit_at_1"][0] == few.headline.intervals["hit_at_1"][1]
     assert " [0." in format_report(default) and " [0." not in format_report(report_of(results[:5]))
+
+
+def test_the_report_shown_in_the_documentation_is_the_one_of_the_fixture(store, questions):
+    from pathlib import Path
+
+    report = evaluate(
+        questions, collection=COLLECTION, store=store, embedder=fixture_embedder(), interval_min_documents=4
+    )
+    shown = format_report(report).split("\n\n")[1]
+    assert shown.startswith(" ") and "headline" in shown and "[0.75, 1.00]" in shown
+    root = Path(__file__).resolve().parent.parent
+    for name in ("README.md", "eval/README.md"):
+        assert shown in (root / name).read_text(encoding="utf-8"), name

@@ -37,8 +37,8 @@ The package root exposes only `__version__`. Everything else is imported from it
 | `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE`, `ModelIntegrityError`, `ModelDownloadError` |
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
-| `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `QUERY_NORMALIZATION` |
-| `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `EvalError` |
+| `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `is_searchable`, `QUERY_NORMALIZATION` |
+| `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `Means`, `EvalError`, `DEFAULT_K`, `DEFAULT_CHUNK_LIMIT`, `DEFAULT_BOOTSTRAP_RESAMPLES`, `DEFAULT_INTERVAL_MIN_DOCUMENTS`, `BOOTSTRAP_SEED`, `INTERVAL_LEVEL` |
 | `rag_engine.cli` | `main` (the `rag-engine` command) |
 | `rag_engine.errors` | `RagEngineError` |
 
@@ -297,19 +297,26 @@ rag-engine eval --questions eval/known_item_v1.jsonl --collection documents \
 | Option | Meaning |
 |---|---|
 | `--questions FILE` | The question file (JSON Lines). Required. |
-| `--collection NAME` | The Qdrant collection to search. Required; it must exist, with vectors of the dimension of the model. |
+| `--collection NAME` | The Qdrant collection to search. Required; it must exist, with one unnamed vector of the dimension of the model (`RAG_ENGINE_DIM`). |
 | `--k N` | Number of documents the metrics look at. Default 10. |
 | `--chunk-limit N` | Number of chunks asked to the search per question. Default 50; at most `RAG_ENGINE_SEARCH_MAX_LIMIT`. |
 | `--backend torch\|onnx` | Embedding backend. Default: `RAG_ENGINE_BACKEND`. |
 | `--output FILE` | Also write the full report as JSON: parameters, metrics, every question with its first documents. |
-| `--fail-under-hit-at-k X` | Exit with code 1 when the overall hit@k is below `X` (between 0 and 1). |
+| `--fail-under-hit-at-k X` | Exit with code 1 when the **headline** hit@k is below `X` (between 0 and 1): the hit@k of the kinds of question asked without filters, averaged per document. Not the pooled mean of all questions. |
+| `--bootstrap-resamples N` | Number of times the documents are drawn again for the 95% intervals. Default 1000. |
+| `--allow-empty` | Run even when the collection holds none of the expected documents. Without it, that is an error (exit code 2). |
 
-The command is the one place of the engine that reads the settings by itself (`Settings.from_env()`; a `.env` file is not read). It prints the report on the standard output. Exit codes: **0** when the evaluation ran, **1** when `--fail-under-hit-at-k` is given and not met, **2** when the evaluation could not run to its end (bad arguments or settings, an unusable question file, an unreachable server or a refused key, a missing collection, a missing embedding backend, a failure midway). `rag-engine --version` prints the version.
+The command is the one place of the engine that reads the settings by itself (`Settings.from_env()`; a `.env` file is not read). It prints the report on the standard output. Exit codes: **0** when the evaluation ran, **1** when `--fail-under-hit-at-k` is given and not met, **2** when the evaluation could not run to its end (bad arguments or settings, an unusable question file, an unreachable server or a refused key, a missing collection, a collection of another dimension or with named vectors, a collection that holds none of the expected documents, a missing embedding backend, a failure midway). `rag-engine --version` prints the version.
 
-**The question file** is JSON Lines, one question per line: `id` (unique), `question`, `expected_doc_ids` (the `doc_id` of every document that answers it, at least one), and optionally `filters` (an object with the field names and the rules of `SearchFilters`), `kind` and `tags` (labels the report groups by), `language` and `rationale` (kept, not used). It is checked strictly when read: a duplicate id, an empty `expected_doc_ids`, an unknown field or filter, a bad date raise an `EvalError` naming the line. Two files are kept under [`eval/`](eval/README.md):
+What is cheap is checked before the embedding model is loaded: the question file, the server, the collection and the dimension of its vectors against `RAG_ENGINE_DIM`, then the presence of the expected documents. A collection in which none of them is found is almost always the wrong collection, so the command stops there instead of printing an empty report and exiting with 0; `--allow-empty` runs it all the same, with a warning.
 
-- `eval/known_item_v1.jsonl`: 833 automatic questions that ask for a document by its title, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`, which never states a date more precisely than the manifest knows it.
-- `eval/analytical_v1.jsonl`: questions on the content of the documents, written by hand; the file is added once its questions are validated.
+**The question file** is JSON Lines, one question per line: `id` (unique), `question`, `expected_doc_ids` (the `doc_id` of every document that answers it, at least one), and optionally `filters` (an object with the field names and the rules of `SearchFilters`), `kind` and `tags` (labels the report groups by), `language` and `rationale` (kept, not used). It is checked strictly when read: a duplicate id, an empty `expected_doc_ids`, an unknown field or filter, a bad date, a question that holds nothing to search for once put in NFKD raise an `EvalError` naming the line. One question file is kept under [`eval/`](eval/README.md):
+
+- `eval/known_item_v1.jsonl`: 797 automatic questions that ask for a document by its title or its catalogue label, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`. The words follow what a doc type is at each bank, a date is never stated more precisely than the manifest knows it nor presented as a meeting date when it is a publication date, and a question expects every document that holds the text asked for (the ECB publishes its decision and its statement a second time as one combined document). [`eval/README.md`](eval/README.md) has the tables and the evidence.
+
+A second file, `eval/analytical_v1.jsonl`, with questions on the content of the documents written by hand, is to come: it does not exist yet, and is added once its questions are validated.
+
+How to read the numbers of the known-item batch: it is a stratified sample, 12 documents per (bank, doc type) cell, so its averages weigh the 18 cells equally and are not weighted like the corpus; and all the documents are English, so its French questions measure cross-lingual retrieval.
 
 **Scoring is done on documents.** The search returns chunks, and several may come from one document, while an expected answer is a document. For each question the search is asked for `chunk_limit` chunks, which are collapsed into documents: a document takes the place and the score of its best chunk. The metrics look at the first `k` documents of that ranking:
 
@@ -320,7 +327,29 @@ The command is the one place of the engine that reads the settings by itself (`S
 | MRR | Mean of `1 / rank` of the best-placed expected document; a rank beyond `k` counts for 0. |
 | recall@k | Mean share of the expected documents found among the first `k`. |
 
-They are given overall, per `kind` and per tag. The questions without any expected document among the first `k` are listed as **misses**, with the three best documents returned and their titles.
+**The report.** One line per `kind`, then the headline, then all questions pooled, then one line per tag:
+
+```
+                  questions  documents  hit@1              hit@10             MRR                recall@10
+kind: filtered *          5          6  0.83 [0.50, 1.00]  0.83 [0.50, 1.00]  0.83 [0.50, 1.00]  0.67
+kind: second *            1          1  0.00               1.00               0.50               1.00       (few documents)
+kind: verbatim            6          4  0.92 [0.75, 1.00]  1.00 [1.00, 1.00]  0.96 [0.88, 1.00]  1.00
+headline                  6          4  0.92 [0.75, 1.00]  1.00 [1.00, 1.00]  0.96 [0.88, 1.00]  1.00
+overall (pooled)         12         11  0.75               0.92               0.83               0.88
+```
+
+(The test fixture of `eval/fixtures/`, with the minimum number of documents for an interval lowered to 4. No measurement of the production collection is recorded here.)
+
+- Every line gives the number of questions and of **distinct expected documents**. The lines of the kinds, of the headline and of the tags are **per-document means**: the questions that expect one document are averaged first, then the documents, because the questions of one document are correlated.
+- `[low, high]` is a 95% interval of that mean, from 1000 resamples of the documents with a fixed seed (`--bootstrap-resamples`; standard library `random`, so the same results always give the same interval). A line with fewer than 20 documents gets none and is marked `(few documents)`. The kinds and the headline have intervals, the tags do not.
+- **`headline`** is the kinds asked without filters, per document. It is what `--fail-under-hit-at-k` looks at.
+- A kind marked `*` is asked with filters and kept out of the headline: where the filters leave fewer than `k` documents, hit@k and recall@k are true by construction, and only hit@1 and MRR are informative.
+- **`overall (pooled)`** is the plain mean over all scored questions, every kind, each question counted once. It is kept, and labelled as pooled in the JSON as well; it is not the headline.
+- Rates are printed to two decimals, which is what their uncertainty allows; the JSON report holds the exact values.
+
+The questions without any expected document among the first `k` are listed as **misses**, with the three best documents returned and their titles.
+
+**Equal scores.** Two chunks with the same text have exactly the same score, and Qdrant returns them in an order that can change from one request to the next. The chunks returned are put in one order (score, then `doc_id`, then `chunk_number`) before they become documents, so the same chunks always give the same ranking. A question whose hit@1 or hit@k hangs on the order of equal scores is marked `tied_at_decision`, and the report counts them. Ties at the edge of the chunk budget stay outside the harness: which of the tied chunks Qdrant returns is its choice.
 
 `chunk_limit` chunks may hold fewer than `k` documents, when the best chunks come from a few long documents. The report does not hide it: it counts the questions for which fewer than `k` documents were ranked and, among them, those whose search returned the whole chunk budget, for which a larger `--chunk-limit` could have ranked more. The budget is bounded by the search maximum (`RAG_ENGINE_SEARCH_MAX_LIMIT`, default 50), so that the evaluation measures the search a caller gets; raise both to look deeper.
 
@@ -334,7 +363,10 @@ from rag_engine.eval import evaluate, format_report, load_questions
 questions = load_questions("eval/known_item_v1.jsonl")
 report = evaluate(questions, collection="documents", store=store, embedder=embedder, k=10, chunk_limit=50)
 print(format_report(report))
-report.overall.hit_at_k  # also .hit_at_1, .mrr, .recall_at_k; report.by_kind, report.by_tag
+report.headline.per_document.hit_at_k  # the headline; also .hit_at_1, .mrr, .recall_at_k
+report.headline.intervals  # {"hit_at_1": (low, high), "hit_at_k": ..., "mrr": ...}, or None with few documents
+report.by_kind, report.by_tag, report.overall  # an Aggregate each; overall is pooled over the questions
+report.tied_at_decision  # questions whose hit@1 or hit@k hangs on the order of equal scores
 report.misses  # the questions without an expected document among the first k
 report.to_json()  # everything, as JSON
 ```
@@ -403,7 +435,7 @@ The tests that parse real documents need the `ingest` extra (`pip install -e ".[
 
 Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
-The default suite also runs the evaluation harness end to end, in qdrant-client's local mode, on the fixture of `eval/fixtures/` (12 documents, 10 questions with known answers), and checks the committed question file `eval/known_item_v1.jsonl`.
+The default suite also runs the evaluation harness end to end, in qdrant-client's local mode, on the fixture of `eval/fixtures/` (13 documents, 13 questions with known answers), and checks the committed question file `eval/known_item_v1.jsonl`.
 
 Two test markers are deselected by default:
 
