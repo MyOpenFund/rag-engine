@@ -23,6 +23,7 @@ def test_version():
         "rag_engine.store",
         "rag_engine.embedding",
         "rag_engine.chunking",
+        "rag_engine.ingest",
     ],
 )
 def test_import_pulls_no_heavy_dependency(modules):

@@ -58,6 +58,46 @@ The API key is never printed: `repr()` and `str()` of a `Settings` show `qdrant_
 
 `Settings(...)` can also be built directly with keyword arguments. The same range checks apply, but nothing is parsed or converted: integers must be `int` (not `bool`, `float` or a numeric string), `qdrant_https` must be a `bool`, `backend` must be exactly `"torch"` or `"onnx"`, and a prefix string is the prefix as it is (`""` for no prefix). An empty `qdrant_host` or `model_name` is refused; a blank `qdrant_api_key` or `model_cache` becomes `None`. A wrong type raises `ConfigError`.
 
+## Ingesting a document
+
+`ingest_document` (in `rag_engine.ingest`, extra `ingest`) chunks one file, embeds its chunks and writes one point per chunk. The collection is ensured once per run, by the caller; `ingest_document` never creates or checks it.
+
+```python
+from rag_engine.config import Settings
+from rag_engine.embedding import make_embedder
+from rag_engine.ingest import ingest_document
+from rag_engine.store import QdrantStore
+
+settings = Settings.from_env()
+store = QdrantStore(settings=settings)
+embedder = make_embedder(settings)
+
+store.ensure_collection("central-bank-e5b-v1", embedder.dim)  # once, not per document
+
+result = ingest_document(
+    "reports/2025-10-30-statement.pdf",
+    "ecb/monetary-policy-statement/2025-10-30",  # doc_id
+    {"corpus": "central-bank", "source_code": "ecb", "date": "2025-10-30", "year": 2025},
+    collection="central-bank-e5b-v1",
+    store=store,
+    embedder=embedder,
+    ocr_languages=settings.ocr_languages,
+)
+print(result.chunks, result.pages, result.empty)
+```
+
+What it guarantees:
+
+- **Deterministic ids.** The id of a point depends on the `doc_id`, the page the chunk starts on and its position in the document, nothing else. Ingesting the same document again overwrites its points; it never adds duplicates.
+- **One ingestion date per document.** Every point of a document carries the same `ingestion_date`, the local time of the ingestion as an ISO string (or the `ingestion_date` argument, for a replay or a test).
+- **Nothing written for an empty document.** A file with no extractable text gives `IngestResult(chunks=0, pages=0, empty=True)`; the embedder and the store are not called. It is not an error.
+- **Errors propagate.** Nothing is caught: an unsupported format, a parser error, an embedding error or a Qdrant error reaches the caller unchanged, and the caller decides what a failed document means. A store error carries the number of points written before it in `points_written`; a failed write is not undone, and ingesting the document again repairs it.
+- **Checked before any work.** A blank `doc_id` or `collection`, an unusable `batch_size`, or metadata that sets a reserved payload key (`doc_id`, `filename`, `chunk_number`, `ingestion_date`, `text`, `page`) raises `ValueError` before the file is read.
+
+`IngestResult.pages` counts the distinct pages chunks start on (0 for a format without pages). The other arguments are `ocr`, `ocr_languages` and `chunking_options` (see below), and `batch_size` (points per write; default `RAG_ENGINE_BATCH_SIZE`).
+
+The points are the ones the previous pipeline wrote: `tests/fixtures/golden/` holds points captured from it for two documents, and the tests require the same ids, payloads and vectors.
+
 ## Supported formats and OCR
 
 `chunk_file(path, *, ocr="auto", ocr_languages="eng", options=None)` (in `rag_engine.chunking`, extra `ingest`) reads one file and returns its chunks in document order, each with its `text` and its `page`. The format is chosen by the file extension, whatever its case; `SUPPORTED_EXTENSIONS` lists them.
