@@ -24,7 +24,7 @@ from .embedding import Embedder
 from .errors import RagEngineError
 from .store import QdrantStore
 
-__all__ = ["QUERY_NORMALIZATION", "Hit", "SearchError", "SearchFilters", "search"]
+__all__ = ["QUERY_NORMALIZATION", "Hit", "SearchError", "SearchFilters", "is_searchable", "search"]
 
 #: The Unicode form a query is put in before it is embedded (``normalize_query=True``): the
 #: form the chunker stores, and therefore embeds, the text of the chunks in.
@@ -63,8 +63,23 @@ def _not_encodable(name: str, verb: str, text: str) -> SearchError:
     )
 
 
-def _searchable(text: str) -> bool:
-    """Whether ``text`` holds a letter, a number, a symbol or a punctuation mark."""
+def is_searchable(text: str, *, normalized: bool = False) -> bool:
+    """Whether ``text`` holds something to search for: the rule :func:`search` applies to a query.
+
+    True when ``text`` holds at least one letter, number, symbol or punctuation mark (Unicode
+    general categories L, N, S and P), in any script; false for a string made only of
+    combining marks, of invisible or control characters and of spaces, and for an empty one.
+
+    With ``normalized=True`` the question is asked of ``text`` put in
+    :data:`QUERY_NORMALIZATION`, the form a query is embedded in when ``normalize_query`` is
+    on: the spacing form of a diacritic (``"\u00a8"``, ``"\u00b4"``) is a symbol as given and
+    becomes a space and a combining mark. :func:`search` refuses a query unless both
+    ``is_searchable(query)`` and, with ``normalize_query=True``,
+    ``is_searchable(query, normalized=True)`` hold; a caller that holds many queries can
+    check them all before the first search.
+    """
+    if normalized:
+        text = unicodedata.normalize(QUERY_NORMALIZATION, text)
     return any(unicodedata.category(character)[0] in "LNSP" for character in text)
 
 
@@ -376,7 +391,7 @@ def search(
         raise SearchError(f"query must be a non-blank string, got {query!r}")
     if not _encodable(query):
         raise _not_encodable("query", "is", query)
-    if not _searchable(query):
+    if not is_searchable(query):
         raise SearchError(
             "the query has no searchable character: it holds no letter, number, symbol or punctuation "
             f"mark, only combining marks, invisible or control characters and spaces, got {query!a}"
@@ -395,7 +410,7 @@ def search(
         raise SearchError(f"limit {wanted} is above the maximum of {maximum}: ask for at most {maximum} hits")
 
     text = unicodedata.normalize(QUERY_NORMALIZATION, query) if normalize_query else query
-    if not _searchable(text):
+    if not is_searchable(text):
         # The spacing form of a diacritic is a symbol; its normalised form is a space and a mark.
         raise SearchError(
             f"the query has no searchable character once put in {QUERY_NORMALIZATION}: it holds only "

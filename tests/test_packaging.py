@@ -92,7 +92,14 @@ PUBLIC_NAMES = {
         "ocr_available",
     },
     "rag_engine.ingest": {"IngestResult", "ingest_document"},
-    "rag_engine.search": {"QUERY_NORMALIZATION", "Hit", "SearchError", "SearchFilters", "search"},
+    "rag_engine.search": {
+        "QUERY_NORMALIZATION",
+        "Hit",
+        "SearchError",
+        "SearchFilters",
+        "is_searchable",
+        "search",
+    },
     "rag_engine.eval": {
         "DEFAULT_CHUNK_LIMIT",
         "DEFAULT_K",

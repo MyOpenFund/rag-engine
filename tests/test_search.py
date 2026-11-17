@@ -31,7 +31,15 @@ from rag_engine.config import Settings
 from rag_engine.embedding import FakeEmbedder
 from rag_engine.errors import RagEngineError
 from rag_engine.schema import point_id
-from rag_engine.search import QUERY_NORMALIZATION, Hit, SearchError, SearchFilters, _qdrant_filter, search
+from rag_engine.search import (
+    QUERY_NORMALIZATION,
+    Hit,
+    SearchError,
+    SearchFilters,
+    _qdrant_filter,
+    is_searchable,
+    search,
+)
 from rag_engine.store import QdrantAuthError, QdrantStore
 
 COLLECTION = "search-test"
@@ -946,3 +954,28 @@ def test_store_query_refuses_a_limit_that_is_not_a_positive_integer(bad):
     with pytest.raises(ValueError, match="limit must be an integer >= 1"):
         QdrantStore(client=client).query(COLLECTION, [0.0], limit=bad)
     assert client.requests == []
+
+
+# ---------------------------------------------------------------------------
+# is_searchable: the rule of the query, for a caller that checks its queries beforehand
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("text", ["2016", "\u20ac", "$AAPL", "???", "caf\u00e9", "\u65e5\u672c"], ids=ascii)
+def test_is_searchable_accepts_what_search_accepts(text):
+    assert is_searchable(text) is True
+    assert is_searchable(text, normalized=True) is True
+
+
+@pytest.mark.parametrize("text", [*UNSEARCHABLE_QUERIES, "", "   "], ids=ascii)
+def test_is_searchable_refuses_what_search_refuses(text):
+    assert is_searchable(text) is False
+    assert is_searchable(text, normalized=True) is False
+
+
+@pytest.mark.parametrize("mark", ["\u00a8", "\u00b4", "\u309b", " \u00b8\u02dc "], ids=ascii)
+def test_is_searchable_can_look_at_the_normalised_form(store, embedder, mark):
+    # Searchable as given, not once put in NFKD: the search refuses it unless normalize_query is off.
+    assert is_searchable(mark) is True
+    assert is_searchable(mark, normalized=True) is False
+    with pytest.raises(SearchError):
+        run(store, embedder, query=mark)
+    assert run(store, embedder, query=mark, normalize_query=False)

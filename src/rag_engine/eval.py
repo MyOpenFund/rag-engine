@@ -37,7 +37,7 @@ from . import __version__
 from .config import Settings
 from .embedding import Embedder
 from .errors import RagEngineError
-from .search import QUERY_NORMALIZATION, SearchError, SearchFilters, _searchable, search
+from .search import QUERY_NORMALIZATION, SearchError, SearchFilters, is_searchable, search
 from .store import QdrantStore
 
 __all__ = [
@@ -160,7 +160,7 @@ class Question:
             raise EvalError(f"'id' must be a non-blank string, got {self.id!r}")
         if not isinstance(self.question, str) or not self.question.strip():
             raise EvalError(f"'question' must be a non-blank string, got {self.question!r}")
-        if not _searchable(self.question):
+        if not is_searchable(self.question):
             raise EvalError(f"'question' has no searchable character, got {self.question!a}")
         expected = _strings("expected_doc_ids", self.expected_doc_ids, allow_empty=False)
         object.__setattr__(self, "expected_doc_ids", expected)
