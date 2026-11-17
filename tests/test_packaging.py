@@ -236,23 +236,33 @@ PUBLIC_NAMES = {
         "search",
     },
     "rag_engine.eval": {
+        "BEHAVIORS",
         "BOOTSTRAP_SEED",
+        "DEFAULT_BEHAVIOR",
         "DEFAULT_BOOTSTRAP_RESAMPLES",
         "DEFAULT_CHUNK_LIMIT",
         "DEFAULT_INTERVAL_MIN_DOCUMENTS",
         "DEFAULT_K",
+        "DEFAULT_SCORE_LEVELS",
         "FILTER_FIELDS",
         "INTERVAL_LEVEL",
         "QUESTION_FIELDS",
+        "UNFILTERED_SUFFIX",
+        "UNFILTERED_TAG",
+        "Abstention",
         "Aggregate",
+        "EssentialAggregate",
+        "EssentialMeans",
         "EvalError",
         "EvalReport",
+        "FilterEffect",
         "Means",
         "NotInCollection",
         "Question",
         "QuestionResult",
         "QuestionSet",
         "RankedDocument",
+        "TopScores",
         "evaluate",
         "format_report",
         "load_questions",
@@ -350,7 +360,7 @@ def test_the_sdist_keeps_the_evaluation_files_and_the_wheel_holds_the_package_on
     root = PYPROJECT.parent
     for name in ("README.md", "make_known_item.py", "known_item_v1.jsonl"):
         assert (root / "eval" / name).is_file(), name
-    for name in ("corpus.json", "questions.jsonl"):
+    for name in ("corpus.json", "questions.jsonl", "questions_v2.jsonl"):
         assert (root / "eval" / "fixtures" / name).is_file(), name
 
 

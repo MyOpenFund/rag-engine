@@ -17,6 +17,25 @@ it is. ``kind`` and ``tags`` only group the results in the report; ``language`` 
 ``rationale`` are kept and not used. Any other field is refused: a misspelt ``filters``
 must not be ignored silently.
 
+A question may say more (the second version of the format; a file of the first one reads
+and scores as before)::
+
+    {"id": "an-21", "question": "How did the vote on the rate cut split?",
+     "expected_behavior": "answer",
+     "essential_ids": ["a5b8ba5e477ad19a"], "acceptable_ids": ["0c1d2e3f4a5b6c7d"],
+     "expected_doc_ids": ["a5b8ba5e477ad19a", "0c1d2e3f4a5b6c7d"],
+     "filters": {"source_codes": ["gb"]}, "run_unfiltered": true,
+     "must_include": ["5-4"], "must_not_include": ["unanimous"],
+     "kind": "analytical", "tags": ["votes"], "language": "en", "rationale": "..."}
+
+``essential_ids`` and ``acceptable_ids`` split the expected documents into those the answer
+needs and those that are merely relevant; ``expected_doc_ids`` may then be left out.
+``expected_behavior`` is ``answer``, ``correct_premise`` or ``abstain``, and only a question
+that abstains may expect no document. ``run_unfiltered`` asks for a second run without the
+filters. ``must_include`` and ``must_not_include`` describe the right answer: they are kept
+for a scorer of answers and are not read here, because the engine returns documents and
+writes no answer.
+
 Scoring is done on documents, not on chunks (:func:`evaluate` says how), and a question
 whose expected documents are not in the collection at all is reported apart instead of
 being counted as a failure of the search.
@@ -39,6 +58,7 @@ import json
 import math
 import os
 import random
+import statistics
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import Any, overload
@@ -51,23 +71,33 @@ from .search import QUERY_NORMALIZATION, SearchError, SearchFilters, is_searchab
 from .store import QdrantStore
 
 __all__ = [
+    "BEHAVIORS",
     "BOOTSTRAP_SEED",
+    "DEFAULT_BEHAVIOR",
     "DEFAULT_BOOTSTRAP_RESAMPLES",
     "DEFAULT_CHUNK_LIMIT",
     "DEFAULT_INTERVAL_MIN_DOCUMENTS",
     "DEFAULT_K",
+    "DEFAULT_SCORE_LEVELS",
     "FILTER_FIELDS",
     "INTERVAL_LEVEL",
     "QUESTION_FIELDS",
+    "UNFILTERED_SUFFIX",
+    "UNFILTERED_TAG",
+    "Abstention",
     "Aggregate",
+    "EssentialAggregate",
+    "EssentialMeans",
     "EvalError",
     "EvalReport",
+    "FilterEffect",
     "Means",
     "NotInCollection",
     "Question",
     "QuestionResult",
     "QuestionSet",
     "RankedDocument",
+    "TopScores",
     "evaluate",
     "format_report",
     "load_questions",
@@ -86,6 +116,20 @@ BOOTSTRAP_SEED = 1
 #: Level of the intervals: the 2.5th and the 97.5th percentiles of the resampled means.
 INTERVAL_LEVEL = 0.95
 
+#: What a question expects of the answer: ``answer`` (the documents answer it), ``correct_premise``
+#: (its premise is false, and the documents show it), ``abstain`` (the collection does not hold the
+#: information). Only the documents are scored here; the behaviour groups the results.
+BEHAVIORS: tuple[str, ...] = ("answer", "correct_premise", "abstain")
+#: The behaviour of a question that states none.
+DEFAULT_BEHAVIOR = "answer"
+#: The scores the documents returned for an abstention question are counted against, unless
+#: ``score_levels`` is given. Cosine similarities; which levels tell anything depends on the model.
+DEFAULT_SCORE_LEVELS: tuple[float, ...] = (0.7, 0.75, 0.8, 0.85, 0.9)
+#: What is added to the id and to the kind of a question for its second run, without its filters.
+UNFILTERED_SUFFIX = "#unfiltered"
+#: The tag that second run carries, besides the tags of its question.
+UNFILTERED_TAG = "unfiltered-rerun"
+
 #: The fields a filter of the question file may hold: those of ``SearchFilters``.
 FILTER_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SearchFilters))
 #: The fields a question of the question file may hold.
@@ -98,27 +142,32 @@ QUESTION_FIELDS: tuple[str, ...] = (
     "tags",
     "language",
     "rationale",
+    "expected_behavior",
+    "essential_ids",
+    "acceptable_ids",
+    "must_include",
+    "must_not_include",
+    "run_unfiltered",
 )
 
-_REQUIRED = ("id", "question", "expected_doc_ids")
+_REQUIRED = ("id", "question")
 _NO_KIND = "(none)"
 _MISS_DOCUMENTS = 3
 _METRICS = ("hit_at_1", "hit_at_k", "mrr", "recall_at_k")
 _INTERVAL_METRICS = ("hit_at_1", "hit_at_k", "mrr")
+_ESSENTIAL_METRICS = ("essential_recall_at_k", "all_essential_at_k")
 
 
 class EvalError(RagEngineError, ValueError):
     """A question, a question file or an argument of the evaluation cannot be used as it is."""
 
 
-def _strings(name: str, value: object, *, allow_empty: bool) -> tuple[str, ...]:
-    """A list field of a question as a tuple of non-blank strings; ``EvalError`` otherwise."""
+def _strings(name: str, value: object) -> tuple[str, ...]:
+    """A list field of a question as a tuple of distinct non-blank strings; ``EvalError`` otherwise."""
     if isinstance(value, (str, bytes)):
         raise EvalError(f"'{name}' must be a list of strings, got the single string {value!r}")
     if not isinstance(value, (list, tuple)):
         raise EvalError(f"'{name}' must be a list of strings, got {type(value).__name__}")
-    if not value and not allow_empty:
-        raise EvalError(f"'{name}' is empty: a question names at least one document that answers it")
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, str) or not item.strip():
@@ -156,7 +205,11 @@ class Question:
     ``question``
         The text given to the search: a non-blank string with something to search for.
     ``expected_doc_ids``
-        The ``doc_id`` of every document that answers the question: at least one, none twice.
+        The ``doc_id`` of every document that answers the question, none twice: the essential
+        and the acceptable ones together. At least one, unless ``expected_behavior`` is
+        ``"abstain"``. It may be left out when ``essential_ids`` or ``acceptable_ids`` is given
+        (it is then the first followed by the second); given with them, it must name the same
+        documents, in any order.
     ``filters``
         The :class:`rag_engine.search.SearchFilters` the search runs with, or ``None``.
     ``kind``, ``tags``
@@ -165,6 +218,22 @@ class Question:
         Free text, kept and not used.
     ``line``
         Line of the question in its file, counted from 1; ``None`` for a question built in code.
+    ``expected_behavior``
+        One of :data:`BEHAVIORS`; ``"answer"`` unless stated. Another label the report groups
+        by. A question that abstains and expects no document is not scored: it is searched and
+        reported apart (:class:`Abstention`).
+    ``essential_ids``, ``acceptable_ids``
+        The documents without which the question cannot be answered, and those that are
+        relevant without being necessary: two lists without a common document. Both are
+        ``None`` for a question that does not say which of its documents are essential (it
+        gives ``expected_doc_ids`` only); when one is given the other is empty unless given too.
+    ``must_include``, ``must_not_include``
+        Short texts a right answer holds, and typical false statements it must not hold. Kept
+        for a scorer of answers: the engine returns documents and writes no answer, so nothing
+        here reads them.
+    ``run_unfiltered``
+        ``True`` to score the question a second time without its filters. Refused on a
+        question that carries none.
 
     The fields are checked when the question is built (``EvalError``); lists are kept as
     tuples.
@@ -172,13 +241,19 @@ class Question:
 
     id: str
     question: str
-    expected_doc_ids: tuple[str, ...]
+    expected_doc_ids: tuple[str, ...] | None = None
     filters: SearchFilters | None = None
     kind: str | None = None
     tags: tuple[str, ...] = ()
     language: str | None = None
     rationale: str | None = None
     line: int | None = None
+    expected_behavior: str = DEFAULT_BEHAVIOR
+    essential_ids: tuple[str, ...] | None = None
+    acceptable_ids: tuple[str, ...] | None = None
+    must_include: tuple[str, ...] = ()
+    must_not_include: tuple[str, ...] = ()
+    run_unfiltered: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -187,28 +262,91 @@ class Question:
             raise EvalError(f"'question' must be a non-blank string, got {self.question!r}")
         if not is_searchable(self.question):
             raise EvalError(f"'question' has no searchable character, got {self.question!a}")
-        expected = _strings("expected_doc_ids", self.expected_doc_ids, allow_empty=False)
-        object.__setattr__(self, "expected_doc_ids", expected)
+        if not isinstance(self.expected_behavior, str) or self.expected_behavior not in BEHAVIORS:
+            raise EvalError(
+                f"'expected_behavior' must be one of {', '.join(BEHAVIORS)}, got {self.expected_behavior!r}"
+            )
+        self._check_documents()
         if self.filters is not None and not isinstance(self.filters, SearchFilters):
             raise EvalError(f"'filters' must be a SearchFilters or None, got {type(self.filters).__name__}")
         if self.kind is not None and (not isinstance(self.kind, str) or not self.kind.strip()):
             raise EvalError(f"'kind' must be a non-blank string, got {self.kind!r}")
-        object.__setattr__(self, "tags", _strings("tags", self.tags, allow_empty=True))
+        for name in ("tags", "must_include", "must_not_include"):
+            object.__setattr__(self, name, _strings(name, getattr(self, name)))
         for name in ("language", "rationale"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, str):
                 raise EvalError(f"'{name}' must be a string, got {value!r}")
+        if not isinstance(self.run_unfiltered, bool):
+            raise EvalError(f"'run_unfiltered' must be true or false, got {self.run_unfiltered!r}")
+        if self.run_unfiltered and _filters_dict(self.filters) is None:
+            raise EvalError(
+                "'run_unfiltered' is true on a question without filters: there is no filter to remove"
+            )
+
+    def _check_documents(self) -> None:
+        """Check the three lists of documents against each other, and store them as tuples."""
+        expected = self.expected_doc_ids
+        essential, acceptable = self.essential_ids, self.acceptable_ids
+        graded = essential is not None or acceptable is not None
+        if graded:
+            essential = _strings("essential_ids", essential if essential is not None else ())
+            acceptable = _strings("acceptable_ids", acceptable if acceptable is not None else ())
+            both = [doc_id for doc_id in essential if doc_id in acceptable]
+            if both:
+                raise EvalError(
+                    f"'essential_ids' and 'acceptable_ids' both name {', '.join(map(repr, both))}: "
+                    "a document is one or the other"
+                )
+            together = essential + acceptable
+            if expected is None:
+                expected = together
+            else:
+                expected = _strings("expected_doc_ids", expected)
+                lacks = [doc_id for doc_id in together if doc_id not in expected]
+                adds = [doc_id for doc_id in expected if doc_id not in together]
+                if lacks or adds:
+                    parts = []
+                    if lacks:
+                        parts.append(f"it lacks {', '.join(map(repr, lacks))}")
+                    if adds:
+                        parts.append(f"it adds {', '.join(map(repr, adds))}")
+                    raise EvalError(
+                        "'expected_doc_ids' must name the documents of 'essential_ids' and "
+                        f"'acceptable_ids' together, in any order: {' and '.join(parts)} "
+                        "(it may also be left out)"
+                    )
+        elif expected is None:
+            raise EvalError("'expected_doc_ids' is missing")
+        else:
+            expected = _strings("expected_doc_ids", expected)
+        if not expected and self.expected_behavior != "abstain":
+            name = "'essential_ids' and 'acceptable_ids' are" if graded else "'expected_doc_ids' is"
+            raise EvalError(
+                f"{name} empty: a question names at least one document that answers it, unless its "
+                "'expected_behavior' is 'abstain'"
+            )
+        object.__setattr__(self, "expected_doc_ids", expected)
+        object.__setattr__(self, "essential_ids", essential if graded else None)
+        object.__setattr__(self, "acceptable_ids", acceptable if graded else None)
 
     def to_dict(self) -> dict[str, Any]:
         """The question as its line of the question file: the fields that are set."""
-        result: dict[str, Any] = {
-            "id": self.id,
-            "question": self.question,
-            "expected_doc_ids": list(self.expected_doc_ids),
-        }
+        result: dict[str, Any] = {"id": self.id, "question": self.question}
+        if self.expected_behavior != DEFAULT_BEHAVIOR:
+            result["expected_behavior"] = self.expected_behavior
+        if self.essential_ids is not None and self.acceptable_ids is not None:
+            result["essential_ids"] = list(self.essential_ids)
+            result["acceptable_ids"] = list(self.acceptable_ids)
+        result["expected_doc_ids"] = list(self.expected_doc_ids or ())
         filters = _filters_dict(self.filters)
         if filters is not None:
             result["filters"] = filters
+        if self.run_unfiltered:
+            result["run_unfiltered"] = True
+        for name in ("must_include", "must_not_include"):
+            if getattr(self, name):
+                result[name] = list(getattr(self, name))
         if self.kind is not None:
             result["kind"] = self.kind
         if self.tags:
@@ -264,18 +402,34 @@ def _question_of(record: object) -> Question:
         filters = SearchFilters.from_mapping(filters)
         if _filters_dict(filters) is None:
             filters = None  # {} and a filter of nulls restrict nothing
-    for name in ("kind", "language", "rationale"):
+    for name in ("kind", "language", "rationale", "expected_behavior"):
         if record.get(name) is not None and not isinstance(record[name], str):
             raise EvalError(f"'{name}' must be a string, got {record[name]!r}")
+    rerun = record.get("run_unfiltered")
+    if rerun is not None and not isinstance(rerun, bool):
+        raise EvalError(f"'run_unfiltered' must be true or false, got {rerun!r}")
+    graded = record.get("essential_ids") is not None or record.get("acceptable_ids") is not None
+    if "expected_doc_ids" not in record and not graded:
+        raise EvalError("'expected_doc_ids' is missing")
+    if not graded and record["expected_doc_ids"] is None:
+        raise EvalError("'expected_doc_ids' must be a list of strings, got NoneType")
     question = Question(
         id=record["id"],
         question=record["question"],
-        expected_doc_ids=record["expected_doc_ids"],
+        expected_doc_ids=record.get("expected_doc_ids"),
         filters=filters,
         kind=record.get("kind"),
         tags=record["tags"] if record.get("tags") is not None else (),
         language=record.get("language"),
         rationale=record.get("rationale"),
+        expected_behavior=(
+            record["expected_behavior"] if record.get("expected_behavior") is not None else DEFAULT_BEHAVIOR
+        ),
+        essential_ids=record.get("essential_ids"),
+        acceptable_ids=record.get("acceptable_ids"),
+        must_include=record["must_include"] if record.get("must_include") is not None else (),
+        must_not_include=record["must_not_include"] if record.get("must_not_include") is not None else (),
+        run_unfiltered=bool(rerun),
     )
     _check_normalised(question)
     return question
@@ -300,7 +454,9 @@ def load_questions(path: str | os.PathLike[str]) -> QuestionSet:
     - ``question``: a non-blank string that holds something to search for, as given and
       once put in NFKD, the form the search embeds it in (an isolated accent such as
       ``"\u00b4"`` is a symbol as given, and a space and a combining mark in NFKD);
-    - ``expected_doc_ids``: a non-empty list of non-blank strings, none twice;
+    - ``expected_doc_ids``: a non-empty list of non-blank strings, none twice. It may be
+      empty when ``expected_behavior`` is ``"abstain"``, and left out when ``essential_ids``
+      or ``acceptable_ids`` is given;
     - ``filters`` (optional): an object whose keys are fields of
       :class:`rag_engine.search.SearchFilters` (:data:`FILTER_FIELDS`) and whose values
       follow its rules: lists of strings, never a bare string or an empty list; dates
@@ -308,14 +464,28 @@ def load_questions(path: str | os.PathLike[str]) -> QuestionSet:
       empty object, restrict nothing;
     - ``kind`` (optional string), ``tags`` (optional list of strings): labels the report
       groups by;
-    - ``language``, ``rationale`` (optional strings): kept, not used.
+    - ``language``, ``rationale`` (optional strings): kept, not used;
+    - ``expected_behavior`` (optional): ``"answer"`` (the default), ``"correct_premise"`` or
+      ``"abstain"``;
+    - ``essential_ids``, ``acceptable_ids`` (optional): lists of non-blank strings, none
+      twice, without a common document. When one of them is given, ``expected_doc_ids`` is
+      the two together: left out, it is the first followed by the second; given, it must
+      name exactly the same documents, in any order;
+    - ``must_include``, ``must_not_include`` (optional): lists of non-blank strings, none
+      twice; kept, not scored;
+    - ``run_unfiltered`` (optional): ``true`` or ``false``; ``true`` only on a question
+      whose ``filters`` restrict something.
 
     An optional field may be left out or null. Nothing is guessed or repaired. The first
     line that breaks a rule raises an :class:`EvalError` naming the file and the line number:
     text that is not JSON or not an object, a missing or unknown field, an unknown filter, a
     value of the wrong type, a bad date, an id already used (the error names the line of its
-    first use). A file without any question, and a file that is not UTF-8, are ``EvalError``
-    too. A file that cannot be read raises the ``OSError`` of the system.
+    first use), an ``expected_doc_ids`` that differs from the essential and acceptable
+    documents, a document both essential and acceptable, no expected document on a question
+    that does not abstain, ``run_unfiltered`` without filters, an id that is the id of another
+    question followed by ``#unfiltered`` when that question is run a second time. A file
+    without any question, and a file that is not UTF-8, are ``EvalError`` too. A file that
+    cannot be read raises the ``OSError`` of the system.
     """
     name = os.fspath(path)
     with open(name, "rb") as handle:
@@ -347,6 +517,13 @@ def load_questions(path: str | os.PathLike[str]) -> QuestionSet:
         questions.append(question)
     if not questions:
         raise EvalError(f"{name}: the file holds no question")
+    for question in questions:
+        derived = question.id + UNFILTERED_SUFFIX
+        if question.run_unfiltered and derived in first_use:
+            raise EvalError(
+                f"{name}, line {first_use[derived]}: the id {derived!r} is the one the second run of "
+                f"{question.id!r} (line {question.line}, 'run_unfiltered') is reported under"
+            )
     return QuestionSet(tuple(questions), path=name, sha256=hashlib.sha256(raw).hexdigest())
 
 
@@ -396,6 +573,28 @@ class QuestionResult:
     ``top_documents``
         The first ``k`` documents of the ranking, best first; the first three when ``k`` is
         smaller, since a miss is shown with the three best documents.
+    ``expected_behavior``, ``essential_ids``, ``acceptable_ids``, ``must_include``, ``must_not_include``
+        As the question gives them. The last two are carried for a scorer of answers and are
+        not scored.
+    ``essential_present``
+        Number of essential documents that are in the collection; ``None`` when the question
+        does not say which of its documents are essential.
+    ``essential_recall_at_k``
+        Share of these that are among the first ``k`` documents; ``None`` when there is none
+        (the question states no essential document, or none of them is in the collection).
+    ``all_essential_at_k``
+        Whether all of them are; ``None`` likewise.
+    ``essential_unreachable``
+        There are more of them than ``k``: ``all_essential_at_k`` is false and
+        ``essential_recall_at_k`` below 1 whatever the search returns.
+    ``rerun_of``
+        For the second run of a question, without its filters (``run_unfiltered``): the id of
+        the question. The result then carries the id and the kind of the question followed by
+        :data:`UNFILTERED_SUFFIX`, its tags and :data:`UNFILTERED_TAG`, and no filters.
+        ``None`` for a question scored as it is written.
+
+    ``rank``, ``hit_at_1``, ``hit_at_k`` and ``reciprocal_rank`` look at the best-placed
+    expected document, essential or acceptable: an acceptable document at rank 1 is a hit.
     """
 
     id: str
@@ -415,6 +614,16 @@ class QuestionResult:
     chunk_budget_exhausted: bool
     top_documents: tuple[RankedDocument, ...]
     tied_at_decision: bool = False
+    expected_behavior: str = DEFAULT_BEHAVIOR
+    essential_ids: tuple[str, ...] | None = None
+    acceptable_ids: tuple[str, ...] | None = None
+    must_include: tuple[str, ...] = ()
+    must_not_include: tuple[str, ...] = ()
+    essential_present: int | None = None
+    essential_recall_at_k: float | None = None
+    all_essential_at_k: bool | None = None
+    essential_unreachable: bool = False
+    rerun_of: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"id": self.id, "question": self.question}
@@ -440,6 +649,20 @@ class QuestionResult:
         ):
             result[name] = getattr(self, name)
         result["top_documents"] = [document.to_dict() for document in self.top_documents]
+        result["expected_behavior"] = self.expected_behavior
+        for name in ("essential_ids", "acceptable_ids"):
+            value = getattr(self, name)
+            result[name] = None if value is None else list(value)
+        result["must_include"] = list(self.must_include)
+        result["must_not_include"] = list(self.must_not_include)
+        for name in (
+            "essential_present",
+            "essential_recall_at_k",
+            "all_essential_at_k",
+            "essential_unreachable",
+            "rerun_of",
+        ):
+            result[name] = getattr(self, name)
         return result
 
     def _miss(self) -> dict[str, Any]:
@@ -473,6 +696,91 @@ class NotInCollection:
         if self.tags:
             result["tags"] = list(self.tags)
         return result
+
+
+@dataclass(frozen=True)
+class Abstention:
+    """What the search returned for a question that expects no document (``expected_behavior`` ``"abstain"``).
+
+    Such a question has no right document, so it has no rank and counts in no mean. It is
+    searched all the same, so that the scores the search gives when nothing answers can be
+    looked at. Nothing here says whether the engine would have abstained: no score is a
+    threshold, and there is no pass or fail.
+
+    ``filters``, ``rerun_of``
+        The filters the search ran with; for the second run of the question, without its
+        filters, the id of the question (the entry then carries that id followed by
+        :data:`UNFILTERED_SUFFIX`).
+    ``chunks_returned``, ``documents_ranked``
+        Number of chunks the search returned, and of distinct documents among them.
+    ``top_documents``
+        The first ``k`` documents of the ranking, best first (the first three when ``k`` is
+        smaller); the first one and its score are :attr:`top_document` and :attr:`top_score`.
+    ``documents_at_or_above``
+        For each score level of the evaluation, in increasing order, the level and the number
+        of documents ranked (all of them, not the first ``k`` only) whose score is at least
+        that level.
+    ``must_include``, ``must_not_include``
+        As the question gives them; not scored.
+    """
+
+    id: str
+    question: str
+    kind: str | None
+    tags: tuple[str, ...]
+    filters: SearchFilters | None
+    chunks_returned: int
+    documents_ranked: int
+    top_documents: tuple[RankedDocument, ...]
+    documents_at_or_above: tuple[tuple[float, int], ...]
+    must_include: tuple[str, ...] = ()
+    must_not_include: tuple[str, ...] = ()
+    rerun_of: str | None = None
+
+    @property
+    def top_document(self) -> RankedDocument | None:
+        """The first document returned; ``None`` when nothing was."""
+        return self.top_documents[0] if self.top_documents else None
+
+    @property
+    def top_score(self) -> float | None:
+        """Its score; ``None`` when nothing was returned."""
+        return self.top_documents[0].score if self.top_documents else None
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"id": self.id, "question": self.question}
+        if self.kind is not None:
+            result["kind"] = self.kind
+        if self.tags:
+            result["tags"] = list(self.tags)
+        filters = _filters_dict(self.filters)
+        if filters is not None:
+            result["filters"] = filters
+        result["rerun_of"] = self.rerun_of
+        result["chunks_returned"] = self.chunks_returned
+        result["documents_ranked"] = self.documents_ranked
+        result["top_score"] = self.top_score
+        result["top_document"] = None if self.top_document is None else self.top_document.to_dict()
+        result["documents_at_or_above"] = [
+            {"score": level, "documents": count} for level, count in self.documents_at_or_above
+        ]
+        result["top_documents"] = [document.to_dict() for document in self.top_documents]
+        result["must_include"] = list(self.must_include)
+        result["must_not_include"] = list(self.must_not_include)
+        return result
+
+
+@dataclass(frozen=True)
+class TopScores:
+    """The lowest, median and highest score of the first document returned, over ``questions`` questions."""
+
+    questions: int
+    min: float
+    median: float
+    max: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"questions": self.questions, "min": self.min, "median": self.median, "max": self.max}
 
 
 @dataclass(frozen=True)
@@ -514,9 +822,13 @@ def _percentile(ordered: Sequence[float], share: float) -> float:
 
 
 def _intervals(
-    documents: Sequence[tuple[float, ...]], *, resamples: int, seed: object
+    documents: Sequence[tuple[float, ...]],
+    *,
+    resamples: int,
+    seed: object,
+    metrics: Sequence[str] = _INTERVAL_METRICS,
 ) -> dict[str, tuple[float, float]]:
-    """Percentile intervals of the mean over ``documents`` of hit@1, hit@k and MRR.
+    """Percentile intervals of the mean over ``documents`` of their first columns, named by ``metrics``.
 
     The documents are drawn with replacement, as many as there are, ``resamples`` times;
     the interval of a metric goes from the 2.5th to the 97.5th percentile of its means.
@@ -524,17 +836,127 @@ def _intervals(
     generator = random.Random(seed)
     count = len(documents)
     places = range(count)
-    draws: list[list[float]] = [[] for _name in _INTERVAL_METRICS]
+    draws: list[list[float]] = [[] for _name in metrics]
     for _ in range(resamples):
         drawn = generator.choices(places, k=count)
         for column, values in enumerate(draws):
             values.append(math.fsum(documents[place][column] for place in drawn) / count)
     low, high = (1.0 - INTERVAL_LEVEL) / 2.0, (1.0 + INTERVAL_LEVEL) / 2.0
     result = {}
-    for name, values in zip(_INTERVAL_METRICS, draws, strict=True):
+    for name, values in zip(metrics, draws, strict=True):
         values.sort()
         result[name] = (_percentile(values, low), _percentile(values, high))
     return result
+
+
+@dataclass(frozen=True)
+class EssentialMeans:
+    """The two essential metrics of a group, as means: ``essential_recall_at_k``, ``all_essential_at_k``."""
+
+    essential_recall_at_k: float
+    all_essential_at_k: float
+
+    def to_dict(self) -> dict[str, float]:
+        return {name: getattr(self, name) for name in _ESSENTIAL_METRICS}
+
+
+@dataclass(frozen=True)
+class EssentialAggregate:
+    """The essential metrics of a group: over its questions that have essential documents in the collection.
+
+    The other questions of the group (they do not say which documents are essential, or none
+    of these is in the collection) are left out of these numbers, not counted as zeros.
+
+    ``questions``
+        Number of questions the metrics are computed on.
+    ``documents``
+        Number of distinct essential documents of these questions, among those in the collection.
+    ``unreachable``
+        Number of these questions with more essential documents than ``k``: they cannot have
+        all of them among the first ``k``, and pull both means down whatever the search does.
+    ``essential_recall_at_k``, ``all_essential_at_k``
+        The means **over the questions**: the mean share of the essential documents found
+        among the first ``k``, and the share of questions with all of them there.
+    ``per_document``
+        The same two as means **over the essential documents** (:class:`EssentialMeans`):
+        for each document, the mean over the questions it is essential to, then the mean of
+        these over the documents.
+    ``intervals``, ``few_documents``
+        As for :class:`Aggregate`, for the two per-document means, from resampling the
+        essential documents.
+    """
+
+    questions: int
+    documents: int
+    unreachable: int
+    essential_recall_at_k: float
+    all_essential_at_k: float
+    per_document: EssentialMeans
+    intervals: Mapping[str, tuple[float, float]] | None = None
+    few_documents: bool = False
+
+    @classmethod
+    def of(
+        cls,
+        results: Sequence[QuestionResult],
+        *,
+        interval: str | None = None,
+        resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+        min_documents: int = DEFAULT_INTERVAL_MIN_DOCUMENTS,
+    ) -> EssentialAggregate | None:
+        """The essential metrics of ``results``; ``None`` when none of them has any."""
+        rows: list[tuple[float, float]] = []
+        questions: dict[str, list[tuple[float, float]]] = {}
+        unreachable = 0
+        for result in results:
+            if result.essential_recall_at_k is None or result.essential_ids is None:
+                continue
+            values = (result.essential_recall_at_k, float(bool(result.all_essential_at_k)))
+            rows.append(values)
+            unreachable += result.essential_unreachable
+            for doc_id in result.essential_ids:
+                if doc_id not in result.absent_doc_ids:
+                    questions.setdefault(doc_id, []).append(values)
+        if not rows:
+            return None
+        documents = [_mean(values) for _doc_id, values in sorted(questions.items())]
+        intervals = None
+        few = False
+        if interval is not None:
+            few = len(documents) < min_documents
+            if not few:
+                intervals = _intervals(
+                    documents,
+                    resamples=resamples,
+                    seed=f"{BOOTSTRAP_SEED}:{interval}:essential",
+                    metrics=_ESSENTIAL_METRICS,
+                )
+        return cls(
+            len(rows),
+            len(documents),
+            unreachable,
+            *_mean(rows),
+            EssentialMeans(*_mean(documents)),
+            intervals,
+            few,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """The aggregate as a new dict, ready for ``json.dumps``: the exact values."""
+        result: dict[str, Any] = {
+            "questions": self.questions,
+            "documents": self.documents,
+            "unreachable": self.unreachable,
+        }
+        result.update({name: getattr(self, name) for name in _ESSENTIAL_METRICS})
+        result["per_document"] = self.per_document.to_dict()
+        result["intervals"] = (
+            None
+            if self.intervals is None
+            else {name: list(bounds) for name, bounds in self.intervals.items()}
+        )
+        result["few_documents"] = self.few_documents
+        return result
 
 
 @dataclass(frozen=True)
@@ -564,6 +986,12 @@ class Aggregate:
         for this group, or when it has too few documents.
     ``few_documents``
         An interval was asked and not given: the group has fewer documents than the minimum.
+    ``essential``
+        The essential metrics of the group (:class:`EssentialAggregate`): how many of the
+        essential documents are among the first ``k``. ``None`` when no question of the group
+        has an essential document in the collection.
+
+    The first four metrics look at the expected documents, essential and acceptable alike.
     """
 
     questions: int
@@ -575,6 +1003,7 @@ class Aggregate:
     per_document: Means | None = None
     intervals: Mapping[str, tuple[float, float]] | None = None
     few_documents: bool = False
+    essential: EssentialAggregate | None = None
 
     @classmethod
     def of(
@@ -605,7 +1034,10 @@ class Aggregate:
                 intervals = _intervals(
                     list(documents.values()), resamples=resamples, seed=f"{BOOTSTRAP_SEED}:{interval}"
                 )
-        return cls(len(results), len(documents), *per_question, per_document, intervals, few)
+        essential = EssentialAggregate.of(
+            results, interval=interval, resamples=resamples, min_documents=min_documents
+        )
+        return cls(len(results), len(documents), *per_question, per_document, intervals, few, essential)
 
     def to_dict(self) -> dict[str, Any]:
         """The aggregate as a new dict, ready for ``json.dumps``: the exact values."""
@@ -618,7 +1050,67 @@ class Aggregate:
             else {name: list(bounds) for name, bounds in self.intervals.items()}
         )
         result["few_documents"] = self.few_documents
+        result["essential"] = None if self.essential is None else self.essential.to_dict()
         return result
+
+
+@dataclass(frozen=True)
+class FilterEffect:
+    """The questions scored with their filters and again without them, side by side.
+
+    ``pairs``
+        For each such question, its result as written and its result without filters.
+    ``filtered``, ``unfiltered``
+        The means **over these questions** of ``hit_at_1``, ``hit_at_k``, ``mrr`` and
+        ``essential_recall_at_k``, with and without the filters. The last one is the mean
+        over the ``essential_questions`` pairs that have essential documents in the
+        collection, ``None`` when there is none.
+    """
+
+    pairs: tuple[tuple[QuestionResult, QuestionResult], ...]
+    filtered: Mapping[str, float | None] = field(init=False)
+    unfiltered: Mapping[str, float | None] = field(init=False)
+    essential_questions: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        graded = [pair for pair in self.pairs if all(r.essential_recall_at_k is not None for r in pair)]
+        for name, place in (("filtered", 0), ("unfiltered", 1)):
+            means = _mean([_values(pair[place])[:3] for pair in self.pairs])
+            values: dict[str, float | None] = dict(zip(_INTERVAL_METRICS, means, strict=True))
+            values["essential_recall_at_k"] = (
+                math.fsum(pair[place].essential_recall_at_k or 0.0 for pair in graded) / len(graded)
+                if graded
+                else None
+            )
+            object.__setattr__(self, name, values)
+        object.__setattr__(self, "essential_questions", len(graded))
+
+    @property
+    def questions(self) -> int:
+        """Number of questions scored both ways."""
+        return len(self.pairs)
+
+    def to_dict(self) -> dict[str, Any]:
+        def one(result: QuestionResult) -> dict[str, Any]:
+            return {
+                "rank": result.rank,
+                "hit_at_1": result.hit_at_1,
+                "hit_at_k": result.hit_at_k,
+                "reciprocal_rank": result.reciprocal_rank,
+                "essential_recall_at_k": result.essential_recall_at_k,
+            }
+
+        return {
+            "aggregation": "means over the questions scored with their filters and without them",
+            "questions": self.questions,
+            "essential_questions": self.essential_questions,
+            "filtered": dict(self.filtered),
+            "unfiltered": dict(self.unfiltered),
+            "pairs": [
+                {"id": written.id, "filtered": one(written), "unfiltered": one(rerun)}
+                for written, rerun in self.pairs
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -630,30 +1122,54 @@ class EvalReport:
         ``model`` and ``backend`` of the embedder, its ``query_prefix``, ``normalize_query``
         and ``query_normalization``, ``questions_file`` and ``questions_sha256`` (``None``
         for questions not read from a file), ``bootstrap_resamples``, ``bootstrap_seed``,
-        ``interval_level`` and ``interval_min_documents``, ``engine_version``.
+        ``interval_level`` and ``interval_min_documents``, ``engine_version``,
+        ``score_levels``.
     ``results``
-        One :class:`QuestionResult` per scored question, in the order of the questions.
+        One :class:`QuestionResult` per scored question, as it is written, in the order of
+        the questions.
     ``not_in_collection``
         The questions left out because none of their expected documents is in the
         collection. They count in no metric.
+    ``unfiltered_reruns``
+        One more :class:`QuestionResult` for each scored question that asks for it
+        (``run_unfiltered``): the same question without its filters, under the id and the
+        kind of the question followed by ``#unfiltered``.
+    ``abstentions``
+        The questions that expect no document (:class:`Abstention`), and their second run
+        without filters when they ask for one. They count in no metric.
 
     Everything else is derived from these:
 
     ``by_kind``, ``by_tag``
         One :class:`Aggregate` per ``kind`` (``"(none)"`` for the questions without one) and
-        per tag. The kinds carry intervals, the tags do not.
+        per tag. The kinds carry intervals, the tags do not. The second runs count here: each
+        under its own kind (``<kind>#unfiltered``), under the tags of its question and under
+        ``unfiltered-rerun``.
     ``filtered_kinds``, ``headline_kinds``
         The kinds with at least one scored question that carries filters, and the others,
         both sorted. Filters narrow the candidates: when they leave fewer than ``k``
         documents, ``hit_at_k`` and ``recall_at_k`` are true by construction, so a filtered
-        kind is read on ``hit_at_1`` and ``mrr`` only and is kept out of the headline.
+        kind is read on ``hit_at_1`` and ``mrr`` only and is kept out of the headline. A
+        second run carries no filters and a kind of its own: that kind is not a filtered one.
     ``headline``
         The :class:`Aggregate`, with intervals, of the questions of the ``headline_kinds``:
-        the kinds asked without filters. Its ``per_document`` means are the headline of the
-        report, and what ``rag-engine eval --fail-under-hit-at-k`` looks at.
+        the kinds asked without filters, the second runs among them. Its ``per_document``
+        means are the headline of the report, and what ``rag-engine eval
+        --fail-under-hit-at-k`` looks at.
     ``overall``
         The :class:`Aggregate` of all the scored questions, pooled: every kind, filtered or
-        not, each question counted once. Kept for reference; it is not the headline.
+        not, each question counted once, as it is written (the second runs are not in it).
+        Kept for reference; it is not the headline.
+    ``by_behavior``
+        One :class:`Aggregate` per ``expected_behavior`` that has a scored question, in the
+        order of :data:`BEHAVIORS`, each question counted once as it is written. No intervals.
+    ``filter_effect``
+        The questions scored with and without their filters, compared (:class:`FilterEffect`);
+        ``None`` when there is none.
+    ``top_scores``
+        The lowest, the median and the highest score of the first document returned, over the
+        scored questions as they are written (:class:`TopScores`): what the scores of the
+        abstention questions compare with. ``None`` when nothing was scored.
 
     and the :attr:`misses` and the counts.
     """
@@ -661,18 +1177,21 @@ class EvalReport:
     parameters: Mapping[str, Any]
     results: tuple[QuestionResult, ...]
     not_in_collection: tuple[NotInCollection, ...] = ()
+    unfiltered_reruns: tuple[QuestionResult, ...] = ()
+    abstentions: tuple[Abstention, ...] = ()
     overall: Aggregate = field(init=False)
     headline: Aggregate = field(init=False)
     headline_kinds: tuple[str, ...] = field(init=False)
     filtered_kinds: tuple[str, ...] = field(init=False)
     by_kind: dict[str, Aggregate] = field(init=False)
     by_tag: dict[str, Aggregate] = field(init=False)
+    by_behavior: dict[str, Aggregate] = field(init=False)
 
     def __post_init__(self) -> None:
         kinds: dict[str, list[QuestionResult]] = {}
         tags: dict[str, list[QuestionResult]] = {}
         filtered: set[str] = set()
-        for result in self.results:
+        for result in self.searches:
             kind = result.kind if result.kind is not None else _NO_KIND
             kinds.setdefault(kind, []).append(result)
             if result.filters is not None:
@@ -684,7 +1203,11 @@ class EvalReport:
             "min_documents": self.parameters.get("interval_min_documents", DEFAULT_INTERVAL_MIN_DOCUMENTS),
         }
         unfiltered = tuple(sorted(name for name in kinds if name not in filtered))
-        headline = [result for result in self.results if (result.kind or _NO_KIND) in unfiltered]
+        headline = [result for result in self.searches if (result.kind or _NO_KIND) in unfiltered]
+        behaviors = {
+            name: [result for result in self.results if result.expected_behavior == name]
+            for name in BEHAVIORS
+        }
         values = {
             "overall": Aggregate.of(self.results),
             "headline": Aggregate.of(headline, interval="headline", **sampling),
@@ -695,14 +1218,29 @@ class EvalReport:
                 for name, group in kinds.items()
             },
             "by_tag": {name: Aggregate.of(group) for name, group in tags.items()},
+            "by_behavior": {name: Aggregate.of(group) for name, group in behaviors.items() if group},
         }
         for name, value in values.items():
             object.__setattr__(self, name, value)
 
     @property
+    def searches(self) -> tuple[QuestionResult, ...]:
+        """The results and the second runs together: each second run right after its question."""
+        reruns: dict[str | None, list[QuestionResult]] = {}
+        for rerun in self.unfiltered_reruns:
+            reruns.setdefault(rerun.rerun_of, []).append(rerun)
+        ordered: list[QuestionResult] = []
+        for result in self.results:
+            ordered.append(result)
+            ordered += reruns.pop(result.id, [])
+        for left in reruns.values():  # a second run whose question is not among the results
+            ordered += left
+        return tuple(ordered)
+
+    @property
     def misses(self) -> tuple[QuestionResult, ...]:
-        """The scored questions without any expected document among the first ``k``."""
-        return tuple(result for result in self.results if not result.hit_at_k)
+        """The scored questions, and second runs, without any expected document among the first ``k``."""
+        return tuple(result for result in self.searches if not result.hit_at_k)
 
     @property
     def partially_absent(self) -> int:
@@ -711,41 +1249,80 @@ class EvalReport:
 
     @property
     def fewer_than_k_documents(self) -> int:
-        """Number of scored questions for which fewer than ``k`` documents were ranked."""
+        """Number of scored questions, and second runs, for which fewer than ``k`` documents were ranked."""
         k = self.parameters["k"]
-        return sum(1 for result in self.results if result.documents_ranked < k)
+        return sum(1 for result in self.searches if result.documents_ranked < k)
 
     @property
     def chunk_budget_exhausted(self) -> int:
         """Among them, those whose search returned every chunk it was asked for."""
-        return sum(1 for result in self.results if result.chunk_budget_exhausted)
+        return sum(1 for result in self.searches if result.chunk_budget_exhausted)
 
     @property
     def tied_at_decision(self) -> int:
-        """Number of scored questions whose hit@1 or hit@k hangs on the order of equal scores."""
-        return sum(1 for result in self.results if result.tied_at_decision)
+        """Number of scored questions, and second runs, whose hit@1 or hit@k hangs on equal scores."""
+        return sum(1 for result in self.searches if result.tied_at_decision)
+
+    @property
+    def essential_unreachable(self) -> int:
+        """Number of scored questions with more essential documents in the collection than ``k``."""
+        return sum(1 for result in self.results if result.essential_unreachable)
+
+    @property
+    def filter_effect(self) -> FilterEffect | None:
+        """The questions scored with and without their filters, compared; ``None`` without any."""
+        written = {result.id: result for result in self.results}
+        pairs = tuple(
+            (written[rerun.rerun_of], rerun) for rerun in self.unfiltered_reruns if rerun.rerun_of in written
+        )
+        return FilterEffect(pairs) if pairs else None
+
+    @property
+    def top_scores(self) -> TopScores | None:
+        """The scores of the first document over the scored questions as written; ``None`` without any."""
+        scores = [result.top_documents[0].score for result in self.results if result.top_documents]
+        if not scores:
+            return None
+        return TopScores(len(scores), min(scores), statistics.median(scores), max(scores))
 
     def to_dict(self) -> dict[str, Any]:
         """The whole report as a new dict, ready for ``json.dumps``, with the exact values.
 
         Keys, in this order: ``parameters``; ``summary`` (the counts); ``metrics``
-        (``headline``, ``overall``, ``by_kind``, ``by_tag``: each an aggregate with its means
-        over the questions, its ``per_document`` means and its ``intervals``; ``headline``
-        and ``overall`` say what they aggregate, and each kind whether it is ``filtered``);
-        ``misses`` (id, question, expected ids, rank, the three best documents with their
-        titles); ``not_in_collection``; ``results`` (every scored question with its first
-        documents).
+        (``headline``, ``overall``, ``by_kind``, ``by_tag``, ``by_expected_behavior``: each an
+        aggregate with its means over the questions, its ``per_document`` means, its
+        ``intervals`` and its ``essential`` metrics; ``headline`` and ``overall`` say what
+        they aggregate, and each kind whether it is ``filtered``); ``misses`` (id, question,
+        expected ids, rank, the three best documents with their titles);
+        ``not_in_collection``; ``results`` (every scored question, as written, with its first
+        documents); ``unfiltered_reruns`` (the second runs, in the same form);
+        ``filter_effect`` (``None`` without second runs); ``abstentions`` (the score levels,
+        the top scores of the scored questions, and one entry per question that expects no
+        document).
+
+        The keys of the first version of the report keep their names and their meaning; the
+        others were added to them.
         """
+        effect = self.filter_effect
+        top = self.top_scores
+        reruns = len(self.unfiltered_reruns)
         return {
             "parameters": dict(self.parameters),
             "summary": {
-                "questions": len(self.results) + len(self.not_in_collection),
+                "questions": (
+                    len(self.results)
+                    + len(self.not_in_collection)
+                    + sum(1 for entry in self.abstentions if entry.rerun_of is None)
+                ),
                 "scored": len(self.results),
                 "not_in_collection": len(self.not_in_collection),
                 "partially_absent": self.partially_absent,
                 "fewer_than_k_documents": self.fewer_than_k_documents,
                 "chunk_budget_exhausted": self.chunk_budget_exhausted,
                 "tied_at_decision": self.tied_at_decision,
+                "unfiltered_reruns": reruns,
+                "abstentions": sum(1 for entry in self.abstentions if entry.rerun_of is None),
+                "essential_unreachable": self.essential_unreachable,
             },
             "metrics": {
                 "headline": {
@@ -762,10 +1339,18 @@ class EvalReport:
                     for name, group in self.by_kind.items()
                 },
                 "by_tag": {name: group.to_dict() for name, group in self.by_tag.items()},
+                "by_expected_behavior": {name: group.to_dict() for name, group in self.by_behavior.items()},
             },
             "misses": [result._miss() for result in self.misses],
             "not_in_collection": [skipped.to_dict() for skipped in self.not_in_collection],
             "results": [result.to_dict() for result in self.results],
+            "unfiltered_reruns": [result.to_dict() for result in self.unfiltered_reruns],
+            "filter_effect": None if effect is None else effect.to_dict(),
+            "abstentions": {
+                "score_levels": list(self.parameters.get("score_levels", DEFAULT_SCORE_LEVELS)),
+                "top_score_of_scored_questions": None if top is None else top.to_dict(),
+                "questions": [entry.to_dict() for entry in self.abstentions],
+            },
         }
 
     def to_json(self, *, indent: int | None = 2) -> str:
@@ -777,6 +1362,21 @@ def _count(name: str, value: object) -> int:
     if type(value) is not int or value < 1:  # a bool is an int subclass, and is not a count
         raise EvalError(f"{name} must be an integer >= 1, got {value!r}")
     return value
+
+
+def _levels(value: object) -> tuple[float, ...]:
+    """``score_levels`` in increasing order; ``EvalError`` unless they are distinct finite numbers."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise EvalError(f"score_levels must be a list of numbers, got {value!r}")
+    levels = list(value)
+    for level in levels:
+        if isinstance(level, bool) or not isinstance(level, (int, float)) or not math.isfinite(level):
+            raise EvalError(f"score_levels must be finite numbers, got {level!r}")
+    if not levels:
+        raise EvalError("score_levels is empty: give at least one score")
+    if len(set(levels)) != len(levels):
+        raise EvalError(f"score_levels names a score twice: {levels!r}")
+    return tuple(sorted(float(level) for level in levels))
 
 
 def _backend(embedder: object) -> str:
@@ -855,6 +1455,7 @@ def evaluate(
     normalize_query: bool = True,
     bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
     interval_min_documents: int = DEFAULT_INTERVAL_MIN_DOCUMENTS,
+    score_levels: Sequence[float] = DEFAULT_SCORE_LEVELS,
 ) -> EvalReport:
     """Run the search for every question and score it on documents.
 
@@ -913,6 +1514,41 @@ def evaluate(
     ``few_documents``: an interval from a handful of documents would look more certain than
     it is.
 
+    **Essential and acceptable documents.** A question may say which of its expected
+    documents are essential (``essential_ids``) and which are only acceptable
+    (``acceptable_ids``). The four metrics above do not tell them apart: the rank is the one
+    of the best-placed expected document, so an acceptable document at rank 1 is a hit. Two
+    more metrics look at the essential ones only: ``essential_recall_at_k``, the share of the
+    essential documents present in the collection that are among the first ``k``, and
+    ``all_essential_at_k``, whether all of them are. They are ``None`` for a question that
+    does not state its essential documents, or has none of them in the collection, and such
+    a question is left out of their means. A question with more essential documents than
+    ``k`` cannot have them all among the first ``k``: it is marked
+    ``essential_unreachable`` and counted, and the remedy is a larger ``k`` (itself at most
+    ``chunk_limit``). Each aggregate carries these metrics (:class:`EssentialAggregate`),
+    over the questions and over the essential documents, with intervals where the group has
+    some.
+
+    **Without the filters.** A question with ``run_unfiltered`` is searched and scored
+    twice: as it is written, and without its filters. The second result is kept apart
+    (``unfiltered_reruns``) under the id and the kind of the question followed by
+    ``#unfiltered``, with the tag ``unfiltered-rerun``: it counts in that kind, which is
+    asked without filters and so belongs to the headline, and in its tags, not in the kind
+    of its question nor in the pooled ``overall``. :attr:`EvalReport.filter_effect` compares
+    the two runs of these questions.
+
+    **Questions that expect no document** (``expected_behavior`` ``"abstain"`` with no
+    expected document) have nothing to be ranked: they are searched, not scored, and listed
+    in ``abstentions`` with the first document returned, its score, and the number of
+    documents ranked at or above each of ``score_levels`` (default
+    :data:`DEFAULT_SCORE_LEVELS`). :attr:`EvalReport.top_scores` gives, for comparison, the
+    lowest, median and highest score of the first document over the scored questions. No
+    threshold is applied and nothing passes or fails: the engine returns documents, and
+    whether to answer is decided by its caller. An abstention question that names documents
+    is scored like any other, and so is a ``"correct_premise"`` one;
+    :attr:`EvalReport.by_behavior` gives one aggregate per behaviour. ``must_include`` and
+    ``must_not_include`` are carried into the results and never read.
+
     ``questions`` is a :class:`QuestionSet` (from :func:`load_questions`) or any iterable of
     :class:`Question` with distinct ids. ``collection`` must exist with the dimension of the
     embedder; it is not checked here. ``normalize_query`` is the argument of ``search``.
@@ -922,7 +1558,9 @@ def evaluate(
     normalised (with ``normalize_query``), a ``k``, ``chunk_limit``, ``max_limit``,
     ``bootstrap_resamples`` or ``interval_min_documents`` that is not an integer >= 1, a
     ``chunk_limit`` above the maximum, a ``k`` above ``chunk_limit``, a blank
-    ``collection``, a ``normalize_query`` that is not a boolean. Everything else is
+    ``collection``, a ``normalize_query`` that is not a boolean, ``score_levels`` that are
+    not distinct finite numbers (at least one), an id that is also the id the second run of
+    another question is reported under. Everything else is
     raised as the search or the store raised it, at the first question that fails; no partial
     report is returned.
     """
@@ -936,6 +1574,13 @@ def evaluate(
         if question.id in seen:
             raise EvalError(f"duplicate id {question.id!r} among the questions")
         seen.add(question.id)
+    for question in asked:
+        if question.run_unfiltered and question.id + UNFILTERED_SUFFIX in seen:
+            raise EvalError(
+                f"the id {question.id + UNFILTERED_SUFFIX!r} is the one the second run of "
+                f"{question.id!r} is reported under"
+            )
+    levels = _levels(score_levels)
     if not isinstance(collection, str) or not collection.strip():
         raise EvalError(f"collection must be a non-blank string, got {collection!r}")
     if not isinstance(normalize_query, bool):
@@ -963,11 +1608,51 @@ def evaluate(
         )
 
     wanted = sorted({doc_id for question in asked for doc_id in question.expected_doc_ids})
-    present = store.existing_doc_ids(collection, wanted)
+    present = store.existing_doc_ids(collection, wanted) if wanted else set()
+
+    def ranked(question: Question, filters: SearchFilters | None) -> tuple[int, list[RankedDocument]]:
+        hits = search(
+            question.question,
+            collection=collection,
+            store=store,
+            embedder=embedder,
+            filters=filters,
+            limit=chunk_limit,
+            max_limit=maximum,
+            normalize_query=normalize_query,
+        )
+        return len(hits), _rank_documents(_in_order(hits))
 
     results: list[QuestionResult] = []
+    reruns: list[QuestionResult] = []
     skipped: list[NotInCollection] = []
+    abstentions: list[Abstention] = []
     for question in asked:
+        # As it is written, then without its filters when it asks for that.
+        runs = [(question.filters, False)] + ([(None, True)] if question.run_unfiltered else [])
+        if not question.expected_doc_ids:  # it abstains: there is no document to look for
+            for filters, again in runs:
+                returned, ranking = ranked(question, filters)
+                abstentions.append(
+                    Abstention(
+                        id=question.id + UNFILTERED_SUFFIX if again else question.id,
+                        question=question.question,
+                        kind=question.kind,
+                        tags=question.tags,
+                        filters=filters,
+                        chunks_returned=returned,
+                        documents_ranked=len(ranking),
+                        top_documents=tuple(ranking[: max(k, _MISS_DOCUMENTS)]),
+                        documents_at_or_above=tuple(
+                            (level, sum(1 for document in ranking if document.score >= level))
+                            for level in levels
+                        ),
+                        must_include=question.must_include,
+                        must_not_include=question.must_not_include,
+                        rerun_of=question.id if again else None,
+                    )
+                )
+            continue
         absent = tuple(doc_id for doc_id in question.expected_doc_ids if doc_id not in present)
         reachable = [doc_id for doc_id in question.expected_doc_ids if doc_id in present]
         if not reachable:
@@ -977,42 +1662,47 @@ def evaluate(
                 )
             )
             continue
-        hits = search(
-            question.question,
-            collection=collection,
-            store=store,
-            embedder=embedder,
-            filters=question.filters,
-            limit=chunk_limit,
-            max_limit=maximum,
-            normalize_query=normalize_query,
-        )
-        ranking = _rank_documents(_in_order(hits))
-        places = {document.doc_id: place for place, document in enumerate(ranking, start=1)}
-        ranks = [places[doc_id] for doc_id in reachable if doc_id in places]
-        rank = min(ranks) if ranks else None
-        within_k = rank is not None and rank <= k
-        results.append(
-            QuestionResult(
-                id=question.id,
+        essential = [doc_id for doc_id in question.essential_ids or () if doc_id in present]
+        for filters, again in runs:
+            returned, ranking = ranked(question, filters)
+            places = {document.doc_id: place for place, document in enumerate(ranking, start=1)}
+            ranks = [places[doc_id] for doc_id in reachable if doc_id in places]
+            rank = min(ranks) if ranks else None
+            within_k = rank is not None and rank <= k
+            found = sum(1 for doc_id in essential if places.get(doc_id, k + 1) <= k)
+            tags = question.tags
+            if again and UNFILTERED_TAG not in tags:
+                tags = (*tags, UNFILTERED_TAG)
+            result = QuestionResult(
+                id=question.id + UNFILTERED_SUFFIX if again else question.id,
                 question=question.question,
-                kind=question.kind,
-                tags=question.tags,
+                kind=(question.kind or _NO_KIND) + UNFILTERED_SUFFIX if again else question.kind,
+                tags=tags,
                 expected_doc_ids=question.expected_doc_ids,
                 absent_doc_ids=absent,
-                filters=question.filters,
+                filters=filters,
                 rank=rank,
                 hit_at_1=rank == 1,
                 hit_at_k=within_k,
                 reciprocal_rank=1.0 / rank if within_k else 0.0,
                 recall_at_k=sum(1 for place in ranks if place <= k) / len(reachable),
-                chunks_returned=len(hits),
+                chunks_returned=returned,
                 documents_ranked=len(ranking),
-                chunk_budget_exhausted=len(ranking) < k and len(hits) >= chunk_limit,
+                chunk_budget_exhausted=len(ranking) < k and returned >= chunk_limit,
                 top_documents=tuple(ranking[: max(k, _MISS_DOCUMENTS)]),
                 tied_at_decision=_tie_decides(ranking, reachable, 1) or _tie_decides(ranking, reachable, k),
+                expected_behavior=question.expected_behavior,
+                essential_ids=question.essential_ids,
+                acceptable_ids=question.acceptable_ids,
+                must_include=question.must_include,
+                must_not_include=question.must_not_include,
+                essential_present=None if question.essential_ids is None else len(essential),
+                essential_recall_at_k=found / len(essential) if essential else None,
+                all_essential_at_k=found == len(essential) if essential else None,
+                essential_unreachable=len(essential) > k,
+                rerun_of=question.id if again else None,
             )
-        )
+            (reruns if again else results).append(result)
 
     parameters = {
         "collection": collection,
@@ -1031,8 +1721,15 @@ def evaluate(
         "interval_level": INTERVAL_LEVEL,
         "interval_min_documents": interval_min_documents,
         "engine_version": __version__,
+        "score_levels": list(levels),
     }
-    return EvalReport(parameters=parameters, results=tuple(results), not_in_collection=tuple(skipped))
+    return EvalReport(
+        parameters=parameters,
+        results=tuple(results),
+        not_in_collection=tuple(skipped),
+        unfiltered_reruns=tuple(reruns),
+        abstentions=tuple(abstentions),
+    )
 
 
 # The width the lines of the text report whose length depends on a path are cut to.
@@ -1081,6 +1778,143 @@ def _table(rows: Sequence[tuple[str, ...]], k: int) -> list[str]:
     return lines
 
 
+def _essential_row(name: str, group: Aggregate, *, pooled: bool = False) -> tuple[str, ...]:
+    """One line of the table of the essential documents: the name, three counts, the two metrics, a mark."""
+    essential = group.essential
+    if essential is None:
+        return (name, "0", "0", "n/a", "n/a", "0", "")
+    means = essential if pooled else essential.per_document
+    cells = []
+    for metric in _ESSENTIAL_METRICS:
+        cell = _number(getattr(means, metric))
+        if essential.intervals is not None and metric in essential.intervals:
+            low, high = essential.intervals[metric]
+            cell += f" [{low:.2f}, {high:.2f}]"
+        cells.append(cell)
+    mark = "(few)" if essential.few_documents else ""
+    return (
+        name,
+        str(essential.questions),
+        str(essential.documents),
+        *cells,
+        str(essential.unreachable),
+        mark,
+    )
+
+
+def _aligned(rows: Sequence[Sequence[str]], *, right: Sequence[int] = (), name_width: int = 36) -> list[str]:
+    """``rows`` (the header first) as lines of aligned columns; the columns of ``right`` are right-aligned."""
+    rows = [(_cut(row[0], name_width), *row[1:]) for row in rows]
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+    lines = []
+    for row in rows:
+        cells = [
+            f"{cell:>{width}}" if column in right else f"{cell:<{width}}"
+            for column, (cell, width) in enumerate(zip(row, widths, strict=True))
+        ]
+        lines.append("  ".join(cells).rstrip())
+    return lines
+
+
+def _behavior_lines(report: EvalReport, k: int) -> list[str]:
+    rows = [_row(f"expected_behavior: {name}", group) for name, group in report.by_behavior.items()]
+    return [
+        "",
+        "Per expected behaviour (per-document means; each question once, as it is written):",
+        *_table(rows, k),
+        "correct_premise, abstain: scored on the documents they name, like any question; the answer is not.",
+    ]
+
+
+def _essential_lines(report: EvalReport, k: int, *, behaviors: bool) -> list[str]:
+    minimum = report.parameters.get("interval_min_documents", DEFAULT_INTERVAL_MIN_DOCUMENTS)
+    filtered = set(report.filtered_kinds)
+    header = ("", "questions", "documents", f"essential_recall@{k}", f"all_essential@{k}", "unreachable", "")
+    rows = [header]
+    if list(report.by_kind) != [_NO_KIND]:
+        for name, group in sorted(report.by_kind.items()):
+            rows.append(_essential_row(f"kind: {name}{' *' if name in filtered else ''}", group))
+    rows.append(_essential_row("headline", report.headline))
+    rows.append(_essential_row("overall (pooled)", report.overall, pooled=True))
+    if behaviors:
+        for name, group in report.by_behavior.items():
+            rows.append(_essential_row(f"expected_behavior: {name}", group))
+    lines = ["", "Essential documents (per-document means; the pooled line is over the questions):"]
+    lines += _aligned(rows, right=(1, 2, 5))
+    lines += [
+        "questions, documents: the questions that state their essential documents, and these documents;",
+        "  the other questions are left out of these two metrics (n/a when a line has none).",
+        f"essential_recall@{k}: for a question, the share of its essential documents among the first {k}.",
+        f"all_essential@{k}: for a question, 1 when all of them are among the first {k}, else 0.",
+        "  In a per-document mean a question counts once for each of its essential documents.",
+        f"unreachable: questions with more essential documents than k={k}: they can never have them all.",
+        "  For chain and aggregation questions raise --k (at most --chunk-limit, itself bounded by",
+        "  RAG_ENGINE_SEARCH_MAX_LIMIT).",
+        f"(few): fewer than {minimum} essential documents, no interval is given.",
+        f"hit@1, hit@{k} and MRR look at the first expected document, essential or acceptable.",
+    ]
+    out_of_reach = [result for result in report.results if result.essential_unreachable]
+    if out_of_reach:
+        lines.append("")
+        lines.append(f"More essential documents than k={k} ({len(out_of_reach)}):")
+        for result in out_of_reach:
+            lines.append(f"  {_cut(result.id, 60)}: {result.essential_present} essential documents")
+    return lines
+
+
+def _filter_lines(effect: FilterEffect, k: int) -> list[str]:
+    header = ("", "questions", "hit@1", f"hit@{k}", "MRR", f"essential_recall@{k}")
+    rows = [header]
+    for name, means in (("with their filters", effect.filtered), ("without filters", effect.unfiltered)):
+        cells = [_number(means[metric]) for metric in (*_INTERVAL_METRICS, "essential_recall_at_k")]
+        rows.append((name, str(effect.questions), *cells))
+    count = effect.questions
+    plural = "" if count == 1 else "s"
+    return [
+        "",
+        f"What the filter brings ({count} question{plural} scored with their filters, then without):",
+        *_aligned(rows, right=(1,)),
+        "Means over these questions. The second runs are the kinds named #unfiltered above; they are",
+        "  in the headline and not in overall (pooled).",
+    ]
+
+
+def _abstention_lines(report: EvalReport) -> list[str]:
+    levels = [level for level, _count in report.abstentions[0].documents_at_or_above]
+    count = sum(1 for entry in report.abstentions if entry.rerun_of is None)
+    plural = "" if count == 1 else "s"
+    lines = [
+        "",
+        f"Abstention ({count} question{plural} that expect no document: searched, in no mean, not judged):",
+    ]
+    header = ("", "top score", *(f">={level:g}" for level in levels), "top document")
+    rows = [header]
+    for entry in report.abstentions:
+        top = entry.top_document
+        if top is None:
+            document = "nothing was returned"
+        else:
+            document = f"{_cut(top.doc_id, 24)}  {_cut(top.title, 30) if top.title else '(no title)'}"
+        score = "n/a" if entry.top_score is None else f"{entry.top_score:.3f}"
+        rows.append(
+            (entry.id, score, *(str(number) for _level, number in entry.documents_at_or_above), document)
+        )
+    lines += _aligned(rows, right=tuple(range(1, len(levels) + 2)), name_width=30)
+    lines.append(
+        ">=x: documents ranked with a score of at least x, among all those returned for the question."
+    )
+    top = report.top_scores
+    if top is None:
+        lines.append("No question was scored: there is no top score to compare with.")
+    else:
+        lines.append(
+            f"For comparison, top score of the {top.questions} scored questions: "
+            f"min {top.min:.3f}, median {top.median:.3f}, max {top.max:.3f}."
+        )
+    lines.append("No threshold is applied: whether to answer is decided by the caller of the search.")
+    return lines
+
+
 def format_report(report: EvalReport) -> str:
     """The report as a short text for a terminal: parameters, metrics, what was left out, misses.
 
@@ -1099,20 +1933,37 @@ def format_report(report: EvalReport) -> str:
     their titles. The line that names the question file is cut to 110 characters whatever
     the length of its path, the end of the path being kept. The text has no trailing line
     break.
+
+    Four more parts are printed when the questions call for them, each with its legend,
+    between the tags and the questions left out: the metrics per ``expected_behavior`` (when
+    a scored question has another one than ``answer``), the essential documents (when a
+    question states them), what the filter brings (questions scored again without their
+    filters), and the abstention questions with the scores they were given. A report of
+    questions that use none of this is the report of the first version, to the character.
     """
     parameters = report.parameters
     k = parameters["k"]
     scored, left_out = len(report.results), len(report.not_in_collection)
+    apart = sum(1 for entry in report.abstentions if entry.rerun_of is None)
     title = (
         f"Search evaluation of collection {parameters['collection']!r}: {scored} questions scored "
-        f"({scored + left_out} read, {left_out} not in the collection)"
+        f"({scored + left_out + apart} read, {left_out} not in the collection)"
     )
     settings = (
         f"k={k}, chunk_limit={parameters['chunk_limit']}, model {parameters['model']} "
         f"({parameters['backend']} backend), query normalisation "
         f"{parameters['query_normalization'] or 'off'}, rag-engine {parameters['engine_version']}"
     )
-    lines = [title, settings]
+    lines = [title]
+    extra = []
+    if apart:
+        extra.append(f"{apart} question{'' if apart == 1 else 's'} that expect no document (not scored)")
+    if report.unfiltered_reruns:
+        again = len(report.unfiltered_reruns)
+        extra.append(f"{again} second run{'' if again == 1 else 's'} without filters")
+    if extra:
+        lines.append("and " + ", ".join(extra))
+    lines.append(settings)
     if parameters.get("questions_file"):
         digest = parameters.get("questions_sha256") or ""
         # The whole line fits the width, wherever the file lives; the end of a path names the file.
@@ -1151,10 +2002,26 @@ def format_report(report: EvalReport) -> str:
         "overall (pooled): the means over all scored questions, every kind, each question counted once;",
         "  it is not the headline.",
     ]
+    if report.unfiltered_reruns:
+        lines += [
+            "#unfiltered: the questions of a kind that ask for it (run_unfiltered), scored again without",
+            "  their filters: a kind of its own, asked without filters; not in overall (pooled).",
+        ]
     if report.by_tag:
         lines.append("")
         lines.append("Per tag (per-document means):")
         lines += _table([_row(f"tag: {name}", group) for name, group in sorted(report.by_tag.items())], k)
+
+    behaviors = any(name != DEFAULT_BEHAVIOR for name in report.by_behavior)
+    if behaviors:
+        lines += _behavior_lines(report, k)
+    if report.overall.essential is not None or report.headline.essential is not None:
+        lines += _essential_lines(report, k, behaviors=behaviors)
+    effect = report.filter_effect
+    if effect is not None:
+        lines += _filter_lines(effect, k)
+    if report.abstentions:
+        lines += _abstention_lines(report)
 
     if report.not_in_collection:
         lines.append("")

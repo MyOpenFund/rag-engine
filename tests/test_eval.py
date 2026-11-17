@@ -474,13 +474,16 @@ def test_parameters_of_the_report(report, questions):
         "interval_level": 0.95,
         "interval_min_documents": 20,
         "engine_version": rag_engine.__version__,
+        "score_levels": [0.7, 0.75, 0.8, 0.85, 0.9],
     }
 
 
 def test_report_as_json(report):
     data = json.loads(report.to_json())
     assert data == json.loads(json.dumps(report.to_dict()))
-    assert list(data) == ["parameters", "summary", "metrics", "misses", "not_in_collection", "results"]
+    # The keys of the first version, in their order; the others were added after them.
+    assert list(data)[:6] == ["parameters", "summary", "metrics", "misses", "not_in_collection", "results"]
+    assert list(data)[6:] == ["unfiltered_reruns", "filter_effect", "abstentions"]
     assert data["summary"] == {
         "questions": 13,
         "scored": 12,
@@ -489,8 +492,11 @@ def test_report_as_json(report):
         "fewer_than_k_documents": 6,
         "chunk_budget_exhausted": 0,
         "tied_at_decision": 1,
+        "unfiltered_reruns": 0,
+        "abstentions": 0,
+        "essential_unreachable": 0,
     }
-    assert list(data["metrics"]) == ["headline", "overall", "by_kind", "by_tag"]
+    assert list(data["metrics"]) == ["headline", "overall", "by_kind", "by_tag", "by_expected_behavior"]
     # The pooled row is kept, and says what it is; the values are exact, not rounded.
     assert data["metrics"]["overall"] == {
         "aggregation": "pooled: every scored question of every kind, counted once",
@@ -508,6 +514,7 @@ def test_report_as_json(report):
         },
         "intervals": None,
         "few_documents": False,
+        "essential": None,
     }
     headline = data["metrics"]["headline"]
     assert headline["aggregation"] == "per document, over the kinds asked without filters"

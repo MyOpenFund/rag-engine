@@ -4,6 +4,9 @@
 meant for: a ``FakeEmbedder`` whose passage and query prefixes are both empty, so that a
 question whose text is the text of a chunk gets the vector of that chunk. The unit tests
 (qdrant-client's local mode) and the integration test (a real server) load the same points.
+
+Two question files are asked of that corpus: ``questions.jsonl``, in the first version of the
+format, and ``questions_v2.jsonl``, which uses every field the second version added.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from rag_engine.schema import build_payload, page_for_id, point_id
 FIXTURES = Path(__file__).resolve().parent.parent / "eval" / "fixtures"
 CORPUS = FIXTURES / "corpus.json"
 QUESTIONS = FIXTURES / "questions.jsonl"
+QUESTIONS_V2 = FIXTURES / "questions_v2.jsonl"
 INGESTED_AT = "2026-11-17T10:00:00"
 
 
