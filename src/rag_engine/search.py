@@ -46,6 +46,28 @@ class SearchError(RagEngineError, ValueError):
     """A search was asked with an argument or a filter that cannot be used as it is."""
 
 
+def _encodable(text: str) -> bool:
+    """Whether ``text`` can be written as UTF-8: false for a string that holds a lone surrogate."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _not_encodable(name: str, verb: str, text: str) -> SearchError:
+    # ascii(): the message can itself be encoded, whatever the string holds.
+    return SearchError(
+        f"{name} {verb} a string that cannot be encoded as UTF-8 (a lone surrogate, as a JSON "
+        f"escape such as \\ud800 gives): {text!a}"
+    )
+
+
+def _searchable(text: str) -> bool:
+    """Whether ``text`` holds a letter, a number, a symbol or a punctuation mark."""
+    return any(unicodedata.category(character)[0] in "LNSP" for character in text)
+
+
 def _values(name: str, value: object) -> tuple[str, ...] | None:
     """One list field of the filters as a tuple without duplicates; ``SearchError`` otherwise."""
     if value is None:
@@ -65,6 +87,8 @@ def _values(name: str, value: object) -> tuple[str, ...] | None:
     for item in value:
         if not isinstance(item, str) or not item.strip():
             raise SearchError(f"{name} must hold non-blank strings, got {item!r}")
+        if not _encodable(item):
+            raise _not_encodable(name, "holds", item)
     ordered = sorted(value) if isinstance(value, (set, frozenset)) else value
     return tuple(dict.fromkeys(ordered))
 
@@ -120,6 +144,9 @@ class SearchFilters:
     - **an empty list**: it could mean "match nothing" as well as "no restriction", and the
       two give opposite results. ``None`` is the only way to write "no restriction";
     - a blank or non-string value in a list, a blank or non-string ``corpus``;
+    - a value of a list, or a ``corpus``, that cannot be encoded as UTF-8: a string holding a
+      lone surrogate, which a JSON escape such as ``"\\ud800"`` gives. No payload holds such a
+      value, and the Qdrant client could not send it;
     - a date bound that is not a full date: ``"2016"``, ``"2016-03"``, ``"10/03/2016"``, a
       date with a time, a ``datetime.datetime``, a number, a day that does not exist;
     - ``date_from`` after ``date_to``.
@@ -155,6 +182,8 @@ class SearchFilters:
             )
         if self.corpus is not None and (not isinstance(self.corpus, str) or not self.corpus.strip()):
             raise SearchError(f"corpus must be a non-blank string or None, got {self.corpus!r}")
+        if self.corpus is not None and not _encodable(self.corpus):
+            raise _not_encodable("corpus", "is", self.corpus)
 
 
 def _qdrant_filter(filters: SearchFilters | None) -> models.Filter | None:
@@ -302,8 +331,17 @@ def search(
 
     Arguments:
 
-    - ``query``: a non-blank string. It is embedded as given, apart from the normalisation
-      below; it is not stripped.
+    - ``query``: a non-blank string that holds something to search for: at least one letter,
+      number, symbol or punctuation mark (Unicode general categories L, N, S and P), in any
+      script. ``"2016"``, ``"€"`` and ``"$AAPL"`` are queries. A query made only of combining
+      marks, of zero-width or other format characters, of control characters and of spaces
+      is refused: it would be embedded, and a full ranked list returned for a question that
+      asks nothing. **Punctuation alone (``"???"``) is accepted**: it is a degenerate query,
+      but one that was typed. The rule is applied to the query as given and, when
+      ``normalize_query`` is on, to its normalised form too: NFKD writes the spacing form of
+      a diacritic (``"¨"``, ``"´"``) as a space and a combining mark, so such a query alone
+      is refused, and is accepted with ``normalize_query=False``. The query is embedded as
+      given, apart from the normalisation below; it is not stripped.
     - ``collection`` must exist, with the dimension of the embedder. **This function does not
       check it** (no extra request per search): the caller calls
       ``store.ensure_collection(collection, embedder.dim)`` once. The payload indexes
@@ -325,7 +363,8 @@ def search(
 
     Errors. :class:`SearchError` (a ``ValueError`` and a ``RagEngineError``), raised before
     the embedder or the store is called: a ``query`` or a ``collection`` that is not a
-    non-blank string, a ``filters`` that is not a ``SearchFilters``, a ``limit`` or a
+    non-blank string or that cannot be encoded as UTF-8 (a lone surrogate), a ``query``
+    without any searchable character, a ``filters`` that is not a ``SearchFilters``, a ``limit`` or a
     ``max_limit`` that is not an integer >= 1, a ``limit`` above ``max_limit``, a
     ``normalize_query`` that is not a boolean. Nothing else is caught: an error of the
     embedder is raised unchanged, a refused API key is a
@@ -335,8 +374,17 @@ def search(
     """
     if not isinstance(query, str) or not query.strip():
         raise SearchError(f"query must be a non-blank string, got {query!r}")
+    if not _encodable(query):
+        raise _not_encodable("query", "is", query)
+    if not _searchable(query):
+        raise SearchError(
+            "the query has no searchable character: it holds no letter, number, symbol or punctuation "
+            f"mark, only combining marks, invisible or control characters and spaces, got {query!a}"
+        )
     if not isinstance(collection, str) or not collection.strip():
         raise SearchError(f"collection must be a non-blank string, got {collection!r}")
+    if not _encodable(collection):
+        raise _not_encodable("collection", "is", collection)
     if filters is not None and not isinstance(filters, SearchFilters):
         raise SearchError(f"filters must be a SearchFilters or None, got {type(filters).__name__}")
     if not isinstance(normalize_query, bool):
@@ -347,6 +395,13 @@ def search(
         raise SearchError(f"limit {wanted} is above the maximum of {maximum}: ask for at most {maximum} hits")
 
     text = unicodedata.normalize(QUERY_NORMALIZATION, query) if normalize_query else query
+    if not _searchable(text):
+        # The spacing form of a diacritic is a symbol; its normalised form is a space and a mark.
+        raise SearchError(
+            f"the query has no searchable character once put in {QUERY_NORMALIZATION}: it holds only "
+            "isolated accents or other marks, which become a space and a combining mark, "
+            f"got {query!a}"
+        )
     vector = embedder.encode_query(text)
     points = store.query(
         collection,

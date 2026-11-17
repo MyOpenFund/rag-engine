@@ -308,6 +308,44 @@ def test_a_blank_or_non_string_corpus_is_refused(bad):
         SearchFilters(corpus=bad)
 
 
+# A lone surrogate is what json.loads('"\\ud800"') returns: a str that no UTF-8 encoder accepts.
+LONE_SURROGATES = ["\ud800", "ec\udfffb", "\udc80 press"]
+
+
+def test_json_can_deliver_a_lone_surrogate():
+    assert json.loads('"\\ud800"') == "\ud800"
+    with pytest.raises(UnicodeEncodeError):
+        "\ud800".encode()
+
+
+@pytest.mark.parametrize("name", LIST_FIELDS)
+@pytest.mark.parametrize("bad", LONE_SURROGATES, ids=ascii)
+def test_a_list_value_that_cannot_be_encoded_as_utf8_is_refused(name, bad):
+    with pytest.raises(
+        SearchError, match=rf"{name} holds a string that cannot be encoded as UTF-8"
+    ) as raised:
+        SearchFilters(**{name: ["ecb", bad]})
+    assert ascii(bad) in str(raised.value)
+    str(raised.value).encode()  # the message itself can be logged and sent
+    with pytest.raises(SearchError, match=name):
+        SearchFilters(**{name: {bad}})
+
+
+@pytest.mark.parametrize("bad", LONE_SURROGATES, ids=ascii)
+def test_a_corpus_that_cannot_be_encoded_as_utf8_is_refused(bad):
+    with pytest.raises(SearchError, match="corpus is a string that cannot be encoded as UTF-8") as raised:
+        SearchFilters(corpus=bad)
+    assert ascii(bad) in str(raised.value)
+    str(raised.value).encode()
+
+
+def test_a_pair_of_surrogates_written_as_one_character_is_a_valid_value():
+    # json.loads joins an escaped pair into the character itself: nothing to refuse.
+    value = json.loads('"\\ud83d\\ude00"')
+    assert value == "\U0001f600"
+    assert SearchFilters(source_codes=[value], corpus=value).corpus == value
+
+
 def test_search_error_is_an_engine_error_and_a_value_error():
     assert issubclass(SearchError, RagEngineError)
     assert issubclass(SearchError, ValueError)
@@ -539,6 +577,163 @@ def test_a_blank_or_non_string_collection_is_refused(store, embedder, bad):
     with pytest.raises(SearchError, match="collection must be a non-blank string"):
         search(QUERY, collection=bad, store=store, embedder=embedder)
     assert embedder.calls == []
+
+
+@pytest.mark.parametrize("bad", LONE_SURROGATES, ids=ascii)
+def test_a_query_that_cannot_be_encoded_as_utf8_is_refused(store, embedder, bad):
+    with pytest.raises(SearchError, match="query is a string that cannot be encoded as UTF-8") as raised:
+        run(store, embedder, query="rates " + bad)
+    assert ascii(bad)[1:-1] in str(raised.value)
+    str(raised.value).encode()
+    assert embedder.calls == []
+
+
+@pytest.mark.parametrize("bad", LONE_SURROGATES, ids=ascii)
+def test_a_collection_that_cannot_be_encoded_as_utf8_is_refused(store, embedder, bad):
+    with pytest.raises(SearchError, match="collection is a string that cannot be encoded as UTF-8"):
+        search(QUERY, collection=bad, store=store, embedder=embedder)
+    assert embedder.calls == []
+
+
+# Nothing to search for: combining marks alone, zero-width and other format characters,
+# controls, separators, private-use characters and unassigned code points.
+UNSEARCHABLE_QUERIES = [
+    "\u0301\u0301",  # two combining acute accents
+    "\u200b",  # zero width space
+    "\u2060",  # word joiner
+    "\ufeff",  # zero width no-break space (byte order mark)
+    "\u200d\u200c",  # zero width joiner and non-joiner
+    "\u00ad",  # soft hyphen
+    "\u202e\u2066",  # bidirectional controls
+    "\x00\x1b\x7f",  # control characters
+    " \u0301 \u200b\n",  # the same between spaces
+    "\u0301\u2028\u3000\u0301",  # marks around a line separator and an ideographic space
+    "\ufe0f",  # variation selector
+    "\ue000",  # private use
+    "\U000e0001",  # language tag
+]
+
+
+@pytest.mark.parametrize("bad", UNSEARCHABLE_QUERIES, ids=ascii)
+@pytest.mark.parametrize("normalize", [True, False])
+def test_a_query_without_any_searchable_character_is_refused(store, embedder, bad, normalize):
+    with pytest.raises(SearchError, match="the query has no searchable character") as raised:
+        run(store, embedder, query=bad, normalize_query=normalize)
+    assert ascii(bad) in str(raised.value)
+    assert embedder.calls == []
+
+
+# A letter, a number, a symbol or a punctuation mark is enough, in any script.
+SEARCHABLE_QUERIES = [
+    "a",
+    "2016",
+    "\u0663",  # an Arabic-Indic digit
+    "\u00bd",  # one half
+    "\u2167",  # a Roman numeral
+    "\u20ac",  # the euro sign
+    "$AAPL",
+    "+",
+    "\u00b0",  # the degree sign
+    "\U0001f600",  # an emoji
+    "???",
+    "\u2026",  # an ellipsis
+    "\u00bf",  # an inverted question mark
+    "\u3002",  # an ideographic full stop
+    "e\u0301",  # a letter and its combining accent
+    "\u200bbce\u200b",  # letters between zero-width spaces
+    "\ufeffinflation",  # a byte order mark left in front of a word
+]
+
+
+@pytest.mark.parametrize("query", SEARCHABLE_QUERIES, ids=ascii)
+@pytest.mark.parametrize("normalize", [True, False])
+def test_one_letter_number_symbol_or_punctuation_mark_makes_a_query(store, embedder, query, normalize):
+    assert len(run(store, embedder, query=query, normalize_query=normalize)) == SEARCH_POINT_COUNT
+    expected = unicodedata.normalize("NFKD", query) if normalize else query
+    assert embedder.calls == [SEARCH_SPEC.query_prefix + expected]
+
+
+def test_a_query_of_punctuation_alone_is_accepted(store, embedder):
+    assert run(store, embedder, query="???", limit=3) == run(store, embedder, query="???", limit=3)
+    assert embedder.calls == [SEARCH_SPEC.query_prefix + "???"] * 2
+
+
+def searchable(text: str) -> bool:
+    """The rule, written again: one character of general category L, N, S or P."""
+    return any(unicodedata.category(character)[0] in "LNSP" for character in text)
+
+
+# One query per script, as typed (NFC), and what a keyboard or a web form may add around it.
+SCRIPT_QUERIES = {
+    "latin": "d\u00e9cision de politique mon\u00e9taire",
+    "greek": "\u03bd\u03bf\u03bc\u03b9\u03c3\u03bc\u03b1\u03c4\u03b9\u03ba\u03ae",
+    "cyrillic": "\u043a\u043b\u044e\u0447\u0435\u0432\u0430\u044f \u0441\u0442\u0430\u0432\u043a\u0430",
+    "arabic": "\u0633\u0639\u0631 \u0627\u0644\u0641\u0627\u0626\u062f\u0629",
+    "hebrew": "\u05e8\u05d9\u05d1\u05d9\u05ea",
+    "devanagari": "\u092c\u094d\u092f\u093e\u091c \u0926\u0930",
+    "thai": "\u0e2d\u0e31\u0e15\u0e23\u0e32\u0e14\u0e2d\u0e01\u0e40\u0e1a\u0e35\u0e49\u0e22",
+    "han": "\u8d27\u5e01\u653f\u7b56",
+    "kana": "\u30c7\u30d5\u30ec\u8131\u5374",
+    "halfwidth kana": "\uff83\uff9e\uff8c\uff9a",
+    "hangul": "\ud55c\uad6d\uc740\ud589",
+    "vietnamese": "l\u00e3i su\u1ea5t \u0111i\u1ec1u h\u00e0nh",
+    "digits": "2016",
+    "fullwidth digits": "\uff12\uff10\uff11\uff16",
+    "ticker": "$AAPL",
+    "euro": "\u20ac",
+    "ligature": "\ufb01nance",
+    "emoji": "\U0001f4c8",
+    "punctuation": "???",
+}
+
+
+@pytest.mark.parametrize("script", SCRIPT_QUERIES)
+def test_a_query_in_any_script_is_still_searchable_once_normalised(store, embedder, script):
+    query = SCRIPT_QUERIES[script]
+    for form in ("NFC", "NFD", "NFKC", "NFKD"):
+        for text in (unicodedata.normalize(form, query), "\u200b " + unicodedata.normalize(form, query)):
+            assert searchable(text)
+            assert searchable(unicodedata.normalize("NFKD", text))
+            embedder.calls.clear()
+            assert run(store, embedder, query=text, limit=1)
+            assert embedder.calls == [SEARCH_SPEC.query_prefix + unicodedata.normalize("NFKD", text)]
+
+
+def test_nfkd_only_empties_a_query_made_of_isolated_spacing_marks():
+    # Over every code point: a character that counts (L, N, S or P) keeps one that counts in
+    # NFKD, except the spacing form of a diacritic ("\u00a8", "\u00b4", "\uff9e", the isolated
+    # Arabic vowel marks...), which NFKD writes as a space and combining marks, or as the
+    # combining mark alone. Those are the only queries normalisation can leave empty.
+    emptied = [
+        character
+        for character in map(chr, range(0x110000))
+        if searchable(character) and not searchable(unicodedata.normalize("NFKD", character))
+    ]
+    assert "\u00a8" in emptied and "\uff9e" in emptied
+    assert len(emptied) < 100
+    for character in emptied:
+        decomposed = unicodedata.normalize("NFKD", character)
+        assert {unicodedata.category(part) for part in decomposed} <= {"Zs", "Mn"}, ascii(character)
+        assert any(unicodedata.combining(part) for part in decomposed), ascii(character)
+
+
+@pytest.mark.parametrize(
+    "mark", ["\u00a8", "\u00b4", "\u309b", "\uff9e", "\ufe7c", " \u00b8\u02dc "], ids=ascii
+)
+def test_a_query_that_normalisation_leaves_without_a_searchable_character_is_refused(store, embedder, mark):
+    assert searchable(mark) and not searchable(unicodedata.normalize("NFKD", mark))
+    with pytest.raises(SearchError, match="the query has no searchable character.*NFKD") as raised:
+        run(store, embedder, query=mark)
+    assert ascii(mark) in str(raised.value)
+    assert embedder.calls == []
+
+    # As given, it is a symbol or a letter: without normalisation it is embedded.
+    assert run(store, embedder, query=mark, normalize_query=False)
+    assert embedder.calls == [SEARCH_SPEC.query_prefix + mark]
+
+    # With anything else that counts, it is a query like another.
+    embedder.calls.clear()
+    assert run(store, embedder, query="a" + mark)
 
 
 @pytest.mark.parametrize("bad", [{"source_codes": ["ecb"]}, ["ecb"], "ecb", 3], ids=repr)
