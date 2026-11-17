@@ -3,6 +3,20 @@
 Every supported format is first turned into a markdown document, then split by ChunkNorris's
 ``MarkdownChunker``, so chunks have the same granularity whatever the source format.
 
+Why the cut must stay stable. The id of a point does not depend on the text of its chunk: it
+is derived from the ``doc_id``, the page the chunk starts on and the position of the chunk
+(:func:`rag_engine.schema.point_id`). So when a document is ingested again after anything
+changed where it is cut (a chunker option, a parser option, the line-spacing measure, a
+release of ChunkNorris):
+
+* the points that have the same (page, index) as before are overwritten, with another text
+  and another vector;
+* the (page, index) pairs of the old cut that the new cut no longer produces are not touched:
+  they stay in the collection as stale points, with the old text.
+
+Nothing detects this. A change of chunking therefore requires a clean re-ingestion of the
+document set (its old points removed first, or a new collection), not a re-run over it.
+
 The parsing libraries (``chunknorris``, ``markitdown``) belong to the ``ingest`` extra and are
 imported inside the functions: importing this module loads neither of them.
 """
@@ -55,9 +69,10 @@ HEADER_LEVELS: tuple[str, ...] = ("h1", "h2", "h3", "h4", "h5", "h6")
 # What ``PdfParser`` is built with, besides the OCR mode and languages. These are the defaults
 # of ChunkNorris 1.3.7 and 1.5.0, which production documents were parsed with; they are passed
 # by name so that a release changing a default does not change the chunks. They are constants,
-# not arguments of chunk_file: changing one changes the text of PDF chunks, so the ids of their
-# points. ``table_finder`` is the one PdfParser argument left to the library: its default is an
-# object (``TableFinder()``), not a value that can be written here.
+# not arguments of chunk_file: changing one changes where PDFs are cut, which requires a clean
+# re-ingestion of the documents (see the module docstring). ``table_finder`` is the one
+# PdfParser argument left to the library: its default is an object (``TableFinder()``), not a
+# value that can be written here.
 #: Tables are extracted and written as markdown tables.
 PDF_EXTRACT_TABLES = True
 #: Headers are looked for (table of contents of the document or of its metadata) and marked.
@@ -101,9 +116,12 @@ class ChunkingOptions:
     - ``hard_max_chunk_word_count``: hard maximum. A longer chunk is always split.
     - ``min_chunk_word_count``: a chunk with fewer words is dropped.
 
-    Changing a value changes the text of the chunks, so the ids of the points made from them:
-    a collection is to be ingested with one set of options. ``ValueError`` for a value that
-    cannot be used.
+    Changing a value changes where documents are cut. The ids do not follow the text (they
+    come from ``doc_id``, page and chunk index), so re-ingesting a document with other options
+    overwrites the points that keep their (page, index) with another text and vector, and
+    leaves the surplus (page, index) pairs of the old cut behind as stale points. A collection
+    is to be ingested with one set of options; changing them requires a clean re-ingestion of
+    the document set. ``ValueError`` for a value that cannot be used.
     """
 
     max_headers_to_use: str = "h4"
@@ -344,10 +362,12 @@ def _safe_line_spacing(lines) -> float:
     larger font above two-line paragraphs, for instance) and the chunk texts differ. Production
     documents were chunked with this function, not with the library's.
 
-    Removing or changing it therefore moves the chunk boundaries of some PDFs. A chunk's text
-    determines its point id: re-ingesting such a PDF would then write points under new ids and
-    leave the old ones behind as stale points. Treat a change here as a change of chunking: it
-    needs a comparison on real documents and a plan for the points already stored.
+    Removing or changing it therefore moves the chunk boundaries of some PDFs. Point ids come
+    from ``doc_id``, page and chunk index, not from the text: re-ingesting such a PDF would
+    overwrite the points that keep their (page, index) with another text and vector, and leave
+    the surplus (page, index) pairs of the old cut behind as stale points. Treat a change here
+    as a change of chunking: it needs a comparison on real documents and a clean re-ingestion
+    of the document set.
 
     It also returns 0.0 on a document with fewer than two lines, where the method of 1.3.7
     fails with ``ValueError: max() arg is an empty sequence``.
