@@ -1,5 +1,5 @@
 {
-  "description": "A tiny corpus for the evaluation harness: 12 documents, 30 chunks. The embedder of the tests has no semantics: a question is answerable either because its text is the text of a chunk (identical vector), or because its filters isolate the expected document.",
+  "description": "A tiny corpus for the evaluation harness: 13 documents, 32 chunks. The embedder of the tests has no semantics: a question is answerable either because its text is the text of a chunk (identical vector), or because its filters isolate the expected document. One document, the combined decisions and statement, repeats a chunk of the decision and a chunk of the statement: these chunks have exactly the same score, on purpose.",
   "model": {
     "name": "fake",
     "dim": 16,
@@ -37,6 +37,22 @@
       },
       "chunks": [
         "Based on our regular economic and monetary analyses, we conducted a thorough review of the monetary policy stance.",
+        "Annual HICP inflation in the euro area is expected to remain negative in the coming months and to pick up later in 2016."
+      ]
+    },
+    {
+      "doc_id": "fx-ecb-combined-2016-03",
+      "metadata": {
+        "corpus": "central-bank",
+        "source_code": "ecb",
+        "doc_type": "B1",
+        "title": "Combined monetary policy decisions and statement, 10 March 2016",
+        "language": "en",
+        "date": "2016-03-10",
+        "year": 2016
+      },
+      "chunks": [
+        "Monthly purchases under the asset purchase programme will be expanded to 80 billion euro starting in April.",
         "Annual HICP inflation in the euro area is expected to remain negative in the coming months and to pick up later in 2016."
       ]
     },

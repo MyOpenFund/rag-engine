@@ -41,7 +41,7 @@ def store():
 def collection(store, request):
     """The fixture corpus in a collection of its own, without and with the payload indexes."""
     name = f"rag-engine-it-{uuid.uuid4().hex}"
-    assert load_fixture(store, name) == 30
+    assert load_fixture(store, name) == 32
     if request.param == "indexed":
         assert store.ensure_payload_indexes(name) == [field for field, _kind in PAYLOAD_INDEXES]
     yield name
@@ -62,20 +62,49 @@ def test_the_fixture_is_evaluated_end_to_end(store, collection):
         "fx-q07": 2,
         "fx-q08": None,
         "fx-q10": 1,
+        "fx-q11": 1,
+        "fx-q12": 2,
+        "fx-q13": 1,
     }
     overall = report.overall
-    assert overall.questions == 9
-    assert overall.hit_at_1 == pytest.approx(7 / 9)
-    assert overall.hit_at_k == pytest.approx(8 / 9)
-    assert overall.mrr == pytest.approx(7.5 / 9)
-    assert overall.recall_at_k == pytest.approx(7.5 / 9)
+    assert (overall.questions, overall.documents) == (12, 11)
+    assert overall.hit_at_1 == pytest.approx(9 / 12)
+    assert overall.hit_at_k == pytest.approx(11 / 12)
+    assert overall.mrr == pytest.approx(10 / 12)
+    assert overall.recall_at_k == pytest.approx(10.5 / 12)
+    headline = report.headline
+    assert report.headline_kinds == ("verbatim",)
+    assert (headline.questions, headline.documents) == (6, 4)
+    assert headline.per_document.hit_at_1 == pytest.approx(11 / 12)
+    assert headline.per_document.mrr == pytest.approx(23 / 24)
     assert [skipped.id for skipped in report.not_in_collection] == ["fx-q09"]
     assert [result.id for result in report.misses] == ["fx-q08"]
-    tenth = report.results[-1]
+    tenth = {result.id: result for result in report.results}["fx-q10"]
     assert tenth.absent_doc_ids == ("fx-us-presser-2016-03",)
     assert (report.fewer_than_k_documents, report.chunk_budget_exhausted) == (6, 0)
     assert report.parameters["collection"] == collection
-    assert "9 questions scored" in format_report(report)
+    assert "12 questions scored" in format_report(report)
+
+
+def test_equal_scores_are_ordered_the_same_way_on_a_real_server(store, collection):
+    """The same chunk stored in two documents: a real server gives both exactly the same score."""
+    questions = [question for question in load_questions(QUESTIONS) if question.id in ("fx-q12", "fx-q13")]
+    for chunk_limit in (50, 13, 2):
+        report = evaluate(
+            questions,
+            collection=collection,
+            store=store,
+            embedder=fixture_embedder(),
+            k=2,
+            chunk_limit=chunk_limit,
+        )
+        twelfth, thirteenth = report.results
+        first, second = twelfth.top_documents[:2]
+        assert (first.doc_id, second.doc_id) == ("fx-ecb-combined-2016-03", "fx-ecb-decision-2016-03")
+        assert first.score == second.score
+        assert (twelfth.rank, twelfth.tied_at_decision) == (2, True)
+        assert (thirteenth.rank, thirteenth.tied_at_decision) == (1, False)
+        assert report.tied_at_decision == 1
 
 
 def test_a_small_chunk_budget_is_reported_on_a_real_server(store, collection):
@@ -83,9 +112,9 @@ def test_a_small_chunk_budget_is_reported_on_a_real_server(store, collection):
     report = evaluate(
         questions, collection=collection, store=store, embedder=fixture_embedder(), k=10, chunk_limit=10
     )
-    assert report.overall.hit_at_1 == pytest.approx(7 / 9)
+    assert report.overall.hit_at_1 == pytest.approx(9 / 12)
     exhausted = {result.id for result in report.results if result.chunk_budget_exhausted}
-    assert exhausted == {"fx-q01", "fx-q02", "fx-q03", "fx-q08", "fx-q10"}
+    assert exhausted == {"fx-q01", "fx-q02", "fx-q03", "fx-q08", "fx-q10", "fx-q11", "fx-q12", "fx-q13"}
 
 
 def test_existing_doc_ids_on_a_real_server(store, collection):

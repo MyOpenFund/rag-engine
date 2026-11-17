@@ -1,6 +1,6 @@
 """Loads the evaluation fixture of ``eval/fixtures/`` into a collection, for the tests.
 
-``corpus.json`` holds twelve small documents (thirty chunks) and the model the fixture is
+``corpus.json`` holds thirteen small documents (thirty-two chunks) and the model the fixture is
 meant for: a ``FakeEmbedder`` whose passage and query prefixes are both empty, so that a
 question whose text is the text of a chunk gets the vector of that chunk. The unit tests
 (qdrant-client's local mode) and the integration test (a real server) load the same points.

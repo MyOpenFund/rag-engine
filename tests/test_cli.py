@@ -54,6 +54,7 @@ def built(monkeypatch, fixture_store):
     """The command wired to the fixture; records the settings its builders were given."""
     for name in ENVIRONMENT:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RAG_ENGINE_DIM", "16")  # the dimension of the fixture collection
     seen: dict[str, object] = {}
 
     def store(settings: Settings) -> QdrantStore:
@@ -102,6 +103,7 @@ def test_without_a_subcommand_is_a_usage_error(capsys):
         ["eval", "--questions", "q.jsonl", "--collection", "c", "--fail-under-hit-at-k", "-0.1"],
         ["eval", "--questions", "q.jsonl", "--collection", "c", "--fail-under-hit-at-k", "nan"],
         ["eval", "--questions", "q.jsonl", "--collection", "c", "--fail-under-hit-at-k", "most"],
+        ["eval", "--questions", "q.jsonl", "--collection", "c", "--bootstrap-resamples", "many"],
     ],
 )
 def test_bad_arguments_are_usage_errors(arguments, capsys, built):
@@ -115,7 +117,8 @@ def test_help_exits_with_0(capsys):
     text = capsys.readouterr().out
     for option in ("--questions", "--collection", "--k", "--chunk-limit", "--backend", "--output"):
         assert option in text
-    assert "--fail-under-hit-at-k" in text
+    assert "--fail-under-hit-at-k" in text and "headline" in text
+    assert "--allow-empty" in text and "--bootstrap-resamples" in text
 
 
 def test_the_module_can_be_run():
@@ -148,8 +151,10 @@ def test_eval_writes_the_json_report(built, capsys, tmp_path):
     data = json.loads(output.read_text(encoding="utf-8"))
     assert data["parameters"]["k"] == 1 and data["parameters"]["chunk_limit"] == 20
     assert data["parameters"]["collection"] == COLLECTION
-    assert data["summary"]["scored"] == 9
-    assert [miss["id"] for miss in data["misses"]] == ["fx-q07", "fx-q08"]
+    assert data["summary"]["scored"] == 12
+    assert [miss["id"] for miss in data["misses"]] == ["fx-q07", "fx-q08", "fx-q12"]
+    assert data["parameters"]["bootstrap_resamples"] == 1000
+    assert data["metrics"]["headline"]["kinds"] == ["verbatim"]
     assert output.read_text(encoding="utf-8").endswith("}\n")
     assert "hit@1" in capsys.readouterr().out
 
@@ -160,26 +165,81 @@ def test_eval_output_in_a_missing_directory_is_refused_before_the_evaluation(bui
     assert "embedder" not in built
 
 
-@pytest.mark.parametrize(("threshold", "code"), [("0.88", 0), ("0.8888", 0), ("0.9", 1), ("1", 1), ("0", 0)])
-def test_fail_under_hit_at_k(built, capsys, threshold, code, tmp_path):
+@pytest.mark.parametrize(("threshold", "code"), [("0.91", 0), ("0.9166", 0), ("0.92", 1), ("1", 1), ("0", 0)])
+def test_fail_under_hit_at_k_looks_at_the_headline(built, capsys, threshold, code, tmp_path):
+    # With k = 1 the headline (the unfiltered kind, per document) is 11/12 = 0.9167. The pooled hit@1
+    # is 9/12 and the per-question one of the same kind 5/6: neither is what the threshold reads.
     output = tmp_path / "report.json"
-    assert run("--fail-under-hit-at-k", threshold, "--output", str(output)) == code
+    assert run("--k", "1", "--fail-under-hit-at-k", threshold, "--output", str(output)) == code
     captured = capsys.readouterr()
-    assert "overall" in captured.out  # the report is printed either way
+    assert "headline" in captured.out  # the report is printed either way
     assert output.is_file()  # and written either way
     assert ("below" in captured.err) is (code == 1)
     if code == 1:
-        assert "hit@10" in captured.err and "0.889" in captured.err
+        assert "headline hit@1" in captured.err and "0.917" in captured.err
 
 
-def test_fail_under_is_not_met_when_nothing_could_be_scored(built, capsys, tmp_path):
+def test_fail_under_is_met_by_the_headline_even_when_filtered_kinds_miss(built, capsys):
+    # Every unfiltered question finds its document among ten; a filtered one (fx-q08) does not.
+    assert run("--fail-under-hit-at-k", "1") == 0
+    assert "Misses (1)" in capsys.readouterr().out
+
+
+def test_fail_under_is_not_met_without_a_headline(built, capsys, tmp_path):
+    # Every question of the file carries filters: there is no kind for a headline.
     questions = tmp_path / "q.jsonl"
-    questions.write_text('{"id": "q1", "question": "anything", "expected_doc_ids": ["ghost"]}\n')
+    line = {
+        "id": "q1",
+        "question": "anything",
+        "expected_doc_ids": ["fx-us-projections-2015-12"],
+        "filters": {"doc_types": ["F1"]},
+    }
+    questions.write_text(json.dumps(line) + "\n")
     arguments = ["eval", "--questions", str(questions), "--collection", COLLECTION]
     assert cli.main(arguments) == 0
-    assert "0 questions scored" in capsys.readouterr().out
+    assert "1 questions scored" in capsys.readouterr().out
     assert cli.main([*arguments, "--fail-under-hit-at-k", "0.5"]) == 1
-    assert "no question could be scored" in capsys.readouterr().err
+    assert "no question asked without filters could be scored" in capsys.readouterr().err
+
+
+def test_a_collection_without_any_expected_document_is_refused(built, capsys, tmp_path):
+    questions = tmp_path / "q.jsonl"
+    questions.write_text(
+        '{"id": "q1", "question": "anything", "expected_doc_ids": ["ghost"]}\n'
+        '{"id": "q2", "question": "anything else", "expected_doc_ids": ["ghost", "phantom"]}\n'
+    )
+    output = tmp_path / "report.json"
+    arguments = ["eval", "--questions", str(questions), "--collection", COLLECTION, "--output", str(output)]
+    assert cli.main(arguments) == 2
+    assert_refused(capsys, built, "none of the 2 documents", repr(COLLECTION), "--allow-empty")
+    assert not output.exists()
+
+
+def test_allow_empty_runs_on_a_collection_without_any_expected_document(built, capsys, tmp_path):
+    questions = tmp_path / "q.jsonl"
+    questions.write_text('{"id": "q1", "question": "anything", "expected_doc_ids": ["ghost"]}\n')
+    arguments = ["eval", "--questions", str(questions), "--collection", COLLECTION, "--allow-empty"]
+    assert cli.main(arguments) == 0
+    captured = capsys.readouterr()
+    assert "0 questions scored" in captured.out
+    assert captured.err.startswith("rag-engine: warning: ") and "none of the 1 documents" in captured.err
+    assert cli.main([*arguments, "--fail-under-hit-at-k", "0.5"]) == 1
+    assert "no question asked without filters could be scored" in capsys.readouterr().err
+
+
+def test_allow_empty_changes_nothing_when_documents_are_there(built, capsys):
+    assert run("--allow-empty") == 0
+    captured = capsys.readouterr()
+    assert "12 questions scored" in captured.out and captured.err == ""
+
+
+def test_the_number_of_resamples_is_an_option(built, capsys, tmp_path):
+    output = tmp_path / "report.json"
+    assert run("--bootstrap-resamples", "50", "--output", str(output)) == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["parameters"]["bootstrap_resamples"] == 50
+    assert "50 resamples" in capsys.readouterr().out
+    assert run("--bootstrap-resamples", "0") == 2
+    assert "--bootstrap-resamples" in capsys.readouterr().err
 
 
 def test_the_settings_come_from_the_environment(built, monkeypatch, capsys):
@@ -272,7 +332,16 @@ def test_a_missing_backend_is_refused_with_the_install_hint(built, capsys, monke
     assert_refused(capsys, built, "rag-engine[torch]")
 
 
-def test_a_collection_of_another_dimension_is_refused(built, capsys, monkeypatch):
+def test_a_collection_of_another_dimension_is_refused_before_the_model_is_loaded(built, capsys, monkeypatch):
+    monkeypatch.setenv("RAG_ENGINE_DIM", "768")
+    assert run() == 2
+    # assert_refused checks that no embedder was built: the cheap check comes first.
+    assert_refused(capsys, built, "768", "16", repr(COLLECTION), "RAG_ENGINE_DIM")
+    assert "store_settings" in built
+
+
+def test_a_model_of_another_dimension_than_announced_is_refused_too(built, capsys, monkeypatch):
+    # The settings announce 16, the dimension of the collection, and the model built produces 768.
     class Wide:
         dim = 768
         model_name = "wide"
@@ -287,6 +356,52 @@ def test_a_collection_of_another_dimension_is_refused(built, capsys, monkeypatch
     assert captured.err.startswith("rag-engine: error: ")
     assert "768" in captured.err and "16" in captured.err
     assert Wide.released is True
+
+
+def named_vectors_store(vectors_config):
+    from qdrant_client import models
+
+    client = QdrantClient(":memory:")
+    client.create_collection("named", vectors_config=vectors_config)
+    return QdrantStore(client=client), models
+
+
+def test_a_collection_with_named_vectors_gets_a_clear_message(built, capsys, monkeypatch):
+    from qdrant_client import models
+
+    config = {
+        "title": models.VectorParams(size=16, distance=models.Distance.COSINE),
+        "body": models.VectorParams(size=16, distance=models.Distance.COSINE),
+    }
+    store, _ = named_vectors_store(config)
+    monkeypatch.setattr(cli, "_store", lambda settings: store)
+    assert cli.main(["eval", "--questions", str(QUESTIONS), "--collection", "named"]) == 2
+    assert_refused(capsys, built, "'named'", "named vectors", "'body', 'title'", "unnamed")
+    store.client.close()
+
+
+def test_the_checks_come_in_order_of_cost(built, capsys, monkeypatch, fixture_store):
+    """Dimension, then the presence of the expected documents, then the model."""
+    calls = []
+    original = fixture_store.existing_doc_ids
+
+    def recording(collection, doc_ids, **kwargs):
+        calls.append("documents")
+        return original(collection, doc_ids, **kwargs)
+
+    def embedder(settings):
+        calls.append("model")
+        return fixture_embedder()
+
+    monkeypatch.setattr(fixture_store, "existing_doc_ids", recording)
+    monkeypatch.setattr(cli, "_embedder", embedder)
+    assert run() == 0
+    assert calls[:2] == ["documents", "model"]
+    capsys.readouterr()
+    calls.clear()
+    monkeypatch.setenv("RAG_ENGINE_DIM", "768")
+    assert run() == 2
+    assert calls == []  # the dimension is wrong: the documents are not even looked up
 
 
 def test_a_failure_during_the_evaluation_is_exit_code_2_not_1(built, capsys, monkeypatch):
