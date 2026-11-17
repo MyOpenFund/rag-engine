@@ -167,6 +167,8 @@ docker run --rm -p 6333:6333 qdrant/qdrant:v1.20.0
 RAG_ENGINE_IT_QDRANT_URL=http://localhost:6333 pytest -m integration -q
 ```
 
+The integration tests of ingestion parse real documents, so they also need the `ingest` extra and skip without it; the CI integration job installs it and fails if the parsers cannot be imported.
+
 ## Licence
 
 MIT, see [LICENSE](LICENSE). Portions are derived from eigenmind (MIT); see [NOTICE](NOTICE).
