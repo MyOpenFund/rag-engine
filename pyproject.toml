@@ -31,7 +31,8 @@ torch = ["sentence-transformers"]
 # compare the chunks of the new minor version with those of 1.5.0 on real documents.
 # psutil: imported by chunknorris (1.5.0) without being declared in its dependencies.
 ingest = ["chunknorris>=1.3.7,<1.6", "markitdown[pptx]", "psutil"]
-dev = ["pytest>=8.3", "ruff>=0.6"]
+# ruff is bounded: CI runs "ruff format --check", and a new ruff release may change its style.
+dev = ["pytest>=8.3", "ruff>=0.17,<0.18"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rag_engine"]
