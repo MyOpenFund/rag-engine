@@ -358,7 +358,9 @@ def test_an_altered_onnx_file_is_refused_before_any_inference(vectors, tmp_path,
     # A model directory of its own: a full copy of the pinned files, one byte of the ONNX file
     # changed (same size, so only the hash can tell).
     copy = tmp_path / source.parents[1].name / "snapshots" / pinned.revision
-    shutil.copytree(source, copy)  # follows the links of the cache: real files
+    # copyfile, not the default copy2: the files of a freshly downloaded cache are read-only,
+    # and copy2 would carry that mode over to the copy that has to be altered.
+    shutil.copytree(source, copy, copy_function=shutil.copyfile)  # follows the links: real files
     altered = copy / pinned.model_file
     with open(altered, "r+b") as stream:
         stream.seek(pinned.size // 2)
