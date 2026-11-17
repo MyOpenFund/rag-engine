@@ -356,7 +356,7 @@ rag-engine eval --questions eval/known_item_v1.jsonl --collection documents \
 |---|---|
 | `--questions FILE` | The question file (JSON Lines). Required. |
 | `--collection NAME` | The Qdrant collection to search. Required; it must exist, with one unnamed vector of the dimension of the model (`RAG_ENGINE_DIM`), compared by cosine. |
-| `--k N` | Number of documents the metrics look at. Default 10; at most `--chunk-limit`. A question with more essential documents than `k` can never have them all: raise it for chain and aggregation questions. |
+| `--k N` | Number of documents the metrics look at. Default 10; at most `--chunk-limit`. A question with more requirements (essential documents and either-of groups) than `k` can never have them all: raise it for chain and aggregation questions. |
 | `--chunk-limit N` | Number of chunks asked to the search per question. Default 50; at most `RAG_ENGINE_SEARCH_MAX_LIMIT`. |
 | `--backend torch\|onnx` | Embedding backend. Default: `RAG_ENGINE_BACKEND`. |
 | `--output FILE` | Also write the full report as JSON: parameters, metrics, every question with its first documents. |
@@ -375,25 +375,27 @@ What is cheap is checked before the embedding model is loaded: the question file
 
 - `eval/known_item_v1.jsonl`: 797 automatic questions that ask for a document by its title or its catalogue label, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`. The words follow what a doc type is at each bank, a date is never stated more precisely than the manifest knows it nor presented as a meeting date when it is a publication date, and a question expects every document that holds the text asked for (the ECB publishes its decision and its statement a second time as one combined document). [`eval/README.md`](eval/README.md) has the tables and the evidence.
 
-A second file, `eval/analytical_v2.jsonl`, holds 79 questions on the content of the documents, written by hand and checked against them: chains over several meetings, comparisons between banks, buried details, false premises and questions the corpus cannot answer. It uses the second version of the question format (essential and acceptable documents, expected behaviour, a second run without filters); see `eval/README.md`.
+A second file, `eval/analytical_v2.jsonl`, holds 79 questions on the content of the documents, written by hand and checked against them: chains over several meetings, comparisons between banks, buried details, false premises and questions the corpus cannot answer. It uses the second version of the question format (essential and acceptable documents, either-of groups, expected behaviour, a second run without filters). `eval/README.md` says how the questions were checked and what was not, which numbers to read for this batch, and its measured limits (75 of the 79 questions name the bank, 63 pairs of questions share a required document).
 
 **Format v2.** A question may say more, and a file that says none of it is read and scored exactly as before:
 
 | Field | Meaning |
 |---|---|
 | `expected_behavior` | `"answer"` (the default), `"correct_premise"` (the premise is false and the documents show it) or `"abstain"` (the collection does not hold the information). |
-| `essential_ids`, `acceptable_ids` | The documents the answer needs, and those that are relevant without being needed: two lists without a common document. `expected_doc_ids` is then the two together: it may be left out, and if given must name the same documents. It may be empty only for a question that abstains. |
+| `essential_ids`, `acceptable_ids` | The documents the answer needs, and those that are relevant without being needed: two lists without a common document. `expected_doc_ids` is then all of them together: it may be left out, and if given must name the same documents. It may be empty only for a question that abstains. |
+| `essential_any_of` | Groups of documents that carry the same fact (the decision release and the combined document of one day): the answer needs any one document of each group. A *requirement* is one essential document or one group. |
 | `must_include`, `must_not_include` | Short facts a right answer holds, and typical false statements. **Carried, not scored**: the engine returns documents and writes no answer; they are validated and written into the JSON report for a scorer of the answers a client generates. |
 | `run_unfiltered` | `true`: score the question a second time without its filters. Only on a question with filters. |
 
 What these add to the scoring, all on documents and cut at `k`:
 
-- **`essential_recall@k`** (the share of the essential documents among the first `k`) and **`all_essential@k`** (whether all of them are), per group, over the questions and over the essential documents, with intervals on the kinds and the headline. hit@1, hit@k and MRR are unchanged: they look at the first expected document, essential or acceptable, so an acceptable document at rank 1 is a hit. A question that does not state its essential documents is left out of the two new metrics. A question with more essential documents than `k` can never reach 1: the report counts and lists them (`unreachable`); raise `--k`, which `--chunk-limit` bounds.
+- **`all_essential@k`**, always the **share of questions** with every requirement satisfied among the first `k`, printed with its counts (`0.75 (3/4)`), and **`essential_recall@k`**, the share of the requirements satisfied, printed as a mean over the questions and pooled over the requirements; intervals on the kinds and the headline come from resampling the questions. hit@1, hit@k and MRR are unchanged: they look at the first expected document, essential or acceptable, so an acceptable document at rank 1 is a hit. A question that does not state its essential documents is left out of the two new metrics. A question with more requirements than `k` can never reach 1: the report counts and lists them (`unreachable`); raise `--k`, which `--chunk-limit` bounds.
+- **The first table again per question.** Its lines are per-document means, in which a question that expects 44 documents weighs 44 times a question that expects one; a second table gives the plain means over the questions, and the report counts the questions that expect more documents than `k`, whose recall@k cannot reach 1.
 - **A second run without filters** is reported under `<id>#unfiltered`, in a kind of its own (`<kind>#unfiltered`) that belongs to the headline, with the tag `unfiltered-rerun`; a table, *what the filter brings*, compares the two runs of these questions.
-- **A question that abstains and expects no document** is searched and left out of every mean. The report lists the first document returned, its score and the number of documents at or above a few score levels, next to the lowest, median and highest top score of the scored questions: material to study a threshold for abstention. No threshold is applied and nothing passes or fails.
-- One line **per expected behaviour**: `correct_premise` questions, and abstentions that name documents, are scored on these documents like any question.
+- **A question that abstains** is searched and left out of every mean, whether it lists documents or not. The documents it lists are context documents, which a system may show while it says that the corpus does not answer; none is essential (an essential document on such a question is refused when the file is read). The report lists the first document returned, its score, the number of documents at or above a few score levels and how many of the context documents are among the first `k`, next to the lowest, median and highest top score of the scored questions: material to study a threshold for abstention. No threshold is applied and nothing passes or fails.
+- One line **per expected behaviour**: `correct_premise` questions are scored on their documents like any question; the questions that abstain have a count and no metric.
 
-`rag-engine eval-check --questions FILE [--manifests GLOB ...] [--doc-types ...] [--mime ...] [--k N]` checks a question file without any collection, model or setting: it prints the counts per kind, tag, expected behaviour and language, the questions with filters, the distribution of essential and expected documents, the texts used twice, and, with the manifests of the corpus, the documents named that are not in the catalogue (or not of the doc types and MIME types ingested). Exit code 0, or 2 when the file breaks a rule or names a document that is not found. [`eval/README.md`](eval/README.md) has a complete example line, every rule, and how to read the new parts of the report.
+`rag-engine eval-check --questions FILE [--manifests GLOB ...] [--doc-types ...] [--mime ...] [--k N]` checks a question file without any collection, model or setting: it prints the counts per kind, tag, expected behaviour and language, the questions with filters, the questions that abstain, the distribution of requirements and of expected documents, the texts used twice, the questions with more requirements or more expected documents than `k`, and, with the manifests of the corpus, the documents named that are not in the catalogue (or not of the doc types and MIME types ingested). Exit code 0, or 2 when the file breaks a rule or names a document that is not found. [`eval/README.md`](eval/README.md) has a complete example line, every rule, and how to read the new parts of the report.
 
 How to read the numbers of the known-item batch: it is a stratified sample, 12 documents per (bank, doc type) cell, so its averages weigh the 18 cells equally and are not weighted like the corpus; and all the documents are English, so its French questions measure cross-lingual retrieval.
 
@@ -447,9 +449,9 @@ report.headline.intervals  # {"hit_at_1": (low, high), "hit_at_k": ..., "mrr": .
 report.by_kind, report.by_tag, report.overall  # an Aggregate each; overall is pooled over the questions
 report.tied_at_decision  # questions whose hit@1 or hit@k hangs on the order of equal scores
 report.misses  # the questions without an expected document among the first k
-report.headline.essential  # essential_recall_at_k, all_essential_at_k, per_document, intervals; None if not stated
+report.headline.essential  # all_essential_at_k (share of questions), essential_recall_at_k, pooled_..., question_intervals
 report.unfiltered_reruns, report.filter_effect  # the second runs without filters, and the comparison
-report.abstentions, report.top_scores  # the questions that expect no document; the top scores to compare with
+report.abstentions, report.top_scores  # the questions that abstain; the top scores to compare with
 report.by_behavior  # an Aggregate per expected_behavior
 report.to_json()  # everything, as JSON
 ```
