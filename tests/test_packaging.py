@@ -31,6 +31,7 @@ ENGINE_MODULES = [
     "rag_engine.ingest",
     "rag_engine.search",
     "rag_engine.eval",
+    "rag_engine.eval_check",
     "rag_engine.cli",
 ]
 
@@ -266,6 +267,14 @@ PUBLIC_NAMES = {
         "evaluate",
         "format_report",
         "load_questions",
+    },
+    "rag_engine.eval_check": {
+        "CatalogueEntry",
+        "DocumentReference",
+        "QuestionCheck",
+        "check_questions",
+        "format_check",
+        "load_catalogue",
     },
     "rag_engine.cli": {"main"},
 }

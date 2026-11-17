@@ -1,4 +1,4 @@
-"""The ``rag-engine`` command: ``--version`` and ``eval``.
+"""The ``rag-engine`` command: ``--version`` and ``eval`` (``eval-check`` is in ``test_eval_check.py``).
 
 The command builds its store and its embedder from the environment. The tests replace these
 two builders with qdrant-client's local mode and a ``FakeEmbedder`` holding the fixture of
@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 import pytest
-from eval_fixture import QUESTIONS, fixture_embedder, load_fixture
+from eval_fixture import QUESTIONS, QUESTIONS_V2, fixture_embedder, load_fixture
 from qdrant_client import QdrantClient
 
 import rag_engine
@@ -104,6 +104,13 @@ def test_without_a_subcommand_is_a_usage_error(capsys):
         ["eval", "--questions", "q.jsonl", "--collection", "c", "--fail-under-hit-at-k", "nan"],
         ["eval", "--questions", "q.jsonl", "--collection", "c", "--fail-under-hit-at-k", "most"],
         ["eval", "--questions", "q.jsonl", "--collection", "c", "--bootstrap-resamples", "many"],
+        ["eval", "--questions", "q.jsonl", "--collection", "c", "--score-levels"],
+        ["eval", "--questions", "q.jsonl", "--collection", "c", "--score-levels", "high"],
+        ["eval", "--questions", "q.jsonl", "--collection", "c", "--score-levels", "0.8", "nan"],
+        ["eval", "--questions", "q.jsonl", "--collection", "c", "--score-levels", "inf"],
+        ["eval-check"],
+        ["eval-check", "--questions", "q.jsonl", "--k", "ten"],
+        ["eval-check", "--questions", "q.jsonl", "--collection", "c"],
     ],
 )
 def test_bad_arguments_are_usage_errors(arguments, capsys, built):
@@ -240,6 +247,113 @@ def test_the_number_of_resamples_is_an_option(built, capsys, tmp_path):
     assert "50 resamples" in capsys.readouterr().out
     assert run("--bootstrap-resamples", "0") == 2
     assert "--bootstrap-resamples" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# eval on the second version of the question format
+# ---------------------------------------------------------------------------
+def run_v2(*arguments: str) -> int:
+    return cli.main(["eval", "--questions", str(QUESTIONS_V2), "--collection", COLLECTION, *arguments])
+
+
+def test_eval_runs_the_second_fixture(built, capsys, fixture_store, tmp_path):
+    output = tmp_path / "report.json"
+    assert run_v2("--output", str(output)) == 0
+    captured = capsys.readouterr()
+    expected = evaluate(
+        load_questions(str(QUESTIONS_V2)),
+        collection=COLLECTION,
+        store=fixture_store,
+        embedder=fixture_embedder(),
+    )
+    assert captured.out == format_report(expected) + "\n"
+    assert captured.err == ""
+    for section in (
+        "Per expected behaviour",
+        "Essential documents",
+        "More essential documents than k=10 (1)",
+        "What the filter brings (2 questions",
+        "Abstention (2 questions",
+        ">=0.7  >=0.75  >=0.8  >=0.85  >=0.9",
+    ):
+        assert section in captured.out
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data == json.loads(expected.to_json())
+    assert data["parameters"]["score_levels"] == [0.7, 0.75, 0.8, 0.85, 0.9]
+    assert data["summary"]["abstentions"] == 2 and data["summary"]["unfiltered_reruns"] == 2
+    assert data["results"][0]["must_include"] == ["80 billion euro", "April"]
+    assert data["metrics"]["headline"]["essential"]["unreachable"] == 1
+
+
+def test_the_score_levels_are_an_option(built, capsys, tmp_path):
+    output = tmp_path / "report.json"
+    assert run_v2("--score-levels", "0.999", "-1", "--output", str(output)) == 0
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["parameters"]["score_levels"] == [-1.0, 0.999]
+    assert data["abstentions"]["questions"][0]["documents_at_or_above"] == [
+        {"score": -1.0, "documents": 13},
+        {"score": 0.999, "documents": 1},
+    ]
+    assert ">=-1  >=0.999" in capsys.readouterr().out
+    assert run_v2("--score-levels", "0.8", "0.8") == 2
+    assert "score_levels names a score twice" in capsys.readouterr().err
+
+
+def test_a_larger_k_is_what_a_question_with_many_essential_documents_needs(built, capsys):
+    assert run_v2("--k", "13") == 0
+    out = capsys.readouterr().out
+    assert "More essential documents" not in out and "essential_recall@13" in out
+    # k is bounded by the chunk budget, which is bounded by the search maximum.
+    assert run_v2("--k", "60") == 2
+    assert "--k 60 documents cannot be ranked from --chunk-limit 50 chunks" in capsys.readouterr().err
+    assert run_v2("--k", "60", "--chunk-limit", "60") == 2
+    assert "RAG_ENGINE_SEARCH_MAX_LIMIT" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("threshold", "code"), [("1", 0), ("0", 0)])
+def test_fail_under_looks_at_the_headline_of_the_second_fixture(built, capsys, threshold, code):
+    # The headline: the kind asked without filters and the second runs; its hit@10 is 1.
+    assert run_v2("--fail-under-hit-at-k", threshold) == code
+
+
+def test_fail_under_counts_a_second_run_that_misses(built, capsys, tmp_path):
+    # With its filter the report is alone; without it the minutes, which hold the text, are first and
+    # with k = 1 the second run is a miss. The second run is the whole headline.
+    line = {
+        "id": "q1",
+        "question": "The Committee voted unanimously to reduce Bank Rate by 25 basis points to 0.25 percent.",
+        "expected_doc_ids": ["fx-gb-report-2016-08"],
+        "filters": {"doc_types": ["E1"], "source_codes": ["gb"]},
+        "run_unfiltered": True,
+    }
+    questions = tmp_path / "q.jsonl"
+    questions.write_text(json.dumps(line) + "\n")
+    arguments = ["eval", "--questions", str(questions), "--collection", COLLECTION, "--k", "1"]
+    assert cli.main(arguments) == 0
+    out = capsys.readouterr().out
+    assert "kind: (none)#unfiltered" in out and "Misses (1)" in out and "q1#unfiltered" in out
+    assert cli.main([*arguments, "--fail-under-hit-at-k", "0.5"]) == 1
+    assert "the headline hit@1 is 0.000, below the required 0.5" in capsys.readouterr().err
+
+
+def test_a_file_of_questions_that_expect_no_document_runs(built, capsys, tmp_path):
+    line = {
+        "id": "q1",
+        "question": "What did the Swiss National Bank say about the franc?",
+        "expected_behavior": "abstain",
+        "expected_doc_ids": [],
+    }
+    questions = tmp_path / "q.jsonl"
+    questions.write_text(json.dumps(line) + "\n")
+    arguments = ["eval", "--questions", str(questions), "--collection", COLLECTION]
+    # No document is expected: there is none to look for, and that is not the wrong collection.
+    assert cli.main(arguments) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "0 questions scored (1 read, 0 not in the collection)" in captured.out
+    assert "Abstention (1 question that expect no document" in captured.out
+    assert cli.main([*arguments, "--fail-under-hit-at-k", "0.5"]) == 1
+    assert "no question asked without filters could be scored" in capsys.readouterr().err
 
 
 def test_the_settings_come_from_the_environment(built, monkeypatch, capsys):
