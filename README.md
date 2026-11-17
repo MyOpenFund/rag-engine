@@ -17,7 +17,7 @@ Python 3.10 or later. The base install is light; each consumer adds only the ext
 |---|---|---|
 | `rag-engine` | `qdrant-client` (1.10 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, indexes, writes), search |
 | `rag-engine[torch]` | `sentence-transformers` | PyTorch embedding backend |
-| `rag-engine[onnx]` | `fastembed` (ONNX runtime) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
+| `rag-engine[onnx]` | `fastembed` 0.9.x (ONNX runtime, `huggingface_hub`) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
 | `rag-engine[ingest]` | `chunknorris`, `markitdown[pptx]`, `psutil` | document parsing and chunking |
 | `rag-engine[dev]` | `pytest`, `ruff` | development |
 
@@ -32,7 +32,7 @@ The package root exposes only `__version__`. Everything else is imported from it
 | `rag_engine.config` | `Settings`, `ConfigError`, `valid_ocr_languages` |
 | `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `RESERVED_KEYS`, `PAYLOAD_INDEXES` |
 | `rag_engine.store` | `QdrantStore`, `StoreError`, `QdrantAuthError`, `CollectionMismatchError` |
-| `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE` |
+| `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE`, `ModelIntegrityError`, `ModelDownloadError` |
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
 | `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `QUERY_NORMALIZATION` |
@@ -57,6 +57,7 @@ Errors. Every exception class the engine defines derives from `rag_engine.errors
 | `RAG_ENGINE_BACKEND` | `torch` | Embedding backend, `torch` or `onnx` (case-insensitive); see [Embedding backends](#embedding-backends) |
 | `RAG_ENGINE_MODEL_CACHE` | none | Directory for model files. Unset leaves the backend default: the Hugging Face cache for `torch`; `FASTEMBED_CACHE_PATH`, or a folder under the system's temporary directory, for `onnx` |
 | `RAG_ENGINE_PARITY_MIN` | `0.999` | Smallest cosine accepted between the `torch` and `onnx` vectors of the same text (above 0, at most 1). Read by the parity test only |
+| `RAG_ENGINE_ONNX_THREADS` | none | Threads the `onnx` backend runs inference on (at least 1). Unset: the ONNX runtime decides, from the cores of the host. **In a container with a CPU limit, set it to the limit**; see [Embedding backends](#embedding-backends) |
 | `RAG_ENGINE_BATCH_SIZE` | `100` | Points sent to Qdrant per write (at least 1). It sizes the writes only: all the chunks of a document are embedded in one call |
 | `RAG_ENGINE_OCR_LANGUAGES` | `eng` | Tesseract languages joined by `+`, without whitespace, e.g. `eng+fra`. The caller passes it to `ingest_document` (see below) |
 | `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. The caller passes it to `search` (see [Searching](#searching)) |
@@ -87,22 +88,26 @@ The API key is never printed: `repr()` and `str()` of a `Settings` show `qdrant_
 
 The intended setup is **passages embedded with `torch`, queries embedded with `onnx`**. It is valid only if both backends give the same vector for the same text, so this is measured, not assumed.
 
-**Measured parity** for `intfloat/multilingual-e5-base` (repository revision `d1287505`, file `onnx/model.onnx`; fastembed 0.9.1, onnxruntime 1.32.0, torch 2.15.0 CPU, sentence-transformers 6.3.0), on 50 fixed texts in English, French, German, Spanish, Italian and Japanese — single words, an empty string, numbers and identifiers, composed and decomposed accents, texts of about 400 words and of about 900 words (cut at 512 tokens):
+**Measured parity** for `intfloat/multilingual-e5-base` (repository revision `d128750597153bb5987e10b1c3493a34e5a4502a`, file `onnx/model.onnx`, 1,110,059,084 bytes, SHA-256 `84a4d426f7e87a6bf5bf195f0bae2c4a7d15f675b23ca96f42fab8326d7a77aa`; fastembed 0.9.1, onnxruntime 1.32.0, torch 2.15.0 CPU, sentence-transformers 6.3.0), on 50 fixed texts in English, French, German, Spanish, Italian and Japanese — single words, an empty string, numbers and identifiers, composed and decomposed accents, texts of about 400 words and of about 900 words (cut at 512 tokens):
 
 | Vectors | Minimum cosine, torch against onnx | Mean |
 |---|---|---|
 | passages | 1 − 1.3 × 10⁻¹¹ | 1.000000 |
 | queries | 1 − 3.9 × 10⁻¹² | 1.000000 |
 
-On a corpus of 20 chunks and 5 queries, the five best chunks of every query are the same, in the same order, with `onnx` queries as with `torch` queries. The test (`tests/test_parity.py`, marker `models`) fails below `RAG_ENGINE_PARITY_MIN` (0.999) or on any difference of ranking; CI runs it in the `parity` job. Run it again after changing the model or upgrading `fastembed`, `onnxruntime`, `torch` or `sentence-transformers`. `rag_engine.embedding.cosine_parity(a, b)` gives the cosine of each pair of rows of two arrays of vectors.
+On a corpus of 20 chunks and 5 queries, the five best chunks of every query are the same, in the same order, with `onnx` queries as with `torch` queries. The test (`tests/test_parity.py`, marker `models`) fails below `RAG_ENGINE_PARITY_MIN` (0.999) or on any difference of ranking; CI runs it in the `parity` job. The test loads the ONNX file exactly as production does, checks that the vectors came from the pinned file on the CPU provider, and checks that a copy with one byte changed is refused. Run it again after changing the model or upgrading `fastembed`, `onnxruntime`, `torch` or `sentence-transformers`; `fastembed` is bounded to the tested minor version (`>=0.9,<0.10`), and the bound is raised only after this test has passed on the new version. `rag_engine.embedding.cosine_parity(a, b)` gives the cosine of each pair of rows of two arrays of vectors.
 
 What the `onnx` backend does, and why it matches:
 
-- **Model file.** fastembed does not ship `intfloat/multilingual-e5-base`; the engine registers it from the table `rag_engine.embedding.ONNX_MODELS`: the full-precision `onnx/model.onnx` of the model's own Hugging Face repository (not a quantised variant), mean pooling over the attention mask, then normalisation — the pipeline of sentence-transformers for this model. A model that fastembed lists itself is used as fastembed defines it. Any other name raises a `ValueError`.
+- **Model file, pinned and verified.** The table `rag_engine.embedding.ONNX_MODELS` names the one ONNX export the engine loads for `intfloat/multilingual-e5-base`: the full-precision `onnx/model.onnx` of the model's own Hugging Face repository (not a quantised variant), at one revision, with its size and SHA-256 — the file the parity above was measured on. The engine fetches that revision itself (`huggingface_hub.snapshot_download`: the ONNX file, `config.json`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`) and hands the directory to fastembed, which downloads nothing. **Before the model is loaded, the ONNX file is hashed and compared with the table**; a different size or hash raises `ModelIntegrityError`, naming the expected and found hashes. A changed export can therefore not reach production unnoticed, whatever the head of the repository holds that day. Hashing 1.1 GB takes about one second; it is done once per process and file (kept for the same path, size and modification time). Only the ONNX file is hashed; the tokenizer files come from the same revision. To change the model file, re-measure parity first, then update the table.
+- **Pipeline.** Mean pooling over the attention mask, then normalisation — the pipeline of sentence-transformers for this model. The engine registers the model with fastembed under a name of its own, so a model that a later fastembed would list under the same name, with another file or pooling, is never used instead.
+- **Other models.** A model that is not in the table but that fastembed lists is used as fastembed defines and downloads it, with a warning in the log: its file is not pinned or verified by the engine, and its parity was not measured. Any other name raises a `ValueError`.
+- **CPU only.** The session is created with the CPU execution provider alone, also where the GPU build of onnxruntime is installed: parity was measured on CPU.
+- **Threads.** By default the ONNX runtime sizes its thread pool from the cores of the host. It does not see the CPU limit of a container (`docker run --cpus=2`, a Kubernetes CPU limit): with more threads than CPUs, inference gets slower, not faster. In a CPU-limited container set `RAG_ENGINE_ONNX_THREADS` to the limit (`OnnxEmbedder(..., threads=...)` does the same).
 - **Prefixes.** The engine adds the prefix once and calls fastembed's plain `embed`; fastembed adds none of its own.
 - **Long texts.** The tokenizer cuts at the limit declared by the model (512 tokens), as sentence-transformers does: both backends see the same tokens.
 - **Batches.** Texts are embedded 32 at a time (`OnnxEmbedder(..., batch_size=...)`, or `make_embedder(settings, batch_size=...)`). A batch is padded to its longest text and the padding is left out of the pooling, so the vector of a text does not depend on its neighbours.
-- **Files.** The first use downloads about 1.1 GB into `RAG_ENGINE_MODEL_CACHE`. Without it, fastembed stores them under the system's temporary directory, which a reboot may clear: set the variable (or `FASTEMBED_CACHE_PATH`) on a server.
+- **Files.** The first use downloads about 1.1 GB into `RAG_ENGINE_MODEL_CACHE`. Without it, the files go where fastembed puts its own (`FASTEMBED_CACHE_PATH`, or a folder under the system's temporary directory, which a reboot may clear): set the variable on a server. Once the files are there, loading makes no request to the Hugging Face Hub. When they are missing and cannot be downloaded, a `ModelDownloadError` says which files, from which repository and revision, and into which directory; on a host without access to huggingface.co, point `RAG_ENGINE_MODEL_CACHE` at a directory filled beforehand (the directory of a host where the model was loaded once can be copied as it is).
 
 ## Ingesting a document
 
@@ -157,7 +162,7 @@ Search filters need payload indexes: Qdrant answers a filter on an indexed field
 | `year` | integer | exact match and range |
 | `date` | datetime | range |
 
-`QdrantStore.ensure_payload_indexes` creates the ones a collection does not have yet and returns the fields it indexed:
+`QdrantStore.ensure_payload_indexes` creates the ones a collection does not have yet and returns the fields it created an index for:
 
 ```python
 store = QdrantStore(settings=Settings.from_env())
@@ -166,11 +171,31 @@ store.ensure_payload_indexes("central-bank-e5b-v1")
 ```
 
 - **On an existing collection.** An index is built from the points already there; no point is rewritten, no document has to be ingested again. The call returns once every index is built and usable. Run it once per collection, before or after ingesting; running it again does nothing and returns `[]`.
+- **What the returned list says.** It lists the fields for which a create call succeeded in this call, no more. Two callers that run at the same moment may each find the indexes missing, each create them, and each report every field. In qdrant-client's local mode, which keeps no index, every call reports every field.
+- **Checking afterwards.** Do not read `get_collection(...).payload_schema[field].points` right after the creation on a large collection: that count has been seen to lag for a few seconds while the index is built. Count through a filter instead: `store.client.count(collection, count_filter=..., exact=True)`.
 - **Never replaces an index.** If a field is already indexed with another kind (a keyword index on `date`, say), the call raises `CollectionMismatchError` naming the field, the expected kind and the one found, and creates nothing. Qdrant itself would drop the existing index and build the other one; removing an index stays a decision of the operator (`store.client.delete_payload_index`).
 - **Errors.** A refused API key is a `QdrantAuthError`. A collection that does not exist is not created: the error of the client is raised, like any other failure. Indexes created before a failure stay, and a second call creates the rest.
 - **Another list.** `ensure_payload_indexes(collection, [("page", "integer")])` takes any list of `(field, kind)`, a kind being the name of a Qdrant payload index type.
 
-**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. Qdrant reads a full date (`2016-03-10`, taken as midnight UTC) or a full date and time (`2016-03-10T12:00:00Z`). Every other value is stored untouched and is never an error, neither when the index is built nor when a point is written, but **it matches no date range**: an imprecise date (`2016-03`, `2016`), an empty string, a null, a missing `date`. A document without a precise date is therefore left out as soon as a date bound is set, with or without the index; its `year` is indexed on its own, but `search` has no filter on `year` in this version. The bounds of a range are full dates too: Qdrant refuses `2016` or `2016-03` as a bound.
+**A value an index cannot read.** No value is ever refused, neither when an index is built nor when a point is written: the point stays stored, and a search without a filter on that field still returns it. But **a filter on that field no longer sees it**. Checked on Qdrant 1.20:
+
+| Field | Values the index reads | Values it does not read: the point is invisible to a filter on the field |
+|---|---|---|
+| `year` (integer) | an integer (`2016`), a float with an integral value (`2016.0`) | a string (`"2016"`), a float such as `2016.5`, a boolean, a null, a missing key |
+| keyword fields | a string, a list of strings | a number, a boolean, a null, a missing key: a filter, which matches strings, never finds them |
+| `date` (datetime) | `2016-03-10` (taken as midnight UTC); with a time after `T` or a space (`2016-03-10T12:00:00`, `2016-03-10 12:00:00`, `2016-03-10T12:00`); with `Z` or an offset (`2016-03-10T12:00:00+02:00`); also the lenient `2016-3-10` | `2016-03`, `2016`, an empty string, a null, a missing key, an integer (`20160310`, a Unix timestamp), `10/03/2016` |
+
+The index changes the answer in one case: without an integer index, a range on `year` still matches `2016.5`; once the index exists it does not. A `year` stored as the string `"2016"` matches no integer range, with or without the index. **Before creating the indexes on a collection that already holds points, check the types of the stored values** of `year` and of the keyword fields (read a sample with `store.client.scroll(collection, with_payload=["year", "source_code", "doc_type", "language", "corpus", "doc_id"])`): a field written with another type has to be rewritten before its filter can be trusted.
+
+**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. A document without a date the index reads is left out as soon as a date bound is set, with or without the index; its `year` is indexed on its own, but `search` has no filter on `year` in this version.
+
+**Date bounds.** A bound must be a full date, and what happens to another value depends on how it reaches Qdrant:
+
+- through the REST API, Qdrant refuses `"2016"` and `"2016-03"` alike with HTTP 400 (not an RFC 3339 date);
+- through the Python client, `"2016-03"` never leaves the process: `models.DatetimeRange` raises a validation error;
+- through the Python client, **`"2016"` is accepted**: the client reads it as a Unix timestamp, 2016 seconds after the epoch (`1970-01-01T00:33:36Z`), and sends that. Nothing fails: as a lower bound it matches almost every dated point, as an upper bound almost none.
+
+This is why `rag_engine.search` accepts only a `datetime.date` or a `YYYY-MM-DD` string as a bound, and refuses everything else itself (see [Searching](#searching)).
 
 qdrant-client's local mode (`QdrantClient(":memory:")`) keeps no payload index: it accepts the creation with a warning and filters by reading every point, with the same answers.
 
@@ -307,7 +332,7 @@ Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 Two test markers are deselected by default:
 
 - `integration`: needs a real Qdrant, given by `RAG_ENGINE_IT_QDRANT_URL`.
-- `models`: downloads embedding models. It holds the test of the real torch model and the parity test of the two backends (`tests/test_parity.py`); it needs `pip install -e ".[dev,torch,onnx]"`. CI runs it in its own job, `parity`, with the model files cached.
+- `models`: downloads embedding models. It holds the test of the real torch model, the parity test of the two backends and the checks of the pinned ONNX file (`tests/test_parity.py`); it needs `pip install -e ".[dev,torch,onnx]"`, and about 1.2 GB of free space in the temporary directory for the altered copy of the ONNX file. CI runs it in its own job, `parity`, with the model files cached under a key that carries the pinned revision.
 
 ```bash
 docker run --rm -p 6333:6333 qdrant/qdrant:v1.20.0
