@@ -91,7 +91,8 @@ def ingest_document(
     Arguments:
 
     - ``metadata`` is copied into every payload and is not changed. It may not contain a
-      reserved key (``rag_engine.schema.RESERVED_KEYS``).
+      reserved key (``rag_engine.schema.RESERVED_KEYS``), except a ``doc_id`` equal to the
+      ``doc_id`` argument, which is accepted.
     - ``collection`` must exist with the dimension of the embedder. **This function does not
       create or check it**: the caller calls ``store.ensure_collection(collection,
       embedder.dim)`` once per run, not once per document.

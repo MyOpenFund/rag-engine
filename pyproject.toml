@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "rag-engine"
 version = "0.1.0"
-description = "Ingest one document into Qdrant and search what was ingested."
+description = "Ingest one document into Qdrant with deterministic point ids (search arrives in the next release)."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
