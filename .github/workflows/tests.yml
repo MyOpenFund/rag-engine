@@ -18,21 +18,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      # The ingest extra (document parsers) is installed on one version only: the tests that
-      # need the real libraries run there and skip elsewhere.
-      - run: pip install -e ".[dev${{ matrix.python-version == '3.12' && ',ingest' || '' }}]"
+      # The ingest extra (document parsers) is installed on 3.12 and on 3.13, the version
+      # production runs on and the golden fixture was captured with: the tests that need the
+      # real libraries run there. 3.10 keeps the light install, where they skip.
+      - run: pip install -e ".[dev${{ matrix.python-version != '3.10' && ',ingest' || '' }}]"
       - name: Check that the document parsers are importable
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version != '3.10'
         run: python -c "import chunknorris.chunkers, chunknorris.parsers, markitdown, pptx, pymupdf"
       # Tesseract is not on the GitHub runner image. With it, the test that reads a scanned PDF
-      # with ocr="always" runs instead of skipping; it needs the parsers, so one version only.
+      # with ocr="always" runs instead of skipping; it needs the parsers.
       - name: Install Tesseract for the OCR test
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version != '3.10'
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr
           tesseract --list-langs 2>&1 | grep -x eng
       - run: ruff check .
+      - run: ruff format --check .
       - run: python -m pytest -q
   integration:
     runs-on: ubuntu-latest

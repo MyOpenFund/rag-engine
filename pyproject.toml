@@ -47,3 +47,7 @@ addopts = "-m 'not integration and not models'"
 
 [tool.ruff]
 line-length = 110
+
+[tool.ruff.lint]
+# The defaults of ruff, plus the line length (the formatter does not shorten strings and comments).
+extend-select = ["E501"]
