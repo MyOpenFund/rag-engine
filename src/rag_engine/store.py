@@ -471,6 +471,69 @@ class QdrantStore:
             raise
         return list(response.points)
 
+    def existing_doc_ids(
+        self,
+        collection: str,
+        doc_ids: Iterable[str],
+        *,
+        batch_size: int = 100,
+        page_size: int = 256,
+    ) -> set[str]:
+        """Which of ``doc_ids`` have at least one point in ``collection``.
+
+        ``doc_ids`` is a list (or tuple, or set) of non-empty strings, compared exactly with
+        the payload field ``doc_id``; a bare string or anything else is a ``ValueError``,
+        raised before anything is sent. Duplicates are asked once. The answer is the subset
+        found, as a new set; it is empty for an empty list, without any request.
+
+        How it asks. The ids are taken ``batch_size`` at a time. For a batch, one request
+        reads up to ``page_size`` points whose ``doc_id`` is one of the batch (a filter on the
+        keyword field, which the payload index on ``doc_id`` makes fast), with the ``doc_id``
+        of their payload only and without vectors. The ids seen are found; the request is
+        repeated for the others until it brings nothing new. A batch therefore costs one
+        request more than the number of pages that found something: two when every document
+        shows up in the first page, and never more than one per document plus one. Points
+        come in the order of their ids, which mixes the documents, so a first page of 256
+        points usually holds every document of a batch of 100.
+
+        Both sizes must be integers >= 1, else ``ValueError``. HTTP 401 or 403 is a
+        :class:`QdrantAuthError`; a collection that does not exist, and any other error, is
+        raised as the client raised it.
+        """
+        if isinstance(doc_ids, (str, bytes)) or not isinstance(doc_ids, (list, tuple, set, frozenset)):
+            # A ValueError, as for every other bad argument of the store.
+            raise ValueError(f"doc_ids must be a list of strings, got {type(doc_ids).__name__}")  # noqa: TRY004
+        for doc_id in doc_ids:
+            if not isinstance(doc_id, str):
+                raise ValueError(f"doc_ids must hold strings, got {doc_id!r}")  # noqa: TRY004
+            if not doc_id:
+                raise ValueError("doc_ids must hold non-empty strings, got an empty one")
+        _positive_int("batch_size", batch_size)
+        _positive_int("page_size", page_size)
+        wanted = sorted(set(doc_ids))
+        found: set[str] = set()
+        for start in range(0, len(wanted), batch_size):
+            remaining = set(wanted[start : start + batch_size])
+            while remaining:
+                condition = models.FieldCondition(key="doc_id", match=models.MatchAny(any=sorted(remaining)))
+                try:
+                    points, _next = self._client.scroll(
+                        collection_name=collection,
+                        scroll_filter=models.Filter(must=[condition]),
+                        limit=page_size,
+                        with_payload=["doc_id"],
+                        with_vectors=False,
+                    )
+                except Exception as exc:
+                    _raise_auth(exc)
+                    raise
+                seen = {(point.payload or {}).get("doc_id") for point in points} & remaining
+                if not seen:
+                    break
+                found |= seen
+                remaining -= seen
+        return found
+
     def count(self, collection: str) -> int:
         """Exact number of points in ``collection``."""
         try:

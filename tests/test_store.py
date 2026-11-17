@@ -1250,3 +1250,125 @@ def test_local_mode_indexes_on_a_missing_collection_raise_and_create_nothing(mem
     with pytest.raises(ValueError, match="not found"):
         memory_store.ensure_payload_indexes("absent")
     assert not memory_store.client.collection_exists("absent")
+
+
+# ---------------------------------------------------------------------------
+# existing_doc_ids
+# ---------------------------------------------------------------------------
+def doc_points(*chunks_per_doc: tuple[str, int]) -> list[models.PointStruct]:
+    """Points of documents given as ``(doc_id, number of chunks)``, with ids in no useful order."""
+    result = []
+    for doc_id, chunks in chunks_per_doc:
+        for index in range(chunks):
+            result.append(
+                models.PointStruct(
+                    id=len(result) + 1, vector=[1.0, 0.0, 0.0, float(index)], payload={"doc_id": doc_id}
+                )
+            )
+    return result
+
+
+class ScrollClient:
+    """Answers ``scroll`` from a list of points, a page at a time, and records every call."""
+
+    def __init__(self, stored: list[models.PointStruct], error: Exception | None = None):
+        self.stored, self.error, self.calls = stored, error, []
+
+    def scroll(self, collection_name, scroll_filter, limit, with_payload, with_vectors):
+        if self.error is not None:
+            raise self.error
+        wanted = set(scroll_filter.must[0].match.any)
+        assert scroll_filter.must[0].key == "doc_id"
+        self.calls.append((collection_name, sorted(wanted), limit, with_payload, with_vectors))
+        matching = [point for point in self.stored if point.payload.get("doc_id") in wanted]
+        return matching[:limit], None
+
+
+def test_existing_doc_ids_local_mode(memory_store):
+    memory_store.ensure_collection("c", 4)
+    memory_store.upsert("c", doc_points(("a", 3), ("b", 1), ("c", 2)))
+    assert memory_store.existing_doc_ids("c", ["a", "c", "nowhere", "A"]) == {"a", "c"}
+    assert memory_store.existing_doc_ids("c", ("b",)) == {"b"}
+    assert memory_store.existing_doc_ids("c", {"nowhere"}) == set()
+
+
+def test_existing_doc_ids_of_nothing_sends_nothing():
+    client = ScrollClient([])
+    assert QdrantStore(client=client).existing_doc_ids("c", []) == set()
+    assert client.calls == []
+
+
+def test_existing_doc_ids_asks_in_batches_and_reads_the_doc_id_only():
+    client = ScrollClient(doc_points(*[(f"d{i}", 1) for i in range(5)]))
+    store = QdrantStore(client=client)
+    wanted = ["d0", "d1", "d2", "d3", "d4", "x1", "x2"]
+    assert store.existing_doc_ids("c", wanted, batch_size=3) == {"d0", "d1", "d2", "d3", "d4"}
+    # Each batch is asked until nothing new comes back: once for what it finds, once for the rest.
+    asked = [call[1] for call in client.calls]
+    assert asked == [["d0", "d1", "d2"], ["d3", "d4", "x1"], ["x1"], ["x2"]]
+    assert {call[0] for call in client.calls} == {"c"}
+    assert {tuple(call[3]) for call in client.calls} == {("doc_id",)}
+    assert {call[4] for call in client.calls} == {False}
+
+
+def test_existing_doc_ids_finds_a_document_hidden_behind_a_long_one():
+    # A page may hold the chunks of one long document only: the others are asked again.
+    client = ScrollClient(doc_points(("long", 7), ("other", 4), ("short", 1)))
+    store = QdrantStore(client=client)
+    found = store.existing_doc_ids("c", ["long", "short", "other", "absent"], page_size=3)
+    assert found == {"long", "short", "other"}
+    assert [call[1] for call in client.calls] == [
+        ["absent", "long", "other", "short"],
+        ["absent", "other", "short"],
+        ["absent", "short"],
+        ["absent"],
+    ]
+
+
+def test_existing_doc_ids_duplicates_are_asked_once():
+    client = ScrollClient(doc_points(("a", 1)))
+    assert QdrantStore(client=client).existing_doc_ids("c", ["a", "a", "a"]) == {"a"}
+    assert [call[1] for call in client.calls] == [["a"]]
+
+
+@pytest.mark.parametrize(
+    ("doc_ids", "match"),
+    [
+        ("abc", "list of strings"),
+        (b"abc", "list of strings"),
+        (["a", 3], "strings"),
+        (["a", ""], "non-empty"),
+        (7, "list of strings"),
+    ],
+)
+def test_existing_doc_ids_refuses_what_is_not_a_list_of_ids(doc_ids, match):
+    client = ScrollClient([])
+    with pytest.raises(ValueError, match=match):
+        QdrantStore(client=client).existing_doc_ids("c", doc_ids)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("name", ["batch_size", "page_size"])
+@pytest.mark.parametrize("value", [0, -1, True, 2.0, "3"])
+def test_existing_doc_ids_refuses_a_bad_size(name, value):
+    with pytest.raises(ValueError, match=name):
+        QdrantStore(client=ScrollClient([])).existing_doc_ids("c", ["a"], **{name: value})
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_existing_doc_ids_refused_api_key_is_a_clear_error(status):
+    store = QdrantStore(client=ScrollClient([], http_error(status)))
+    with pytest.raises(QdrantAuthError, match=f"HTTP {status}"):
+        store.existing_doc_ids("c", ["a"])
+
+
+def test_existing_doc_ids_other_errors_are_raised_unchanged():
+    error = http_error(500)
+    with pytest.raises(UnexpectedResponse) as info:
+        QdrantStore(client=ScrollClient([], error)).existing_doc_ids("c", ["a"])
+    assert info.value is error
+
+
+def test_existing_doc_ids_on_a_missing_collection_raises(memory_store):
+    with pytest.raises(ValueError, match="missing"):
+        memory_store.existing_doc_ids("missing", ["a"])
