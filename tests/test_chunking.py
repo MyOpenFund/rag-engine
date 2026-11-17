@@ -127,6 +127,26 @@ def _install_stubs(monkeypatch, *, with_line_spacing=True):
     return stubs
 
 
+# The chunknorris modules chunk_file imports, parent first.
+CHUNKNORRIS_MODULES = (
+    "chunknorris",
+    "chunknorris.chunkers",
+    "chunknorris.exceptions",
+    "chunknorris.parsers",
+)
+
+
+def _hide_chunknorris(monkeypatch):
+    """Make every chunknorris import of ``chunk_file`` fail, as on a host without the library.
+
+    Blanking the parent alone is not enough: once a test has really imported
+    ``chunknorris.chunkers`` and the others, ``from chunknorris.chunkers import ...`` finds the
+    submodule in ``sys.modules`` and never looks at the parent.
+    """
+    for name in CHUNKNORRIS_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+
+
 @pytest.fixture
 def stubs(monkeypatch):
     monkeypatch.delenv("ENABLE_OCR", raising=False)
@@ -244,7 +264,7 @@ def test_unsupported_extension_is_refused_by_name(stubs, tmp_path, name):
 
 
 def test_unsupported_extension_is_refused_without_the_ingest_extra(monkeypatch, tmp_path):
-    monkeypatch.setitem(sys.modules, "chunknorris", None)
+    _hide_chunknorris(monkeypatch)
     with pytest.raises(ValueError, match="'.html'"):
         chunk_file(_file(tmp_path, "page.html"))
 
@@ -666,7 +686,8 @@ def test_text_is_read_as_the_old_engine_read_it(stubs, tmp_path):
 def test_importing_the_module_loads_no_parser_library():
     code = (
         "import sys, rag_engine.chunking; "
-        "print(','.join(m for m in sys.modules if m.split('.')[0] in ('chunknorris', 'markitdown', 'pymupdf')))"
+        "heavy = ('chunknorris', 'markitdown', 'pymupdf'); "
+        "print(','.join(m for m in sys.modules if m.split('.')[0] in heavy))"
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
@@ -675,12 +696,20 @@ def test_importing_the_module_loads_no_parser_library():
 
 @pytest.mark.parametrize("name", ["a.pdf", "a.md", "a.txt", "a.csv"])
 def test_missing_chunknorris_tells_to_install_the_ingest_extra(monkeypatch, tmp_path, name):
-    monkeypatch.setitem(sys.modules, "chunknorris", None)
+    _hide_chunknorris(monkeypatch)
     with pytest.raises(ImportError, match=r"rag-engine\[ingest\]") as error:
         chunk_file(_file(tmp_path, name))
     assert isinstance(error.value.__cause__, ImportError)
     # The module that could not be imported is named, not hidden behind the hint.
     assert "chunknorris" in str(error.value)
+
+
+def test_missing_chunknorris_is_reported_even_when_its_submodules_were_imported(stubs, monkeypatch, tmp_path):
+    """The order-dependence guard: submodules already in ``sys.modules`` (here, the stubs)."""
+    assert all(sys.modules.get(name) is not None for name in CHUNKNORRIS_MODULES)
+    _hide_chunknorris(monkeypatch)
+    with pytest.raises(ImportError, match=r"rag-engine\[ingest\]"):
+        chunk_file(_file(tmp_path, "a.md"))
 
 
 def test_missing_markitdown_tells_to_install_the_ingest_extra(stubs, monkeypatch, tmp_path):
