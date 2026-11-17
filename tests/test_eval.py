@@ -7,6 +7,7 @@ any semantics: a question is the text of a chunk, or its filters isolate the ans
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import hashlib
 import json
@@ -567,6 +568,45 @@ def test_human_readable_report(report):
     assert report.parameters["questions_sha256"][:12] in text
     assert all(len(line) <= 120 for line in lines)
     assert not text.endswith("\n")
+
+
+def questions_line(report, path: str) -> str:
+    """The line of the report that names the question file, for a report read from ``path``."""
+    moved = dataclasses.replace(report, parameters={**report.parameters, "questions_file": path})
+    lines = format_report(moved).splitlines()
+    assert all(len(line) <= 120 for line in lines)
+    (line,) = [line for line in lines if line.startswith("questions: ")]
+    return line
+
+
+def test_the_report_names_a_short_question_file_in_full(report):
+    digest = report.parameters["questions_sha256"][:12]
+    assert (
+        questions_line(report, "eval/questions.jsonl") == f"questions: eval/questions.jsonl (sha256 {digest})"
+    )
+
+
+@pytest.mark.parametrize("depth", [8, 40])
+def test_the_report_keeps_the_end_of_a_long_question_file_path(report, depth):
+    # Wherever the repository lives: the line fits, and shows the end of the path, the file name.
+    path = "/" + "/".join(f"a-rather-long-folder-name-{level:02d}" for level in range(depth))
+    path += "/eval/fixtures/questions.jsonl"
+    digest = report.parameters["questions_sha256"][:12]
+    line = questions_line(report, path)
+    assert len(line) == 110
+    assert line.startswith("questions: …") and line.endswith(
+        f"/eval/fixtures/questions.jsonl (sha256 {digest})"
+    )
+    shown = line[len("questions: …") : -len(f" (sha256 {digest})")]
+    assert path.endswith(shown)
+
+
+def test_the_report_cuts_the_question_file_path_exactly_at_the_width(report):
+    digest = report.parameters["questions_sha256"][:12]
+    room = 110 - len(f"questions:  (sha256 {digest})")
+    assert questions_line(report, "p" * room) == f"questions: {'p' * room} (sha256 {digest})"
+    cut = questions_line(report, "x" + "p" * room)
+    assert cut == f"questions: …{'p' * (room - 1)} (sha256 {digest})" and len(cut) == 110
 
 
 def test_the_report_gives_the_kinds_first_then_the_headline_then_the_pooled_line(report):

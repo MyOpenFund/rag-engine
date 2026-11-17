@@ -1238,28 +1238,39 @@ def test_real_pptx(real, tmp_path):
     assert "Quarterly review" in text and "Reserves rose" in text
 
 
-def _tessdata_dir():
-    """The folder holding ``eng.traineddata``, or None when tesseract is not usable here."""
+def _tessdata_dir(environment):
+    """The folder holding ``eng.traineddata``, or None when tesseract is not usable here.
+
+    Tesseract is asked with ``environment``, the one of the host: the tests themselves run
+    without its ``TESSDATA_PREFIX``, and the host may need it to find the language data. When
+    that fails (a ``TESSDATA_PREFIX`` that leads nowhere), it is asked again without it.
+    """
     if shutil.which("tesseract") is None:
         return None
-    result = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True, check=False)
-    output = result.stdout + result.stderr
-    if result.returncode != 0 or "eng" not in output.split():
-        return None
-    for line in output.splitlines():
-        if '"' in line:
-            folder = line.split('"')[1]
-            return folder.rstrip("/") or None
+    without = {name: value for name, value in environment.items() if name != "TESSDATA_PREFIX"}
+    for asked in (environment, without):
+        result = subprocess.run(
+            ["tesseract", "--list-langs"], env=asked, capture_output=True, text=True, check=False
+        )
+        output = result.stdout + result.stderr
+        if result.returncode != 0 or "eng" not in output.split():
+            continue
+        for line in output.splitlines():
+            if '"' in line:
+                folder = line.split('"')[1]
+                return folder.rstrip("/") or None
     return None
 
 
 @needs_ingest
 @pytest.mark.parametrize("switch", [None, "false", "true"])
 @pytest.mark.parametrize("prefix", ["folder", "parent"])
-def test_real_scanned_pdf_is_read_with_ocr_always(real, tmp_path, monkeypatch, prefix, switch):
+def test_real_scanned_pdf_is_read_with_ocr_always(
+    real, tmp_path, monkeypatch, host_environment, prefix, switch
+):
     """``always`` reads a scan whatever ENABLE_OCR says, TESSDATA_PREFIX being the language
     data folder or its parent."""
-    tessdata = _tessdata_dir()
+    tessdata = _tessdata_dir(host_environment)
     if tessdata is None:
         pytest.skip("needs tesseract with the eng language data")
     if prefix == "parent" and os.path.basename(tessdata) != "tessdata":

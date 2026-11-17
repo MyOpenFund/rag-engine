@@ -7,6 +7,7 @@ import sys
 
 import pytest
 
+import rag_engine.config as config_module
 from rag_engine.config import ConfigError, Settings
 
 SECRET = "k3y-Zx9-DISTINCTIVE-41f7"
@@ -543,6 +544,10 @@ def test_short_values_are_echoed_in_full():
 
 
 def _run(code, env, cwd=None):
+    # The engine is found from any working directory, also when it is not installed and the
+    # tests were started with a relative PYTHONPATH (PYTHONPATH=src).
+    source = os.path.dirname(os.path.dirname(os.path.abspath(config_module.__file__)))
+    env = dict(env, PYTHONPATH=os.pathsep.join(filter(None, [source, env.get("PYTHONPATH")])))
     return subprocess.run(
         [sys.executable, "-c", code], env=env, cwd=cwd, capture_output=True, text=True, check=False
     )

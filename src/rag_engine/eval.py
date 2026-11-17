@@ -1035,10 +1035,20 @@ def evaluate(
     return EvalReport(parameters=parameters, results=tuple(results), not_in_collection=tuple(skipped))
 
 
+# The width the lines of the text report whose length depends on a path are cut to.
+_LINE_WIDTH = 110
+
+
 def _cut(text: str, width: int) -> str:
     """``text`` on one line, cut to ``width`` characters."""
     flat = " ".join(text.split())
     return flat if len(flat) <= width else flat[: width - 1] + "…"
+
+
+def _cut_start(text: str, width: int) -> str:
+    """``text`` on one line, cut to ``width`` characters by dropping its start: the end is kept."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= width else "…" + flat[len(flat) - (width - 1) :]
 
 
 def _number(value: float | None) -> str:
@@ -1086,7 +1096,9 @@ def format_report(report: EvalReport) -> str:
     tell (``n/a`` for a group without questions); the exact values are in
     :meth:`EvalReport.to_dict`. Then come the questions left out, the ties, and each miss
     with the question, the expected documents and the three best documents returned, with
-    their titles. The text has no trailing line break.
+    their titles. The line that names the question file is cut to 110 characters whatever
+    the length of its path, the end of the path being kept. The text has no trailing line
+    break.
     """
     parameters = report.parameters
     k = parameters["k"]
@@ -1103,7 +1115,10 @@ def format_report(report: EvalReport) -> str:
     lines = [title, settings]
     if parameters.get("questions_file"):
         digest = parameters.get("questions_sha256") or ""
-        lines.append(f"questions: {_cut(str(parameters['questions_file']), 110)} (sha256 {digest[:12]})")
+        # The whole line fits the width, wherever the file lives; the end of a path names the file.
+        before, after = "questions: ", f" (sha256 {digest[:12]})"
+        room = _LINE_WIDTH - len(before) - len(after)
+        lines.append(f"{before}{_cut_start(str(parameters['questions_file']), room)}{after}")
 
     resamples = parameters.get("bootstrap_resamples", DEFAULT_BOOTSTRAP_RESAMPLES)
     minimum = parameters.get("interval_min_documents", DEFAULT_INTERVAL_MIN_DOCUMENTS)

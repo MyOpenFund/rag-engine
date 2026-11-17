@@ -67,6 +67,22 @@ def run(store, embedder, query=QUERY, **kwargs):
     return search(query, collection=COLLECTION, store=store, embedder=embedder, **kwargs)
 
 
+SCORE_TOLERANCE = 1e-6
+
+
+def assert_same_hits(first: list[Hit], second: list[Hit]) -> None:
+    """The same chunks in the same order, with the same fields; the scores within rounding noise.
+
+    Two identical searches are not compared with ``==``: in qdrant-client's local mode the
+    first query of a fresh in-memory collection gives scores about 1e-8 away from those of
+    the later ones, so an exact comparison depends on which test ran first.
+    """
+    assert [hit.point_id for hit in first] == [hit.point_id for hit in second]
+    for one, other in zip(first, second, strict=True):
+        assert dataclasses.replace(one, score=0.0) == dataclasses.replace(other, score=0.0)
+        assert one.score == pytest.approx(other.score, abs=SCORE_TOLERANCE)
+
+
 def expected_ranking(query: str = QUERY) -> list[tuple[int, float]]:
     """``(point id, cosine)`` of every chunk of the corpus for ``query``, best first."""
     reference = FakeEmbedder(SEARCH_SPEC)
@@ -100,8 +116,8 @@ def test_the_matrix_names_real_documents_and_has_cases_without_any_result():
 
 def test_no_filters_and_empty_filters_are_the_same_search(store, embedder):
     without = run(store, embedder)
-    assert run(store, embedder, filters=None) == without
-    assert run(store, embedder, filters=SearchFilters()) == without
+    assert_same_hits(run(store, embedder, filters=None), without)
+    assert_same_hits(run(store, embedder, filters=SearchFilters()), without)
     assert len(without) == SEARCH_POINT_COUNT
 
 
@@ -662,7 +678,9 @@ def test_one_letter_number_symbol_or_punctuation_mark_makes_a_query(store, embed
 
 
 def test_a_query_of_punctuation_alone_is_accepted(store, embedder):
-    assert run(store, embedder, query="???", limit=3) == run(store, embedder, query="???", limit=3)
+    first = run(store, embedder, query="???", limit=3)
+    assert_same_hits(first, run(store, embedder, query="???", limit=3))
+    assert len(first) == 3
     assert embedder.calls == [SEARCH_SPEC.query_prefix + "???"] * 2
 
 
@@ -803,7 +821,7 @@ def test_composed_and_decomposed_queries_give_the_same_hits_when_normalised(stor
     composed = unicodedata.normalize("NFC", "デフレ脱却")
     decomposed = unicodedata.normalize("NFKD", composed)
 
-    assert run(store, embedder, query=composed) == run(store, embedder, query=decomposed)
+    assert_same_hits(run(store, embedder, query=composed), run(store, embedder, query=decomposed))
     raw = run(store, embedder, query=composed, normalize_query=False)
     assert [hit.point_id for hit in raw] != [hit.point_id for hit in run(store, embedder, query=composed)]
 
@@ -826,9 +844,16 @@ def test_a_search_changes_neither_the_filters_nor_the_collection(store, embedder
     first = run(store, embedder, filters=filters)
     second = run(store, embedder, filters=filters)
 
-    assert first == second and first
+    assert_same_hits(first, second)
+    assert first
     assert filters == before_filters
-    assert store.client.scroll(COLLECTION, limit=100, with_payload=True, with_vectors=True)[0] == before
+    after = store.client.scroll(COLLECTION, limit=100, with_payload=True, with_vectors=True)[0]
+    assert [(record.id, record.payload) for record in after] == [
+        (record.id, record.payload) for record in before
+    ]
+    # Local mode hands the stored vectors back about 1e-8 away once a first query has run.
+    for now, then in zip(after, before, strict=True):
+        assert now.vector == pytest.approx(then.vector, abs=SCORE_TOLERANCE)
     assert store.count(COLLECTION) == SEARCH_POINT_COUNT
 
 

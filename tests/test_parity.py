@@ -349,14 +349,31 @@ def test_the_hash_of_the_onnx_file_is_computed_once_per_process(vectors, monkeyp
     assert warm < cold / 10
 
 
+@pytest.fixture
+def model_copy_dir(tmp_path):
+    """An empty model directory for one test, removed when the test ends, passed or failed.
+
+    pytest keeps the temporary directories of its last three runs: without this, each run of
+    the altered-ONNX test would leave its 1.1 GB copy of the model behind.
+    """
+    directory = tmp_path / "model-copy"
+    directory.mkdir()
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+        assert not directory.exists(), f"the copy of the model was not removed: {directory}"
+
+
 @pytest.mark.models
-def test_an_altered_onnx_file_is_refused_before_any_inference(vectors, tmp_path, monkeypatch):
+def test_an_altered_onnx_file_is_refused_before_any_inference(vectors, model_copy_dir, monkeypatch):
     fastembed = pytest.importorskip("fastembed")
+    tmp_path = model_copy_dir
     loaded = vectors["onnx_model"]
     pinned = ONNX_MODELS[loaded["name"]]
     source = loaded["path"].parents[len(pinned.model_file.split("/")) - 1]  # snapshots/<revision>
     # A model directory of its own: a full copy of the pinned files, one byte of the ONNX file
-    # changed (same size, so only the hash can tell).
+    # changed (same size, so only the hash can tell). The fixture removes it afterwards.
     copy = tmp_path / source.parents[1].name / "snapshots" / pinned.revision
     # copyfile, not the default copy2: the files of a freshly downloaded cache are read-only,
     # and copy2 would carry that mode over to the copy that has to be altered.
@@ -387,8 +404,9 @@ def test_an_altered_onnx_file_is_refused_before_any_inference(vectors, tmp_path,
 
 
 @pytest.mark.models
-def test_an_altered_tokenizer_file_is_refused_before_any_inference(vectors, tmp_path, monkeypatch):
+def test_an_altered_tokenizer_file_is_refused_before_any_inference(vectors, model_copy_dir, monkeypatch):
     fastembed = pytest.importorskip("fastembed")
+    tmp_path = model_copy_dir  # removed afterwards: where links cannot be made it holds a full copy
     loaded = vectors["onnx_model"]
     pinned = ONNX_MODELS[loaded["name"]]
     source = loaded["path"].parents[len(pinned.model_file.split("/")) - 1]  # snapshots/<revision>
