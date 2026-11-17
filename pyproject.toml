@@ -25,11 +25,22 @@ dependencies = ["qdrant-client>=1.10", "numpy"]
 # embeds queries for passages embedded with sentence-transformers: a fastembed release that
 # tokenises, pools or loads the model differently would move the query vectors away from the
 # stored ones without any error. The backend also relies on what 0.9 offers: the
-# specific_model_path and providers options, and huggingface_hub as a dependency (it downloads
-# the pinned model files). Raise the upper bound only after the parity test
+# specific_model_path and providers options. Raise the upper bound only after the parity test
 # (pytest -m models) has passed on the new version.
-onnx = ["fastembed>=0.9,<0.10"]
-torch = ["sentence-transformers"]
+# huggingface_hub is imported by the backend itself (snapshot_download fetches the pinned model
+# files), so it is declared here and not left to arrive through fastembed. 0.20 is the lower
+# bound fastembed 0.9 declares; the arguments the backend uses (revision, allow_patterns,
+# cache_dir, local_files_only) all exist in 0.20.0. No upper bound: the files it fetches are
+# verified by their SHA-256 whatever version fetched them (fastembed 0.9 itself asks for <2).
+onnx = ["fastembed>=0.9,<0.10", "huggingface_hub>=0.20"]
+# sentence-transformers is bounded to the major version parity was measured on (6.3.0): the
+# passages of a collection are embedded with it, and a release that loads, tokenises, pools or
+# normalises the model differently would write vectors that no longer match the stored ones,
+# nor the queries of the onnx backend, without any error. The bound admits 6.0.0 to 6.3.0 and
+# the later 6.x releases; it leaves out 5.x and older (5.7.0 was the last, of August 2026) and
+# 7.x. Raise the upper bound only after the tests of the real model and the parity test
+# (pytest -m models) have passed on the new version.
+torch = ["sentence-transformers>=6,<7"]
 # chunknorris is bounded because a release that cuts documents differently would silently mix
 # two cuts. Point ids come from doc_id, page and chunk index, not from the text: on
 # re-ingestion, the points with the same (page, index) are overwritten with other text and

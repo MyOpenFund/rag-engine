@@ -1214,7 +1214,9 @@ def test_onnx_the_expected_hash_is_the_one_of_the_table(fastembed_stub, monkeypa
     assert fastembed_stub.instances == []
 
 
-def test_onnx_every_pinned_file_is_hashed_once_per_process(fastembed_stub, monkeypatch):
+def test_onnx_the_small_files_are_hashed_at_every_load_and_the_onnx_file_once_per_process(
+    fastembed_stub, monkeypatch
+):
     hashed: list[str] = []
     real_open = open
 
@@ -1227,10 +1229,58 @@ def test_onnx_every_pinned_file_is_hashed_once_per_process(fastembed_stub, monke
     directory = snapshot(fastembed_stub.default_cache)
     expected = [os.path.realpath(directory / file) for file in PINNED_FILES]
     assert hashed == expected
-    assert sorted(key[0] for key in embedding_mod._sha256_cache) == sorted(expected)
+    # Only the hash of the large file is kept.
+    onnx_file = os.path.realpath(directory / "onnx/model.onnx")
+    assert [key[0] for key in embedding_mod._sha256_cache] == [onnx_file]
+    del hashed[:]
     second = OnnxEmbedder(E5_SPEC)
-    assert hashed == expected
+    assert hashed == [path for path in expected if path != onnx_file]
+    assert len(hashed) == len(PINNED_FILES) - 1
     assert first.model_sha256 == second.model_sha256 == sha256(ONNX_BYTES)
+
+
+def alter_keeping_size_and_mtime(path: Path, content: bytes) -> None:
+    """Replace the content of ``path`` and put its modification time back: only a hash can tell."""
+    before = path.stat()
+    assert len(content) == before.st_size
+    path.write_bytes(content)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
+@pytest.mark.parametrize("file", sorted(SUPPORT_BYTES))
+def test_onnx_a_small_file_altered_with_its_mtime_restored_is_refused_on_the_next_load(fastembed_stub, file):
+    # Same path, same size, same modification time as the file that passed the check: a cache
+    # keyed on those three would accept it. The small files are read again at every load.
+    OnnxEmbedder(E5_SPEC)
+    path = snapshot(fastembed_stub.default_cache) / file
+    alter_keeping_size_and_mtime(path, altered_bytes(file))
+    with pytest.raises(ModelIntegrityError, match=re.escape(f"the file {file!r}")) as caught:
+        OnnxEmbedder(E5_SPEC)
+    assert f"found sha256 {sha256(altered_bytes(file))}" in str(caught.value)
+    assert len(fastembed_stub.instances) == 1
+    # Put back, it loads again.
+    alter_keeping_size_and_mtime(path, SUPPORT_BYTES[file])
+    OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.instances) == 2
+
+
+def test_onnx_the_kept_hash_of_the_onnx_file_is_trusted_for_the_same_path_size_and_mtime(fastembed_stub):
+    """The documented limit of the check: within one process, the large file is hashed once.
+
+    Whoever can write to the model cache while the service runs, and puts the modification
+    time back, is not detected for this file: the cache directory must not be writable.
+    """
+    OnnxEmbedder(E5_SPEC)
+    path = snapshot(fastembed_stub.default_cache) / "onnx/model.onnx"
+    alter_keeping_size_and_mtime(path, altered_bytes("onnx/model.onnx"))
+    OnnxEmbedder(E5_SPEC)
+    assert len(fastembed_stub.instances) == 2
+    # A process that starts afterwards has no kept hash, and refuses the file.
+    embedding_mod._sha256_cache.clear()
+    with pytest.raises(ModelIntegrityError, match="onnx/model.onnx"):
+        OnnxEmbedder(E5_SPEC)
 
 
 def test_onnx_the_log_says_how_many_files_were_verified(fastembed_stub, caplog):
@@ -1245,16 +1295,28 @@ def test_the_hash_of_a_file_is_computed_once_for_a_path_size_and_mtime(tmp_path,
     path = tmp_path / "model.onnx"
     path.write_bytes(b"first")
     before = path.stat()
-    assert embedding_mod._file_sha256(path) == (sha256(b"first"), 5)
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"first"), 5)
     # Same path, size and modification time: the file is not read again.
     path.write_bytes(b"other")
     os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
-    assert embedding_mod._file_sha256(path) == (sha256(b"first"), 5)
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"first"), 5)
+    # Asked without the cache, it is read, and the kept hash is left as it is.
+    assert embedding_mod._file_sha256(path) == (sha256(b"other"), 5)
+    assert embedding_mod._file_sha256(path, cached=False) == (sha256(b"other"), 5)
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"first"), 5)
     # A newer modification time, or another size: it is hashed again.
     os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
-    assert embedding_mod._file_sha256(path) == (sha256(b"other"), 5)
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"other"), 5)
     path.write_bytes(b"longer")
-    assert embedding_mod._file_sha256(path) == (sha256(b"longer"), 6)
+    assert embedding_mod._file_sha256(path, cached=True) == (sha256(b"longer"), 6)
+
+
+def test_a_hash_computed_without_the_cache_is_not_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(embedding_mod, "_sha256_cache", {})
+    path = tmp_path / "tokenizer.json"
+    path.write_bytes(b"first")
+    assert embedding_mod._file_sha256(path) == (sha256(b"first"), 5)
+    assert embedding_mod._sha256_cache == {}
 
 
 def test_the_hash_cache_follows_a_link_to_the_file_it_points_to(tmp_path, monkeypatch):
@@ -1264,7 +1326,7 @@ def test_the_hash_cache_follows_a_link_to_the_file_it_points_to(tmp_path, monkey
     blob.write_bytes(b"first")
     link = tmp_path / "model.onnx"
     link.symlink_to(blob)
-    assert embedding_mod._file_sha256(link) == (sha256(b"first"), 5)
+    assert embedding_mod._file_sha256(link, cached=True) == (sha256(b"first"), 5)
     assert [key[0] for key in embedding_mod._sha256_cache] == [os.path.realpath(blob)]
 
 
@@ -1642,3 +1704,30 @@ def test_real_model_gives_the_vectors_of_sentence_transformers_with_the_e5_prefi
     # The two prefixes give different vectors, and the truncated text is not a degenerate row.
     assert not np.allclose(passages, np.stack(queries), atol=1e-4)
     assert not np.allclose(passages[3], passages[2], atol=1e-4)
+
+
+@pytest.mark.models
+def test_real_model_loaded_from_a_cache_directory_reports_no_deprecated_argument(caplog, capfd):
+    # The torch backend hands its cache_dir to SentenceTransformer as cache_folder. Checked on
+    # the real library: it takes that name, and loading the model through it reports nothing
+    # deprecated (the bound on sentence-transformers is raised only after this has passed).
+    sentence_transformers = pytest.importorskip("sentence_transformers")
+    import inspect
+    import warnings
+
+    from huggingface_hub import constants
+
+    parameters = inspect.signature(sentence_transformers.SentenceTransformer.__init__).parameters
+    assert "cache_folder" in parameters
+    spec = ModelSpec.from_settings(Settings())
+    with warnings.catch_warnings(record=True) as caught, caplog.at_level(logging.WARNING):
+        warnings.simplefilter("always")
+        # The directory the model of the other tests is in: nothing is downloaded a second time.
+        with TorchEmbedder(spec, cache_dir=constants.HF_HUB_CACHE) as embedder:
+            vector = embedder.encode_query("a query")
+    assert vector.shape == (768,)
+    said = [record.getMessage() for record in caplog.records] + [str(warning.message) for warning in caught]
+    said.append(capfd.readouterr().err)
+    print(f"\nsentence-transformers {sentence_transformers.__version__}, cache_folder given: ", end="")
+    print("nothing reported as deprecated" if not any("deprecat" in text.lower() for text in said) else said)
+    assert not [text for text in said if "cache" in text.lower() and "deprecat" in text.lower()]

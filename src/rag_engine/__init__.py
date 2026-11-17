@@ -1,7 +1,10 @@
 """rag-engine: ingest one document into Qdrant and search what was ingested.
 
 Importing this package stays light: embedding backends and document parsers
-live behind optional extras and are only imported when they are used.
+live behind optional extras, and the modules of the engine import them only when
+they are used. ``torch`` is never imported unless the torch backend is built. One
+import is not the engine's: ``qdrant-client``, which the store imports, itself
+loads ``fastembed`` (and with it the ONNX runtime) when that package is installed.
 
 The package root exposes ``__version__`` only. Everything else is imported from
 its module: ``rag_engine.config``, ``rag_engine.schema``, ``rag_engine.store``,

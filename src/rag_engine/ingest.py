@@ -4,8 +4,10 @@ The points are the ones the MyOpenFund data-orchestrator wrote before this funct
 same ids, same payloads, same vectors for the same chunks (``tests/fixtures/golden/`` pins it).
 Ingesting a document again therefore overwrites its points in place.
 
-Importing this module loads no document parser and no embedding backend: the parsing
+This module imports no document parser and no embedding backend at import time: the parsing
 libraries are imported by :func:`rag_engine.chunking.chunk_file` when a file is read.
+(``qdrant-client``, imported by the store, may itself load ``fastembed`` when that package
+is installed.)
 """
 
 from __future__ import annotations

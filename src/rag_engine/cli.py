@@ -26,7 +26,10 @@ What is cheap is checked first: the arguments, the question file, the server, th
 collection, its dimension and its distance, the presence of the expected documents; the embedding model is
 loaded last.
 
-Importing this module loads no embedding backend.
+This module imports no embedding backend and no parser at import time: the backend is
+imported when the embedder is built, after the cheap checks, and ``torch`` never unless the
+torch backend is asked for. Through the store it imports ``qdrant-client``, which may itself
+load ``fastembed`` (and with it the ONNX runtime) when that package is installed.
 """
 
 from __future__ import annotations

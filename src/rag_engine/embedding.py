@@ -308,6 +308,10 @@ class TorchEmbedder(BaseEmbedder):
         self.device = device or detect_device()
         options: dict[str, Any] = {"device": self.device}
         if cache_dir is not None:
+            # cache_folder is the name SentenceTransformer takes for it, in 6.0 as in 6.3, and
+            # loading a model through it reports nothing deprecated (a test of the real model
+            # checks it). The "cache_dir is deprecated" message of sentence-transformers 6 is
+            # about an argument of its Transformer module, which the engine never builds.
             options["cache_folder"] = os.fspath(cache_dir)
         gc.collect()
         logger.info("Loading embedding model %s on %s", spec.name, self.device)
@@ -605,31 +609,45 @@ def _pinned_model_dir(name: str, known: OnnxModel, cache_dir: str) -> Path:
     return downloaded
 
 
-def _file_sha256(path: Path) -> tuple[str, int]:
-    """SHA-256 and size of a file. Computed once per process for a given path, size and mtime."""
+def _hash_file(resolved: str) -> str:
+    hasher = hashlib.sha256()
+    with open(resolved, "rb") as stream:
+        while block := stream.read(1 << 20):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def _file_sha256(path: Path, *, cached: bool = False) -> tuple[str, int]:
+    """SHA-256 and size of a file, read now.
+
+    With ``cached=True`` the hash is computed once per process for a given path, size and
+    modification time, and that one is returned afterwards without reading the file: a file
+    altered in place, with the same size and its modification time put back, is not seen.
+    It is meant for the large ONNX file only (about a second per gigabyte).
+    """
     resolved = os.path.realpath(path)
     stat = os.stat(resolved)
+    if not cached:
+        return _hash_file(resolved), stat.st_size
     key = (resolved, stat.st_size, stat.st_mtime_ns)
     # Hashing inside the lock: embedders built at the same time hash the file once.
     with _sha256_lock:
         digest = _sha256_cache.get(key)
         if digest is None:
-            hasher = hashlib.sha256()
-            with open(resolved, "rb") as stream:
-                while block := stream.read(1 << 20):
-                    hasher.update(block)
-            digest = _sha256_cache[key] = hasher.hexdigest()
+            digest = _sha256_cache[key] = _hash_file(resolved)
     return digest, stat.st_size
 
 
 def _verify_pinned_files(name: str, known: OnnxModel, directory: Path) -> str:
     """Check every file about to be loaded against the table; return the SHA-256 of the ONNX file.
 
-    The first file that differs raises :class:`ModelIntegrityError`, which names it.
+    The first file that differs raises :class:`ModelIntegrityError`, which names it. The
+    tokenizer and configuration files (17 MB in all for E5) are read and hashed at every
+    call; only the hash of the ONNX file is kept from one call to the next.
     """
     for file, (expected, expected_size) in known.files.items():
         path = directory / file
-        found, size = _file_sha256(path)
+        found, size = _file_sha256(path, cached=file == known.model_file)
         if found != expected or size != expected_size:
             raise ModelIntegrityError(
                 f"embedding model {name!r}: the file {file!r} in the model cache, {os.fspath(path)!r}, is "
@@ -693,9 +711,24 @@ class OnnxEmbedder(BaseEmbedder):
     configuration files, which decide the vectors just as much — and the model is built only
     if each has the SHA-256 and the size of the table (:class:`ModelIntegrityError` naming
     the file otherwise): what runs is what the vectors compared with those of
-    sentence-transformers were computed with. The hash of a file is computed once per process
-    (about a second per gigabyte) and kept for the same path, size and modification time.
+    sentence-transformers were computed with. The tokenizer and configuration files (17 MB
+    in all for E5) are hashed every time an embedder is built. The hash of the ONNX file
+    is computed once per process (about a second per gigabyte) and kept for the same path,
+    size and modification time.
     ``model_path`` and ``model_sha256`` give the ONNX file loaded and its hash.
+
+    **What the check protects against, and what it does not.** It catches a download that
+    was changed or damaged on the way or on disk, and an export or a tokenizer other than
+    the one parity was measured with (a repository whose files moved, a cache filled by
+    another tool or by hand). It does not protect against someone who can write to the model
+    cache while the service runs: the files are verified when an embedder is built, not
+    while it is used; the ONNX runtime opens them after the check; and within one process
+    the kept hash of the ONNX file is trusted for the same path, size and modification
+    time. On a server, give the model cache a directory of its own
+    (``RAG_ENGINE_MODEL_CACHE``, the ``cache_dir`` here), fill it once, and mount it
+    read-only for the service. Left unset, the cache is a directory under the system's
+    temporary directory (or ``FASTEMBED_CACHE_PATH``), which other users of the host may be
+    able to write to and which a reboot may clear.
     fastembed is handed that directory and does not download anything, and the name is
     registered with it under a name of the engine's own, so that a model fastembed would list
     under the same name with another source or pooling is never used instead.

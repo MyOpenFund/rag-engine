@@ -5,7 +5,10 @@ returns them as :class:`Hit` objects, best first. The filters are a :class:`Sear
 checked when it is built: a filter that could be read in two ways is refused instead of
 being guessed. :meth:`SearchFilters.from_mapping` builds one from a parsed JSON object.
 
-Importing this module loads no embedding backend: the embedder is given by the caller.
+This module imports no embedding backend and no parser: the embedder is given by the caller,
+and ``torch`` is never imported unless the torch backend is built. It imports the store, and
+so ``qdrant-client``, which may itself load ``fastembed`` (and with it the ONNX runtime) when
+that package is installed.
 """
 
 from __future__ import annotations

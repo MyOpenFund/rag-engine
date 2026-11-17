@@ -3,6 +3,11 @@
 The store never guesses. A collection is created only when Qdrant answers that it does not
 exist; a refused API key is reported as such; every other failure (connection refused,
 timeout, server error) is raised as the client raised it.
+
+This module imports ``qdrant-client`` and nothing else outside the engine. qdrant-client
+itself imports ``fastembed`` when that package is installed (the ``onnx`` extra), which loads
+the ONNX runtime, ``huggingface_hub`` and ``tokenizers``: in such an install, importing the
+store loads them, although the engine does not ask for them.
 """
 
 from __future__ import annotations

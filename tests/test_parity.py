@@ -339,10 +339,10 @@ def test_the_hash_of_the_onnx_file_is_computed_once_per_process(vectors, monkeyp
     path = vectors["onnx_model"]["path"]
     monkeypatch.setattr(embedding_mod, "_sha256_cache", {})
     started = time.perf_counter()
-    first = embedding_mod._file_sha256(path)
+    first = embedding_mod._file_sha256(path, cached=True)
     cold = time.perf_counter() - started
     started = time.perf_counter()
-    second = embedding_mod._file_sha256(path)
+    second = embedding_mod._file_sha256(path, cached=True)
     warm = time.perf_counter() - started
     print(f"\nhash check of the ONNX file: {cold:.2f} s the first time, {warm * 1000:.3f} ms afterwards")
     assert first == second == (ONNX_MODELS[vectors["onnx_model"]["name"]].sha256, path.stat().st_size)

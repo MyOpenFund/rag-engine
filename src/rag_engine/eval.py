@@ -26,8 +26,10 @@ means: over the questions, and over the documents they expect, the questions of 
 being averaged first (they are correlated). Its headline is the second one, on the kinds of
 question asked without filters, with an interval obtained by resampling the documents.
 
-Importing this module loads no embedding backend, and needs the standard library only
-besides the engine.
+This module imports no embedding backend and no parser, and needs the standard library only
+besides the engine: ``torch`` is never imported unless the torch backend is built. Through the
+store it imports ``qdrant-client``, which may itself load ``fastembed`` (and with it the ONNX
+runtime) when that package is installed.
 """
 
 from __future__ import annotations
