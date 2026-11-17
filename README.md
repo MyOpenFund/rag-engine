@@ -42,7 +42,8 @@ The package root exposes only `__version__`. Everything else is imported from it
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
 | `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `is_searchable`, `QUERY_NORMALIZATION` |
-| `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `Means`, `EvalError`, `DEFAULT_K`, `DEFAULT_CHUNK_LIMIT`, `DEFAULT_BOOTSTRAP_RESAMPLES`, `DEFAULT_INTERVAL_MIN_DOCUMENTS`, `BOOTSTRAP_SEED`, `INTERVAL_LEVEL` |
+| `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `Means`, `EssentialAggregate`, `EssentialMeans`, `FilterEffect`, `Abstention`, `TopScores`, `EvalError`, `DEFAULT_K`, `DEFAULT_CHUNK_LIMIT`, `DEFAULT_BOOTSTRAP_RESAMPLES`, `DEFAULT_INTERVAL_MIN_DOCUMENTS`, `DEFAULT_SCORE_LEVELS`, `BOOTSTRAP_SEED`, `INTERVAL_LEVEL`, `BEHAVIORS`, `DEFAULT_BEHAVIOR`, `UNFILTERED_SUFFIX`, `UNFILTERED_TAG`, `QUESTION_FIELDS`, `FILTER_FIELDS` |
+| `rag_engine.eval_check` | `check_questions`, `load_catalogue`, `format_check`, `QuestionCheck`, `CatalogueEntry`, `DocumentReference` |
 | `rag_engine.cli` | `main` (the `rag-engine` command) |
 | `rag_engine.errors` | `RagEngineError` |
 
@@ -355,12 +356,13 @@ rag-engine eval --questions eval/known_item_v1.jsonl --collection documents \
 |---|---|
 | `--questions FILE` | The question file (JSON Lines). Required. |
 | `--collection NAME` | The Qdrant collection to search. Required; it must exist, with one unnamed vector of the dimension of the model (`RAG_ENGINE_DIM`), compared by cosine. |
-| `--k N` | Number of documents the metrics look at. Default 10. |
+| `--k N` | Number of documents the metrics look at. Default 10; at most `--chunk-limit`. A question with more essential documents than `k` can never have them all: raise it for chain and aggregation questions. |
 | `--chunk-limit N` | Number of chunks asked to the search per question. Default 50; at most `RAG_ENGINE_SEARCH_MAX_LIMIT`. |
 | `--backend torch\|onnx` | Embedding backend. Default: `RAG_ENGINE_BACKEND`. |
 | `--output FILE` | Also write the full report as JSON: parameters, metrics, every question with its first documents. |
 | `--fail-under-hit-at-k X` | Exit with code 1 when the **headline** hit@k is below `X` (between 0 and 1): the hit@k of the kinds of question asked without filters, averaged per document. Not the pooled mean of all questions. |
 | `--bootstrap-resamples N` | Number of times the documents are drawn again for the 95% intervals. Default 1000. |
+| `--score-levels X ...` | Scores the documents returned for a question that expects no document are counted against. Default `0.7 0.75 0.8 0.85 0.9`. Reported, never used as a threshold. |
 | `--allow-empty` | Run even when the collection holds none of the expected documents. Without it, that is an error (exit code 2). |
 
 The command is the one place of the engine that reads the settings by itself (`Settings.from_env()`; a `.env` file is not read). It prints the report on the standard output. Exit codes: **0** when the evaluation ran, **1** when `--fail-under-hit-at-k` is given and not met, **2** when the evaluation could not run to its end (bad arguments or settings, an unusable question file, an unreachable server or a refused key, a missing collection, a collection of another dimension, of another distance than cosine or with named vectors, a collection that holds none of the expected documents, a missing embedding backend, a failure midway). `rag-engine --version` prints the version.
@@ -374,6 +376,24 @@ What is cheap is checked before the embedding model is loaded: the question file
 - `eval/known_item_v1.jsonl`: 797 automatic questions that ask for a document by its title or its catalogue label, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`. The words follow what a doc type is at each bank, a date is never stated more precisely than the manifest knows it nor presented as a meeting date when it is a publication date, and a question expects every document that holds the text asked for (the ECB publishes its decision and its statement a second time as one combined document). [`eval/README.md`](eval/README.md) has the tables and the evidence.
 
 A second file, `eval/analytical_v1.jsonl`, with questions on the content of the documents written by hand, is to come: it does not exist yet, and is added once its questions are validated.
+
+**Format v2.** A question may say more, and a file that says none of it is read and scored exactly as before:
+
+| Field | Meaning |
+|---|---|
+| `expected_behavior` | `"answer"` (the default), `"correct_premise"` (the premise is false and the documents show it) or `"abstain"` (the collection does not hold the information). |
+| `essential_ids`, `acceptable_ids` | The documents the answer needs, and those that are relevant without being needed: two lists without a common document. `expected_doc_ids` is then the two together: it may be left out, and if given must name the same documents. It may be empty only for a question that abstains. |
+| `must_include`, `must_not_include` | Short facts a right answer holds, and typical false statements. **Carried, not scored**: the engine returns documents and writes no answer; they are validated and written into the JSON report for a scorer of the answers a client generates. |
+| `run_unfiltered` | `true`: score the question a second time without its filters. Only on a question with filters. |
+
+What these add to the scoring, all on documents and cut at `k`:
+
+- **`essential_recall@k`** (the share of the essential documents among the first `k`) and **`all_essential@k`** (whether all of them are), per group, over the questions and over the essential documents, with intervals on the kinds and the headline. hit@1, hit@k and MRR are unchanged: they look at the first expected document, essential or acceptable, so an acceptable document at rank 1 is a hit. A question that does not state its essential documents is left out of the two new metrics. A question with more essential documents than `k` can never reach 1: the report counts and lists them (`unreachable`); raise `--k`, which `--chunk-limit` bounds.
+- **A second run without filters** is reported under `<id>#unfiltered`, in a kind of its own (`<kind>#unfiltered`) that belongs to the headline, with the tag `unfiltered-rerun`; a table, *what the filter brings*, compares the two runs of these questions.
+- **A question that abstains and expects no document** is searched and left out of every mean. The report lists the first document returned, its score and the number of documents at or above a few score levels, next to the lowest, median and highest top score of the scored questions: material to study a threshold for abstention. No threshold is applied and nothing passes or fails.
+- One line **per expected behaviour**: `correct_premise` questions, and abstentions that name documents, are scored on these documents like any question.
+
+`rag-engine eval-check --questions FILE [--manifests GLOB ...] [--doc-types ...] [--mime ...] [--k N]` checks a question file without any collection, model or setting: it prints the counts per kind, tag, expected behaviour and language, the questions with filters, the distribution of essential and expected documents, the texts used twice, and, with the manifests of the corpus, the documents named that are not in the catalogue (or not of the doc types and MIME types ingested). Exit code 0, or 2 when the file breaks a rule or names a document that is not found. [`eval/README.md`](eval/README.md) has a complete example line, every rule, and how to read the new parts of the report.
 
 How to read the numbers of the known-item batch: it is a stratified sample, 12 documents per (bank, doc type) cell, so its averages weigh the 18 cells equally and are not weighted like the corpus; and all the documents are English, so its French questions measure cross-lingual retrieval.
 
@@ -427,6 +447,10 @@ report.headline.intervals  # {"hit_at_1": (low, high), "hit_at_k": ..., "mrr": .
 report.by_kind, report.by_tag, report.overall  # an Aggregate each; overall is pooled over the questions
 report.tied_at_decision  # questions whose hit@1 or hit@k hangs on the order of equal scores
 report.misses  # the questions without an expected document among the first k
+report.headline.essential  # essential_recall_at_k, all_essential_at_k, per_document, intervals; None if not stated
+report.unfiltered_reruns, report.filter_effect  # the second runs without filters, and the comparison
+report.abstentions, report.top_scores  # the questions that expect no document; the top scores to compare with
+report.by_behavior  # an Aggregate per expected_behavior
 report.to_json()  # everything, as JSON
 ```
 
@@ -494,7 +518,7 @@ The tests that parse real documents need the `ingest` extra (`pip install -e ".[
 
 Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
-The default suite also runs the evaluation harness end to end, in qdrant-client's local mode, on the fixture of `eval/fixtures/` (13 documents, 13 questions with known answers), and checks the committed question file `eval/known_item_v1.jsonl`.
+The default suite also runs the evaluation harness end to end, in qdrant-client's local mode, on the fixture of `eval/fixtures/` (13 documents; 13 questions with known answers in the first version of the question format, 11 more that use every field of the second), and checks the committed question file `eval/known_item_v1.jsonl`.
 
 The tests do not read the settings of the host: `tests/conftest.py` takes `QDRANT_*`, `RAG_ENGINE_*`, `ENABLE_OCR` and `TESSDATA_PREFIX` out of the environment for the run (and puts them back afterwards), so a `QDRANT_PORT` or a `RAG_ENGINE_BACKEND` set for other work changes nothing. Only the variables meant for the tests get through, to the tests of their marker: `RAG_ENGINE_IT_QDRANT_URL` and `RAG_ENGINE_IT_QDRANT_API_KEY` (`integration`), `RAG_ENGINE_MODEL_CACHE` and `RAG_ENGINE_PARITY_MIN` (`models`). The caches of the model libraries (`HF_HOME`, `FASTEMBED_CACHE_PATH`) are left alone. The tests do not depend on their order either (`pytest -p randomly` with `pytest-randomly` installed).
 

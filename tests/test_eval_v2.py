@@ -1443,3 +1443,34 @@ def test_a_report_built_from_results_groups_by_behavior_in_a_fixed_order():
         "top_score_of_scored_questions": {"questions": 3, "min": 1.0, "median": 1.0, "max": 1.0},
         "questions": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# The documentation
+# ---------------------------------------------------------------------------
+def test_the_tables_shown_in_the_documentation_are_those_of_the_second_fixture(store, questions):
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    readme = (root / "eval" / "README.md").read_text(encoding="utf-8")
+    report = evaluate(questions, collection=COLLECTION, store=store, embedder=fixture_embedder())
+    parts = format_report(report).split("\n\n")
+    shown = [parts[1]]
+    for start in ("Per expected behaviour", "Essential documents", "What the filter brings", "Abstention ("):
+        shown += [part for part in parts if part.startswith(start)]
+    assert len(shown) == 5
+    for part in shown:
+        assert part in readme, part.splitlines()[0]
+
+
+def test_the_example_line_of_the_documentation_is_a_valid_question(tmp_path):
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    readme = (root / "eval" / "README.md").read_text(encoding="utf-8")
+    (line,) = [line for line in readme.splitlines() if line.startswith('{"id": "an-21"')]
+    assert set(json.loads(line)) == set(QUESTION_FIELDS)  # complete: every field of the format
+    (question,) = load_questions(write(tmp_path, line))
+    assert (question.expected_behavior, question.run_unfiltered) == ("answer", True)
+    assert question.expected_doc_ids == question.essential_ids + question.acceptable_ids
+    assert question.must_include == ("unanimously", "0.25 percent") and question.must_not_include == ("6-3",)
