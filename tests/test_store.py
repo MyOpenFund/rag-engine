@@ -11,6 +11,7 @@ Three kinds of client are used:
 from __future__ import annotations
 
 import json
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -209,6 +210,35 @@ def test_the_api_key_is_never_printed(built):
     assert SECRET not in repr(vars(store))
 
 
+def test_a_key_from_the_settings_is_not_kept_by_the_store(built):
+    store = QdrantStore(settings=Settings(qdrant_host="h", qdrant_api_key=SECRET, batch_size=5))
+    assert built[0]["api_key"] == SECRET  # it did reach the client
+    assert SECRET not in repr(store) and SECRET not in str(store)
+    assert SECRET not in repr(vars(store))  # the client is a stand-in here: nothing else holds the key
+    assert not any(isinstance(value, Settings) for value in vars(store).values())
+    public = [name for name in dir(store) if not name.startswith("_") and name != "client"]
+    assert {"host", "port"} <= set(public)
+    for name in public:
+        value = getattr(store, name)
+        assert SECRET not in repr(value), name
+        assert not isinstance(value, Settings), name
+        assert SECRET not in repr(getattr(value, "__dict__", {})), name
+
+
+def test_a_key_from_the_environment_is_not_kept_by_the_store(built, monkeypatch):
+    monkeypatch.setenv("QDRANT_API_KEY", SECRET)
+    store = QdrantStore()
+    assert built[0]["api_key"] == SECRET
+    assert SECRET not in repr(vars(store))
+    assert not any(isinstance(value, Settings) for value in vars(store).values())
+
+
+def test_an_injected_client_store_keeps_no_settings():
+    store = QdrantStore(client=FakeClient(), settings=Settings(qdrant_api_key=SECRET))
+    assert SECRET not in repr(vars(store))
+    assert not any(isinstance(value, Settings) for value in vars(store).values())
+
+
 # --- from_url ---------------------------------------------------------------
 def test_from_url_reads_host_port_and_scheme(built):
     store = QdrantStore.from_url("https://qdrant.example:8443", SECRET, settings=Settings())
@@ -241,6 +271,106 @@ def test_from_url_never_echoes_credentials_of_the_url(built):
     with pytest.raises(ValueError) as info:
         QdrantStore.from_url(f"http://user:{SECRET}@h:6333/prefix", settings=Settings())
     assert SECRET not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["h h", "h\th", "h\nh", "h\rh", "h\x00", "h\x1f", "h\x7f", "h\u00a0h", "h\u200b", "h\u2028h", " h", "h "],
+    ids=lambda host: host.encode("unicode_escape").decode(),
+)
+def test_from_url_refuses_whitespace_and_control_characters_in_the_host(built, host):
+    with pytest.raises(ValueError, match="URL") as info:
+        QdrantStore.from_url(f"http://{host}.qdrant.example:6333", SECRET, settings=Settings())
+    assert "qdrant.example" not in str(info.value) and SECRET not in str(info.value)
+    assert built == []
+
+
+@pytest.mark.parametrize("url", ["http://qdrant.example:6333\n", "\thttp://qdrant.example:6333", "http://h:63\n33"])
+def test_from_url_refuses_whitespace_anywhere_rather_than_dropping_it(built, url):
+    with pytest.raises(ValueError, match="URL"):
+        QdrantStore.from_url(url, settings=Settings())
+    assert built == []
+
+
+@pytest.mark.parametrize("url", ["http://qdrant.example:0", "https://qdrant.example:0/", "http://[::1]:0"])
+def test_from_url_refuses_port_zero(built, url):
+    with pytest.raises(ValueError, match="URL") as info:
+        QdrantStore.from_url(url, settings=Settings())
+    assert "qdrant.example" not in str(info.value) and "::1" not in str(info.value)
+    assert built == []
+
+
+@pytest.mark.parametrize("url", ["http://[::1", "http://::1:6333", "http://[::1]x:6333", "http://[not-an-address]:6333"])
+def test_from_url_refuses_a_malformed_ipv6_literal(built, url):
+    with pytest.raises(ValueError, match="URL"):
+        QdrantStore.from_url(url, settings=Settings())
+    assert built == []
+
+
+# --- IPv6 literals: the client needs the brackets, the store shows the bare address ---------
+def test_from_url_hands_an_ipv6_literal_to_the_client_in_brackets(built):
+    store = QdrantStore.from_url("http://[::1]:6333", settings=Settings())
+    assert built[0]["host"] == "[::1]" and built[0]["port"] == 6333
+    assert (store.host, store.port) == ("::1", 6333)
+
+
+@pytest.mark.parametrize("host", ["::1", "[::1]"])
+def test_an_ipv6_host_given_to_the_constructor_is_bracketed_once(built, host):
+    store = QdrantStore(host, 6333, settings=Settings())
+    assert built[0]["host"] == "[::1]"
+    assert store.host == "::1"
+
+
+def test_an_ipv6_host_from_the_settings_is_bracketed(built):
+    QdrantStore(settings=Settings(qdrant_host="2001:db8::1"))
+    assert built[0]["host"] == "[2001:db8::1]"
+
+
+def test_a_name_or_ipv4_host_is_handed_over_unchanged(built):
+    QdrantStore("127.0.0.1", 6333, settings=Settings())
+    QdrantStore("qdrant.example", 6333, settings=Settings())
+    assert [call["host"] for call in built] == ["127.0.0.1", "qdrant.example"]
+
+
+@pytest.mark.parametrize(
+    ("url", "rest_uri"),
+    [("http://[::1]:6333", "http://[::1]:6333"), ("https://[2001:db8::1]", "https://[2001:db8::1]:6333")],
+)
+def test_the_real_client_builds_a_valid_url_for_an_ipv6_literal(url, rest_uri):
+    store = QdrantStore.from_url(url, timeout=1, settings=Settings())
+    assert store.client._client.rest_uri == rest_uri
+    parsed = httpx.URL(rest_uri + "/collections")  # raises InvalidURL for a bare, unbracketed address
+    assert parsed.port == 6333 and parsed.host == store.host
+
+
+def test_the_real_client_reaches_a_server_on_an_ipv6_loopback():
+    class V6Server(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"result": {"collections": []}, "status": "ok", "time": 0.0}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        server = V6Server(("::1", 0), Handler)
+    except OSError:
+        pytest.skip("no IPv6 loopback on this machine")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        store = QdrantStore.from_url(f"http://[::1]:{server.server_address[1]}", timeout=5, settings=Settings())
+        assert store.is_reachable() is True
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +484,25 @@ def test_losing_the_creation_race_is_not_fatal(error):
     store.ensure_collection("c", 8)
     assert len(client.named("create_collection")) == 1
     assert client.named("get_collection") == [("get_collection", "c")]
+
+
+@pytest.mark.parametrize("error", [TimeoutError("timed out"), http_error(500), http_error(409)],
+                         ids=["timeout", "500", "409"])
+def test_a_failed_create_that_left_a_matching_collection_is_logged_without_guessing_who_created_it(error, caplog):
+    store, _client = fake_store(exists=[False, True], vectors=unnamed(8), create=error)
+    with caplog.at_level("INFO", logger="rag_engine.store"):
+        store.ensure_collection("c", 8)
+    text = caplog.text.lower()
+    assert "another process" not in text and "meanwhile" not in text
+    last = caplog.records[-1].getMessage()
+    assert "'c'" in last and "error" in last.lower() and "exists" in last.lower()
+
+
+def test_a_failed_create_that_left_a_mismatching_collection_does_not_log_a_match(caplog):
+    store, _client = fake_store(exists=[False, True], vectors=unnamed(384), create=http_error(500))
+    with caplog.at_level("INFO", logger="rag_engine.store"), pytest.raises(CollectionMismatchError):
+        store.ensure_collection("c", 8)
+    assert "match" not in caplog.text.lower() and "another process" not in caplog.text.lower()
 
 
 def test_the_race_winner_with_another_dimension_is_refused():
@@ -533,6 +682,95 @@ def test_upsert_other_errors_are_raised_unchanged(error):
         store.upsert("c", points(5), batch_size=2)
     assert info.value is error
     assert len(client.named("upsert")) == 1  # stops at the first failed batch
+
+
+class FailingFrom(FakeClient):
+    """Accepts the first ``ok`` upsert calls, then raises ``error`` on every later one."""
+
+    def __init__(self, ok: int, error: Exception):
+        super().__init__()
+        self._ok, self._error = ok, error
+
+    def upsert(self, collection_name, points, wait=None):
+        super().upsert(collection_name, points, wait)
+        if len(self.named("upsert")) > self._ok:
+            raise self._error
+
+
+@pytest.mark.parametrize("error", [http_error(500), ConnectionError("gone"), TimeoutError("timed out")],
+                         ids=["500", "connection", "timeout"])
+def test_upsert_failure_on_the_second_batch_tells_how_many_points_were_written(error):
+    client = FailingFrom(1, error)
+    store = QdrantStore(client=client, settings=Settings())
+    with pytest.raises(type(error)) as info:
+        store.upsert("c", points(7), batch_size=3)
+    assert info.value is error  # same exception, same type
+    assert info.value.points_written == 3
+    assert [len(call[2]) for call in client.named("upsert")] == [3, 3]  # the third batch is never sent
+
+
+def test_upsert_failure_on_the_first_batch_reports_zero_points_written():
+    error = http_error(500)
+    store, _client = fake_store(upsert=error)
+    with pytest.raises(UnexpectedResponse) as info:
+        store.upsert("c", points(5), batch_size=2)
+    assert info.value.points_written == 0
+
+
+def test_upsert_refused_key_after_some_batches_tells_how_many_points_were_written():
+    error = http_error(401)
+    client = FailingFrom(2, error)
+    store = QdrantStore(client=client, settings=Settings())
+    with pytest.raises(QdrantAuthError) as info:
+        store.upsert("c", points(5), batch_size=2)
+    assert info.value.points_written == 4
+    assert info.value.__cause__ is error
+
+
+@pytest.mark.parametrize(("good", "written"), [(0, 0), (2, 0), (3, 3), (5, 3), (6, 6)])
+def test_upsert_of_a_generator_that_raises_midway_tells_how_many_points_were_written(good, written):
+    boom = RuntimeError("the source broke")
+
+    def source():
+        yield from points(good)
+        raise boom
+
+    store, client = fake_store()
+    with pytest.raises(RuntimeError) as info:
+        store.upsert("c", source(), batch_size=3)
+    assert info.value is boom
+    assert info.value.points_written == written
+    # Full batches went out before the failure; the partial one is not sent.
+    assert sum(len(call[2]) for call in client.named("upsert")) == written
+
+
+def test_upsert_failure_with_an_exception_that_takes_no_attribute_is_still_raised():
+    class Sealed(Exception):
+        __slots__ = ()
+
+        def __setattr__(self, name, value):
+            raise AttributeError(name)
+
+    error = Sealed("sealed")
+    store, _client = fake_store(upsert=error)
+    with pytest.raises(Sealed) as info:
+        store.upsert("c", points(1))
+    assert info.value is error
+
+
+def test_local_mode_batches_written_before_a_failure_stay_and_a_rerun_overwrites_them(memory_store):
+    memory_store.ensure_collection("c", 4)
+
+    def source():
+        yield from points(4)
+        raise RuntimeError("the source broke")
+
+    with pytest.raises(RuntimeError) as info:
+        memory_store.upsert("c", source())  # batch size 3 from the settings
+    assert info.value.points_written == 3
+    assert memory_store.count("c") == 3
+    assert memory_store.upsert("c", points(4)) == 4  # same ids: the re-run overwrites
+    assert memory_store.count("c") == 4
 
 
 @pytest.mark.parametrize("n", [0, 1, 3, 4])

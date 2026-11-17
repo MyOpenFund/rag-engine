@@ -7,6 +7,7 @@ timeout, server error) is raised as the client raised it.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -53,6 +54,22 @@ def _positive_int(name: str, value: object) -> int:
     return value
 
 
+def _bare_host(host: str) -> str:
+    """``host`` without the square brackets of an IPv6 literal (``[::1]`` -> ``::1``)."""
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
+def _client_host(host: str) -> str:
+    """``host`` as qdrant-client needs it: an IPv6 literal in square brackets.
+
+    qdrant-client pastes the host into ``scheme://host:port`` as it is; a bare ``::1`` gives
+    a URL that cannot be parsed, and every later call fails.
+    """
+    return f"[{host}]" if ":" in host else host
+
+
 class QdrantStore:
     """One Qdrant server (or one injected client).
 
@@ -67,7 +84,12 @@ class QdrantStore:
     then built, and ``host`` / ``port`` are the ones given explicitly, else ``None``: the store
     cannot know where an injected client points to.
 
-    The API key is handed to the client and not kept by the store; ``repr()`` never shows it.
+    An IPv6 address is accepted bare or in square brackets (``::1``, ``[::1]``); ``host``
+    shows it bare, and the client receives it in brackets.
+
+    The API key is handed to the client and not kept by the store: the settings are read
+    when the store is built and not retained, only the batch size is. ``repr()`` never shows
+    the key. The client itself (:attr:`client`) does hold it.
     """
 
     def __init__(
@@ -81,18 +103,20 @@ class QdrantStore:
         settings: Settings | None = None,
         client: Any = None,
     ) -> None:
-        self._settings = settings if settings is not None else Settings.from_env()
+        # The settings are not kept: they hold the API key.
+        settings = settings if settings is not None else Settings.from_env()
+        self._batch_size = settings.batch_size
         if client is not None:
             self._host, self._port, self._https = host, port, https
             self._client = client
             return
-        self._host = host or self._settings.qdrant_host
-        self._port = port if port is not None else self._settings.qdrant_port
-        self._https = https if https is not None else self._settings.qdrant_https
+        self._host = _bare_host(host or settings.qdrant_host)
+        self._port = port if port is not None else settings.qdrant_port
+        self._https = https if https is not None else settings.qdrant_https
         self._client = QdrantClient(
-            host=self._host,
+            host=_client_host(self._host),
             port=self._port,
-            api_key=(api_key or "").strip() or self._settings.qdrant_api_key,
+            api_key=(api_key or "").strip() or settings.qdrant_api_key,
             https=self._https,
             timeout=timeout,
         )
@@ -108,11 +132,16 @@ class QdrantStore:
     ) -> QdrantStore:
         """Build a store from ``http://host[:port]`` or ``https://host[:port]``.
 
-        The scheme decides TLS, whatever the settings say; the port defaults to 6333. A URL
-        with a path, a query or credentials is refused. ``api_key`` and ``settings`` are as
-        in the constructor.
+        The scheme decides TLS, whatever the settings say; the port defaults to 6333. An IPv6
+        address is written in square brackets (``http://[::1]:6333``). A URL with a path, a
+        query or credentials, with a whitespace or control character anywhere, or with port 0
+        is refused with a ``ValueError`` that never echoes the URL. ``api_key`` and
+        ``settings`` are as in the constructor.
         """
         problem = "a Qdrant URL must look like http://host:port or https://host:port"
+        # Checked on the raw text: urlsplit silently drops tabs and line breaks.
+        if any(char.isspace() or not char.isprintable() for char in url):
+            raise ValueError(f"{problem}, without whitespace or control characters")
         try:
             parts = urlsplit(url)
             port = parts.port
@@ -123,6 +152,8 @@ class QdrantStore:
         if parts.path not in ("", "/") or parts.query or parts.fragment or parts.username or parts.password:
             # The URL is not echoed: it may hold credentials.
             raise ValueError(f"{problem}, without path, query or credentials")
+        if port == 0:
+            raise ValueError(f"{problem}, with a port between 1 and 65535")
         return cls(
             parts.hostname,
             port if port is not None else DEFAULT_URL_PORT,
@@ -168,7 +199,8 @@ class QdrantStore:
           size ``dim`` with cosine distance.
         * Qdrant answers that it does not exist (and only then): it is created.
         * The creation fails and the collection exists afterwards (another process created it
-          meanwhile): the collection is checked as above. If it still does not exist, or if
+          meanwhile, or our own request was applied although it reported an error, e.g. a
+          timeout): the collection is checked as above. If it still does not exist, or if
           that second look fails, the error of the creation is raised.
         * HTTP 401 or 403: :class:`QdrantAuthError`.
         * Anything else (connection refused, timeout, server error) is raised as the client
@@ -185,13 +217,21 @@ class QdrantStore:
         except Exception as exc:
             _raise_auth(exc)
             raise
-        if info is None:
-            info = self._create(name, dim)
         if info is not None:
             _check_vectors(name, dim, info.config.params.vectors)
+            return
+        info = self._create(name, dim)
+        if info is not None:
+            _check_vectors(name, dim, info.config.params.vectors)
+            logger.info("Create of Qdrant collection %r reported an error, but the collection exists and matches",
+                        name)
 
     def _create(self, name: str, dim: int) -> Any:
-        """Create the collection. Returns ``None``, or the collection another process created."""
+        """Create the collection.
+
+        Returns ``None``, or the collection found after a failed creation: who created it
+        (another process, or our own request despite its error) cannot be told.
+        """
         logger.info("Creating Qdrant collection %r (dim=%d, %s)", name, dim, DISTANCE.value)
         try:
             self._client.create_collection(
@@ -202,7 +242,7 @@ class QdrantStore:
         except Exception as exc:  # noqa: BLE001 - re-raised below unless the collection now exists
             _raise_auth(exc)
             created_error = exc
-        # Lost race? Any failure while finding out reports the creation error: it is the one
+        # Lost race, or a create applied despite its error? Any failure while finding out reports the creation error: it is the one
         # the operator needs.
         try:
             exists = self._client.collection_exists(collection_name=name)
@@ -211,7 +251,6 @@ class QdrantStore:
             raise created_error from None
         if info is None:
             raise created_error
-        logger.info("Qdrant collection %r was created by another process meanwhile", name)
         return info
 
     def upsert(self, collection: str, points: Iterable[Any], batch_size: int | None = None) -> int:
@@ -221,17 +260,28 @@ class QdrantStore:
         integer >= 1 is a ``ValueError``, raised before anything is sent. Each batch waits for
         Qdrant to apply it (``wait=True``). Nothing is sent for no points. HTTP 401 or 403 is
         a :class:`QdrantAuthError`; any other error is raised as is, at the first failed batch.
+
+        A failure does not undo anything: the batches sent before it stay written, and the
+        following ones are not sent. The error raised is the one of the failed batch (or the
+        one ``points`` raised while being read), with the number of points written before it
+        in its ``points_written`` attribute. With deterministic point ids, running the same
+        write again overwrites the points already there.
         """
-        size = self._settings.batch_size if batch_size is None else _positive_int("batch_size", batch_size)
+        size = self._batch_size if batch_size is None else _positive_int("batch_size", batch_size)
         written = 0
         batch: list[Any] = []
-        for point in points:
-            batch.append(point)
-            if len(batch) == size:
+        try:
+            for point in points:
+                batch.append(point)
+                if len(batch) == size:
+                    written += self._send(collection, batch)
+                    batch = []
+            if batch:
                 written += self._send(collection, batch)
-                batch = []
-        if batch:
-            written += self._send(collection, batch)
+        except Exception as exc:
+            with contextlib.suppress(AttributeError, TypeError):  # an exception that takes no attribute
+                exc.points_written = written  # type: ignore[attr-defined]
+            raise
         return written
 
     def _send(self, collection: str, batch: list[Any]) -> int:
