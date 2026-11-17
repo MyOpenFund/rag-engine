@@ -9,6 +9,8 @@ import pytest
 
 from rag_engine.config import ConfigError, Settings
 
+SECRET = "k3y-Zx9-DISTINCTIVE-41f7"
+
 DEFAULTS = {
     "qdrant_host": "localhost",
     "qdrant_port": 6333,
@@ -188,11 +190,36 @@ def test_search_limit_above_maximum_is_refused():
 
 
 def test_maximum_below_default_limit_is_refused():
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError) as excinfo:
         Settings.from_env({"RAG_ENGINE_SEARCH_MAX_LIMIT": "5"})
+    message = str(excinfo.value)
+    assert "RAG_ENGINE_SEARCH_LIMIT=10" in message
+    assert "RAG_ENGINE_SEARCH_MAX_LIMIT=5" in message
+
+
+# --- backend ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["onnx", "ONNX", " Onnx "])
+def test_backend_is_case_insensitive_in_the_environment(raw):
+    assert Settings.from_env({"RAG_ENGINE_BACKEND": raw}).backend == "onnx"
+
+
+def test_invalid_backend_echoes_the_raw_value():
+    with pytest.raises(ConfigError) as excinfo:
+        Settings.from_env({"RAG_ENGINE_BACKEND": "  TensorFlow "})
+    message = str(excinfo.value)
+    assert "RAG_ENGINE_BACKEND='  TensorFlow '" in message
+    assert "torch" in message and "onnx" in message
 
 
 # --- prefixes ---------------------------------------------------------------
+
+
+PREFIXES = [
+    ("RAG_ENGINE_PASSAGE_PREFIX", "passage_prefix", "passage: "),
+    ("RAG_ENGINE_QUERY_PREFIX", "query_prefix", "query: "),
+]
 
 
 def test_prefixes_are_not_stripped():
@@ -203,16 +230,34 @@ def test_prefixes_are_not_stripped():
     assert settings.query_prefix == "query:\t"
 
 
-def test_empty_prefix_means_no_prefix():
-    settings = Settings.from_env({"RAG_ENGINE_PASSAGE_PREFIX": "", "RAG_ENGINE_QUERY_PREFIX": ""})
-    assert settings.passage_prefix == ""
-    assert settings.query_prefix == ""
+@pytest.mark.parametrize(("name", "field", "default"), PREFIXES)
+def test_empty_prefix_variable_gives_the_default(name, field, default):
+    # A compose passthrough of an unset variable arrives as the empty string.
+    assert getattr(Settings.from_env({name: ""}), field) == default
+
+
+@pytest.mark.parametrize(("name", "field", "default"), PREFIXES)
+@pytest.mark.parametrize("raw", ["none", "None", "NONE", "  none\t", " nOnE "])
+def test_none_means_no_prefix(name, field, default, raw):
+    assert getattr(Settings.from_env({name: raw}), field) == ""
+
+
+@pytest.mark.parametrize(("name", "field", "default"), PREFIXES)
+@pytest.mark.parametrize("raw", [" ", "   ", "none: ", "no", "passage:", " x "])
+def test_any_other_prefix_is_taken_verbatim(name, field, default, raw):
+    assert getattr(Settings.from_env({name: raw}), field) == raw
 
 
 def test_one_prefix_set_leaves_the_other_at_its_default():
-    settings = Settings.from_env({"RAG_ENGINE_QUERY_PREFIX": ""})
+    settings = Settings.from_env({"RAG_ENGINE_QUERY_PREFIX": "none"})
     assert settings.passage_prefix == "passage: "
     assert settings.query_prefix == ""
+
+
+def test_direct_construction_takes_prefixes_verbatim():
+    settings = Settings(passage_prefix="", query_prefix="none")
+    assert settings.passage_prefix == ""
+    assert settings.query_prefix == "none"
 
 
 # --- OCR languages ----------------------------------------------------------
@@ -233,15 +278,264 @@ def test_ocr_settings_of_the_previous_engine_are_not_read():
 
 
 def test_direct_construction_is_validated():
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_SEARCH_LIMIT=100.*RAG_ENGINE_SEARCH_MAX_LIMIT=50"):
         Settings(search_limit=100, search_max_limit=50)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_BACKEND='tensorflow'"):
         Settings(backend="tensorflow")
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_BATCH_SIZE=0"):
         Settings(batch_size=0)
 
 
+INT_FIELDS = [
+    ("qdrant_port", "QDRANT_PORT"),
+    ("model_dim", "RAG_ENGINE_DIM"),
+    ("batch_size", "RAG_ENGINE_BATCH_SIZE"),
+    ("search_limit", "RAG_ENGINE_SEARCH_LIMIT"),
+    ("search_max_limit", "RAG_ENGINE_SEARCH_MAX_LIMIT"),
+]
+
+STR_FIELDS = [
+    ("qdrant_host", "QDRANT_HOST"),
+    ("model_name", "RAG_ENGINE_MODEL"),
+    ("passage_prefix", "RAG_ENGINE_PASSAGE_PREFIX"),
+    ("query_prefix", "RAG_ENGINE_QUERY_PREFIX"),
+    ("backend", "RAG_ENGINE_BACKEND"),
+    ("ocr_languages", "RAG_ENGINE_OCR_LANGUAGES"),
+]
+
+
+@pytest.mark.parametrize(("field", "variable"), INT_FIELDS)
+@pytest.mark.parametrize("value", [True, False, 5.0, 5.5, "5", None, [5]])
+def test_direct_integers_must_be_real_integers(field, variable, value):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(**{field: value})
+    message = str(excinfo.value)
+    assert variable in message
+    assert repr(value) in message
+    assert type(value).__name__ in message
+
+
+@pytest.mark.parametrize("value", ["false", "true", "", 0, 1, None])
+def test_direct_https_must_be_a_real_boolean(value):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(qdrant_https=value)
+    message = str(excinfo.value)
+    assert "QDRANT_HTTPS" in message
+    assert repr(value) in message
+
+
+@pytest.mark.parametrize(("field", "variable"), STR_FIELDS)
+@pytest.mark.parametrize("value", [None, 5, b"torch", ["eng"]])
+def test_direct_strings_must_be_strings(field, variable, value):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(**{field: value})
+    message = str(excinfo.value)
+    assert variable in message
+    assert repr(value) in message
+
+
+@pytest.mark.parametrize(
+    ("field", "variable"), [("qdrant_host", "QDRANT_HOST"), ("model_name", "RAG_ENGINE_MODEL")]
+)
+@pytest.mark.parametrize("value", ["", "   ", "\t"])
+def test_direct_empty_host_or_model_is_refused(field, variable, value):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(**{field: value})
+    assert variable in str(excinfo.value)
+
+
+@pytest.mark.parametrize("field", ["qdrant_api_key", "model_cache"])
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_direct_blank_optional_string_becomes_none(field, value):
+    assert getattr(Settings(**{field: value}), field) is None
+
+
+def test_direct_optional_strings_must_be_strings_or_none():
+    with pytest.raises(ConfigError, match="RAG_ENGINE_MODEL_CACHE=5"):
+        Settings(model_cache=5)
+    with pytest.raises(ConfigError, match="QDRANT_API_KEY"):
+        Settings(qdrant_api_key=12345)
+
+
+@pytest.mark.parametrize("value", ["ONNX", "Torch", " onnx", "onnx "])
+def test_direct_backend_is_matched_exactly(value):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(backend=value)
+    assert f"RAG_ENGINE_BACKEND={value!r}" in str(excinfo.value)
+
+
+def test_direct_construction_accepts_valid_values():
+    settings = Settings(
+        qdrant_host="qdrant.internal",
+        qdrant_port=6334,
+        qdrant_api_key=SECRET,
+        qdrant_https=True,
+        backend="onnx",
+        model_cache="/var/cache/models",
+    )
+    assert settings.qdrant_api_key == SECRET
+    assert settings.qdrant_https is True
+    assert settings.backend == "onnx"
+
+
+# --- the API key is never printed -------------------------------------------
+
+
+def test_api_key_is_absent_from_repr_and_str():
+    for settings in (Settings(qdrant_api_key=SECRET), Settings.from_env({"QDRANT_API_KEY": SECRET})):
+        assert settings.qdrant_api_key == SECRET
+        for text in (repr(settings), str(settings), f"{settings}", f"{settings!r}", f"{[settings]}"):
+            assert SECRET not in text
+            assert "qdrant_api_key=<set>" in text
+
+
+def test_repr_says_when_no_api_key_is_set():
+    text = repr(Settings())
+    assert "qdrant_api_key=<unset>" in text
+    assert "qdrant_host='localhost'" in text
+    assert "qdrant_port=6333" in text
+
+
+def test_repr_shows_every_field():
+    text = repr(Settings())
+    assert text.startswith("Settings(") and text.endswith(")")
+    for field in dataclasses.fields(Settings):
+        assert f"{field.name}=" in text
+
+
+INVALID_ENV = [
+    {"QDRANT_PORT": "abc"},
+    {"QDRANT_PORT": "0"},
+    {"QDRANT_HTTPS": "maybe"},
+    {"RAG_ENGINE_DIM": "0"},
+    {"RAG_ENGINE_BACKEND": "tensorflow"},
+    {"RAG_ENGINE_BATCH_SIZE": "many"},
+    {"RAG_ENGINE_OCR_LANGUAGES": "eng,fra"},
+    {"RAG_ENGINE_SEARCH_LIMIT": "51"},
+    {"RAG_ENGINE_SEARCH_MAX_LIMIT": "5"},
+]
+
+INVALID_KWARGS = [
+    {"qdrant_host": ""},
+    {"qdrant_host": 5},
+    {"qdrant_port": "6333"},
+    {"qdrant_port": 0},
+    {"qdrant_https": "false"},
+    {"model_name": ""},
+    {"model_dim": 1.5},
+    {"passage_prefix": None},
+    {"query_prefix": 3},
+    {"backend": "ONNX"},
+    {"batch_size": True},
+    {"ocr_languages": "eng,fra"},
+    {"search_limit": 100},
+    {"search_max_limit": 5},
+    {"model_cache": 5},
+]
+
+
+@pytest.mark.parametrize("env", INVALID_ENV)
+def test_api_key_is_absent_from_environment_errors(env):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings.from_env({"QDRANT_API_KEY": SECRET, **env})
+    assert SECRET not in str(excinfo.value)
+    assert SECRET not in repr(excinfo.value)
+
+
+@pytest.mark.parametrize("kwargs", INVALID_KWARGS)
+def test_api_key_is_absent_from_direct_construction_errors(kwargs):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(qdrant_api_key=SECRET, **kwargs)
+    assert SECRET not in str(excinfo.value)
+    assert SECRET not in repr(excinfo.value)
+
+
+@pytest.mark.parametrize("value", [SECRET.encode(), [SECRET], {"key": SECRET}])
+def test_api_key_of_the_wrong_type_is_refused_without_echoing_it(value):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(qdrant_api_key=value)
+    message = str(excinfo.value)
+    assert "QDRANT_API_KEY" in message
+    assert type(value).__name__ in message
+    assert SECRET not in message
+
+
+# --- echoed values are truncated --------------------------------------------
+
+HUGE = "x" * 5000
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"QDRANT_PORT": HUGE},
+        {"QDRANT_HTTPS": HUGE},
+        {"RAG_ENGINE_BACKEND": HUGE},
+        {"RAG_ENGINE_OCR_LANGUAGES": HUGE + "+"},
+        {"RAG_ENGINE_SEARCH_LIMIT": "9" * 4000},
+        {"RAG_ENGINE_SEARCH_MAX_LIMIT": "-" + "9" * 4000},
+    ],
+)
+def test_huge_environment_value_is_truncated_in_the_error(env):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings.from_env(env)
+    message = str(excinfo.value)
+    assert next(iter(env)) in message
+    assert len(message) < 300
+    assert "…" in message
+    assert "x" * 81 not in message and "9" * 81 not in message
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"qdrant_host": [HUGE]},
+        {"qdrant_port": HUGE},
+        {"qdrant_https": HUGE},
+        {"backend": HUGE},
+        {"ocr_languages": HUGE + "+"},
+        {"model_cache": [HUGE]},
+        {"search_limit": 10**400},
+    ],
+)
+def test_huge_direct_value_is_truncated_in_the_error(kwargs):
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(**kwargs)
+    message = str(excinfo.value)
+    assert len(message) < 300
+    assert "…" in message
+
+
+def test_integer_too_large_to_print_still_raises_a_config_error():
+    with pytest.raises(ConfigError) as excinfo:
+        Settings(qdrant_port=10**5000)
+    message = str(excinfo.value)
+    assert "QDRANT_PORT" in message
+    assert len(message) < 300
+
+
+def test_short_values_are_echoed_in_full():
+    value = "y" * 70
+    with pytest.raises(ConfigError) as excinfo:
+        Settings.from_env({"RAG_ENGINE_BACKEND": value})
+    assert repr(value) in str(excinfo.value)
+    assert "…" not in str(excinfo.value)
+
+
 # --- no side effect at import -----------------------------------------------
+
+
+def _run(code, env, cwd=None):
+    return subprocess.run(
+        [sys.executable, "-c", code], env=env, cwd=cwd, capture_output=True, text=True, check=False
+    )
+
+
+def _clean_environment():
+    """The current environment without any variable the settings read."""
+    return {
+        name: value for name, value in os.environ.items() if not name.startswith(("QDRANT_", "RAG_ENGINE_"))
+    }
 
 
 def test_import_does_not_read_the_environment():
@@ -256,8 +550,44 @@ def test_import_does_not_read_the_environment():
         "    assert 'QDRANT_PORT' in str(exc), exc\n"
         "    print('from_env raised')\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=False
-    )
+    result = _run(code, env)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "from_env raised"
+
+
+def test_variable_changed_after_import_is_seen():
+    # Nothing is snapshotted at import: the environment is read on every call.
+    env = dict(_clean_environment(), QDRANT_PORT="7001", RAG_ENGINE_PASSAGE_PREFIX="before: ")
+    code = (
+        "import os\n"
+        "import rag_engine.config as config\n"
+        "os.environ['QDRANT_PORT'] = '7123'\n"
+        "os.environ['QDRANT_HOST'] = 'late.internal'\n"
+        "os.environ['RAG_ENGINE_PASSAGE_PREFIX'] = 'after: '\n"
+        "first = config.Settings.from_env()\n"
+        "print(first.qdrant_port, first.qdrant_host, repr(first.passage_prefix))\n"
+        "del os.environ['QDRANT_PORT']\n"
+        "print(config.Settings.from_env().qdrant_port)\n"
+    )
+    result = _run(code, env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["7123 late.internal 'after: '", "6333"]
+
+
+def test_dotenv_file_in_the_working_directory_is_ignored(tmp_path):
+    (tmp_path / ".env").write_text(
+        "QDRANT_PORT=7999\nQDRANT_HOST=from-dotenv.internal\nRAG_ENGINE_BACKEND=onnx\n",
+        encoding="utf-8",
+    )
+    code = (
+        "import os, sys\n"
+        "import rag_engine.config as config\n"
+        "assert os.path.exists('.env'), os.getcwd()\n"
+        "settings = config.Settings.from_env()\n"
+        "assert 'dotenv' not in sys.modules\n"
+        "assert 'QDRANT_PORT' not in os.environ\n"
+        "print(settings.qdrant_port, settings.qdrant_host, settings.backend)\n"
+    )
+    result = _run(code, _clean_environment(), cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "6333 localhost torch"
