@@ -8,6 +8,7 @@ index does with a date it cannot read are therefore pinned here.
 from __future__ import annotations
 
 import os
+import time
 import uuid
 
 import pytest
@@ -165,14 +166,44 @@ def test_indexes_of_a_missing_collection_raise_and_create_nothing(store, collect
     assert not store.client.collection_exists(collection_name=collection)
 
 
+def _count(store, collection, condition) -> int:
+    count_filter = models.Filter(must=[condition])
+    return store.client.count(collection_name=collection, count_filter=count_filter, exact=True).count
+
+
+def _index_sizes(store, collection) -> dict[str, int]:
+    schema = store.client.get_collection(collection_name=collection).payload_schema
+    return {field: info.points for field, info in schema.items()}
+
+
 def test_the_indexes_hold_the_values_they_can_read(store, populated):
-    """The number of points each index took in: an unreadable date is left out, not refused."""
+    """The points each index took in: an unreadable date is left out, not refused."""
     store.ensure_payload_indexes(populated)
-    schema = store.client.get_collection(collection_name=populated).payload_schema
-    assert schema["doc_id"].points == len(PAYLOADS)
-    assert schema["source_code"].points == len(PAYLOADS)
-    assert schema["year"].points == WITH_A_YEAR
-    assert schema["date"].points == READABLE_DATES
+    # Through filters, which answer as soon as the indexes exist.
+    for field in ("doc_id", "source_code"):
+        values = sorted({payload[field] for payload in PAYLOADS.values()})
+        any_value = models.FieldCondition(key=field, match=models.MatchAny(any=values))
+        assert _count(store, populated, any_value) == len(PAYLOADS)
+    any_year = models.FieldCondition(key="year", range=models.Range(gte=-(10**6), lte=10**6))
+    assert _count(store, populated, any_year) == WITH_A_YEAR
+    any_date = _date_range(gte="0001-01-01", lte="9999-12-31")
+    assert _count(store, populated, any_date) == READABLE_DATES
+    # The size each index reports. On a large collection this count can lag behind for a
+    # few seconds while the index is built: it is polled, never read once.
+    expected = {
+        "doc_id": len(PAYLOADS),
+        "source_code": len(PAYLOADS),
+        "year": WITH_A_YEAR,
+        "date": READABLE_DATES,
+    }
+    deadline = time.monotonic() + 15
+    while True:
+        sizes = _index_sizes(store, populated)
+        reported = {field: sizes[field] for field in expected}
+        if reported == expected or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
+    assert reported == expected
 
 
 def test_keyword_match_on_source_code(store, populated):

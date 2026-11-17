@@ -351,7 +351,7 @@ class QdrantStore:
         return len(batch)
 
     def ensure_payload_indexes(self, collection: str, indexes: Iterable[Any] | None = None) -> list[str]:
-        """Create the payload indexes ``collection`` does not have yet; returns the fields indexed now.
+        """Create the payload indexes ``collection`` does not have yet; returns the fields created now.
 
         ``indexes`` is a list of ``(field, kind)`` pairs, ``kind`` being the name of a Qdrant
         payload index type (``"keyword"``, ``"integer"``, ``"datetime"``, ...) or the matching
@@ -375,16 +375,30 @@ class QdrantStore:
           raised it; the collection is never created here. Indexes created before a failure
           stay, and a second call creates the remaining ones.
 
+        **The returned list** names the fields for which a create call succeeded during
+        this call, and says no more than that. The existing indexes are read once, before
+        creating: two callers that run at the same moment may each find the indexes missing,
+        each create them, and each return every field (and two that ask for different kinds
+        for the same field are not told apart). qdrant-client's local mode keeps no payload
+        index: it accepts the creation, warns that it has no effect, and reports none
+        afterwards, so there every call returns the whole list.
+
         Creating an index never rewrites a point, and works on a collection that already
-        holds points. A payload value the index cannot read (a ``date`` that is not a full
-        date, a null, a missing key) is not an error: the point is left out of that index.
+        holds points. A payload value the index cannot read is not an error, neither here nor
+        when a point is written: the point stays stored, and a search without a filter on
+        that field still returns it, but **a filter on that field no longer sees it**. An
+        integer index reads integers (and floats with an integral value): a ``year`` stored
+        as the string ``"2016"`` or as ``2016.5`` matches no integer range once indexed. A
+        keyword index reads strings: a ``source_code`` stored as a number is not matched. A
+        datetime index reads the forms listed with :data:`rag_engine.schema.PAYLOAD_INDEXES`.
+        Before creating indexes on a collection that already holds points, check the types
+        of the stored values of ``year`` and of the keyword fields.
 
-        The existing indexes are read once, before creating: two processes that call this
-        with different kinds for the same field at the same moment are not told apart.
-
-        qdrant-client's local mode keeps no payload index: it accepts the creation, warns
-        that it has no effect, and reports none afterwards, so there every call returns the
-        whole list.
+        To check the result afterwards, count through a filter
+        (``client.count(collection, count_filter=..., exact=True)``). Do not rely on
+        ``get_collection(...).payload_schema[field].points`` right after the creation on a
+        large collection: that count has been seen to lag for a few seconds while the index
+        is built.
         """
         wanted = _index_kinds(PAYLOAD_INDEXES if indexes is None else indexes)
         try:

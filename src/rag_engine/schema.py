@@ -43,8 +43,9 @@ the chunk has no page (see ``page_for_id``).
 
 Payload indexes (``PAYLOAD_INDEXES``) are what the search filters rely on. An
 index never changes a point: it can be added to a collection that already
-holds points, and a payload value an index cannot read is not an error, the
-point is only left out of that index.
+holds points, and a payload value an index cannot read is not an error. The
+point stays stored and is still returned by a search without a filter on that
+field, but a filter on that field no longer sees it.
 """
 
 from __future__ import annotations
@@ -61,12 +62,30 @@ RESERVED_KEYS: tuple[str, ...] = ("doc_id", "filename", "chunk_number", "ingesti
 #: Qdrant payload index type. ``QdrantStore.ensure_payload_indexes`` creates them.
 #:
 #: - keyword (exact match): ``doc_id``, ``source_code``, ``doc_type``, ``language``, ``corpus``.
-#: - integer (match and range): ``year``.
-#: - datetime (range): ``date``, the publication date as the vault gives it. Qdrant reads a
-#:   full date (``2016-03-10``, taken as midnight UTC) or a full date and time. A value it
-#:   cannot read (``2016-03``, ``2016``, an empty string), a null and a missing key are not
-#:   errors, neither when the index is built nor when the point is written: the point is
-#:   stored as it is, and it never matches a date range.
+#:   The index reads strings (and lists of strings). A number or a boolean is not read: a
+#:   filter, which matches strings, does not find that point.
+#: - integer (match and range): ``year``. The index reads integers, and floats with an
+#:   integral value (``2016.0``). A ``year`` stored as the string ``"2016"`` or as ``2016.5``
+#:   is not read: once the index exists, it matches no integer range.
+#: - datetime (range): ``date``, the publication date as the vault gives it. The index reads
+#:   a full date (``2016-03-10``, taken as midnight UTC); a full date and a time, after ``T``
+#:   or a space (``2016-03-10T12:00:00``, ``2016-03-10 12:00:00``, ``2016-03-10T12:00``);
+#:   the same with ``Z`` or an offset (``2016-03-10T12:00:00+02:00``); and the lenient
+#:   ``2016-3-10``. It does not read ``2016-03``, ``2016``, an empty string, a null, a
+#:   missing key, an integer (``20160310``, a Unix timestamp) or ``10/03/2016``.
+#:
+#: A value an index cannot read is never an error, neither when the index is built nor when
+#: the point is written. The point is stored as it is, and a search without a filter on that
+#: field still returns it; a filter on that field no longer sees it. Before creating the
+#: indexes on a collection that already holds points, check the types of the stored values
+#: of ``year`` and of the keyword fields. (Checked on Qdrant 1.20.)
+#:
+#: The bounds of a date range must be full dates as well. The REST API of Qdrant refuses
+#: ``"2016"`` and ``"2016-03"`` with HTTP 400. Through the Python client, ``"2016-03"`` is a
+#: validation error raised by the client, but ``"2016"`` is accepted and read as a Unix
+#: timestamp (``1970-01-01T00:33:36Z``): no error, and a range that matches almost
+#: everything or almost nothing depending on the side of the bound. ``rag_engine.search``
+#: therefore accepts only a ``datetime.date`` or a ``YYYY-MM-DD`` string.
 PAYLOAD_INDEXES: tuple[tuple[str, str], ...] = (
     ("doc_id", "keyword"),
     ("source_code", "keyword"),
