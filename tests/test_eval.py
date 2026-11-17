@@ -475,6 +475,7 @@ def test_parameters_of_the_report(report, questions):
         "interval_min_documents": 20,
         "engine_version": rag_engine.__version__,
         "score_levels": [0.7, 0.75, 0.8, 0.85, 0.9],
+        "interval_min_questions": 20,
     }
 
 
@@ -495,6 +496,7 @@ def test_report_as_json(report):
         "unfiltered_reruns": 0,
         "abstentions": 0,
         "essential_unreachable": 0,
+        "expected_beyond_k": 0,
     }
     assert list(data["metrics"]) == ["headline", "overall", "by_kind", "by_tag", "by_expected_behavior"]
     # The pooled row is kept, and says what it is; the values are exact, not rounded.

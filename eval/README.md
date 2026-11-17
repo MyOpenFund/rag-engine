@@ -8,7 +8,7 @@ Question files for `rag-engine eval`, the script that builds the automatic one, 
 | `make_known_item.py` | Builds a known-item file from manifest files. Standard library only; not part of the installed package. |
 | `fixtures/corpus.json`, `fixtures/questions.jsonl` | 13 small documents (32 chunks) and 13 questions with known answers, in the first version of the format. The test suite loads them into a collection and checks the exact metrics. |
 | `analytical_v2.jsonl` | 79 questions on the content of the policy core, written by hand and checked against the documents: 71 that the corpus answers, 4 whose premise is false, 4 that the corpus cannot answer. |
-| `fixtures/questions_v2.jsonl` | 11 questions on the same 13 documents that use every field of the second version of the format: essential and acceptable documents, expected behaviour, a second run without filters, questions that expect no document. |
+| `fixtures/questions_v2.jsonl` | 13 questions on the same 13 documents that use every field of the second version of the format: essential and acceptable documents, either-of groups, expected behaviour, a second run without filters, questions that abstain. |
 
 `analytical_v2.jsonl` holds 79 questions on the content of the documents (see "The analytical batch" below). Unlike the known-item questions, which measure whether a document a user can describe is found, they ask what an analyst would ask, and they use the second version of the format.
 
@@ -34,27 +34,38 @@ The file is checked strictly when it is read: a duplicate `id`, an empty `expect
 
 ### Format v2: what a question may say more
 
-Six optional fields were added. A file that uses none of them is read and scored exactly as before, and gives the same report. A complete line:
+Seven optional fields were added. A file that uses none of them is read and scored exactly as before, and gives the same report. A complete line:
 
 ```json
-{"id": "an-21", "question": "How did the Monetary Policy Committee vote on Bank Rate in August 2016?", "expected_behavior": "answer", "essential_ids": ["fx-gb-minutes-2016-08"], "acceptable_ids": ["fx-gb-report-2016-08"], "expected_doc_ids": ["fx-gb-minutes-2016-08", "fx-gb-report-2016-08"], "filters": {"source_codes": ["gb"]}, "run_unfiltered": true, "must_include": ["unanimously", "0.25 percent"], "must_not_include": ["6-3"], "kind": "analytical+filters", "tags": ["factual", "votes"], "language": "en", "rationale": "The minutes hold the vote; the report of the same month is relevant without being needed."}
+{"id": "ex-01", "question": "How did the Monetary Policy Committee vote on Bank Rate in August 2016?", "expected_behavior": "answer", "essential_ids": ["fx-gb-minutes-2016-08"], "essential_any_of": [["fx-ecb-decision-2016-03", "fx-ecb-combined-2016-03"]], "acceptable_ids": ["fx-gb-report-2016-08"], "expected_doc_ids": ["fx-gb-minutes-2016-08", "fx-ecb-decision-2016-03", "fx-ecb-combined-2016-03", "fx-gb-report-2016-08"], "filters": {"source_codes": ["gb", "ecb"]}, "run_unfiltered": true, "must_include": ["unanimously", "0.25 percent"], "must_not_include": ["6-3"], "kind": "analytical+filters", "tags": ["factual", "votes"], "language": "en", "rationale": "The minutes hold the vote; the report of the same month is relevant without being needed."}
 ```
 
 | Field | Meaning | Rules |
 |---|---|---|
 | `expected_behavior` | What the right response does: `"answer"` (the documents answer the question; the default), `"correct_premise"` (the premise of the question is false, and the documents show it), `"abstain"` (the collection does not hold the information). | One of the three. |
-| `essential_ids` | The documents without which the question cannot be answered. | A list of `doc_id`, none twice. May be empty. |
-| `acceptable_ids` | The documents that are relevant without being necessary: the same content under another type, a neighbouring meeting that restates the fact. | A list of `doc_id`, none twice, and none that is also essential. May be empty. |
-| `expected_doc_ids` | The essential and the acceptable documents together. | When `essential_ids` or `acceptable_ids` is given it may be left out; if it is given it must name exactly the same documents, in any order. It may be empty only when `expected_behavior` is `"abstain"`. |
+| `essential_ids` | The documents without which the question cannot be answered. | A list of `doc_id`, none twice. May be empty; must be empty on a question that abstains. |
+| `essential_any_of` | Groups of documents that carry the same fact: the answer needs **any one** document of each group. | A list of groups, each a non-empty list of distinct `doc_id`. A document is in one group at most, and in neither `essential_ids` nor `acceptable_ids`. Not allowed on a question that abstains. |
+| `acceptable_ids` | The documents that are relevant without being necessary: a neighbouring meeting that restates the fact, a report on the same subject. On a question that abstains: its context documents (below). | A list of `doc_id`, none twice, and none that is also essential or in a group. May be empty. |
+| `expected_doc_ids` | The essential documents, the members of the groups and the acceptable documents together. | When one of the three fields above is given it may be left out; if it is given it must name exactly the same documents, in any order. It may be empty only when `expected_behavior` is `"abstain"`. |
 | `must_include` | Short facts a right answer holds (`"5-4"`, `"Shirai"`). | A list of non-blank strings, none twice. May be empty. |
-| `must_not_include` | Typical false statements (`"unanimous"`). | The same. |
+| `must_not_include` | Typical false statements (`"unanimous"`). | The same; a text may not be in both lists. |
 | `run_unfiltered` | `true`: score the question a second time without its `filters`. | `true` or `false`; `true` only on a question whose `filters` restrict something. |
 
-Every rule that is broken is an error naming the line, as for the first fields: an `expected_doc_ids` that lacks or adds a document, a document both essential and acceptable, a question that expects no document and does not abstain, an unknown behaviour, `run_unfiltered` without filters, a misspelt field (`essential`, `must_includes`, `expected_behaviour`).
+Every rule that is broken is an error naming the line, as for the first fields: an `expected_doc_ids` that lacks or adds a document, a document both essential and acceptable, or in two groups, a question that expects no document and does not abstain, an essential document on a question that abstains, an unknown behaviour, `run_unfiltered` without filters, a misspelt field (`essential`, `must_includes`, `expected_behaviour`). The loader also refuses a key written twice in one object (JSON would silently keep the last one), a document id with a space before or after it (it would never match), and a `kind` that ends with `#unfiltered`, the name the report gives to a second run.
+
+**Requirements: essential documents and either-of groups.** What an answer needs is a list of *requirements*: one per document of `essential_ids`, and one per group of `essential_any_of`. A requirement is satisfied at `k` when one of its documents is among the first `k` documents. Use a group when several documents carry the same fact and any of them lets a system answer: the decision release, the statement and the combined document of one meeting day; the minutes and a later report that restates a total; twenty-four consecutive minutes that all record the same dissent. Naming one of them essential and the others acceptable would punish a correct system that returns the sibling.
+
+```json
+{"id": "ex-02", "question": "By how much did the ECB lower the deposit facility rate in March 2016?", "essential_ids": [], "essential_any_of": [["fx-ecb-decision-2016-03", "fx-ecb-combined-2016-03"]], "acceptable_ids": ["fx-ecb-account-2016-04"]}
+```
+
+Here the question has one requirement, satisfied by the decision or by the combined document; the account is relevant without being needed. A question that compares two meetings would have two groups, one per meeting. The members of a group are expected documents: hit@1, hit@k, MRR and recall@k count them like the others.
+
+**Questions that abstain.** `"abstain"` says that the corpus does not answer the question. Nothing is then the right document, so **such a question is never scored**, whether it lists documents or not: it is searched, reported apart (the Abstention section of the report), and left out of every mean. The documents it lists are its *context documents*: those a system may reasonably show while it says that the corpus does not hold the answer (the document that shows where the information stops, the nearest one on the subject). They go in `acceptable_ids` (or in `expected_doc_ids` alone); none is essential, because a document that answered would make the question an ordinary one. The report says, for information, how many of them came back among the first `k`: returning one is neither a hit nor a fault.
 
 **What is scored now, and what is carried for later.** The engine returns documents; it writes no answer (a client does). The harness therefore scores retrieval only:
 
-- **Scored now**, on documents: where the expected documents stand (hit@1, hit@k, MRR, recall@k, as before), and how many of the **essential** ones are among the first `k` (`essential_recall@k`, `all_essential@k`). `expected_behavior` groups the results, and decides one thing: a question that abstains and expects no document is searched and reported apart, not scored. `run_unfiltered` adds a second run.
+- **Scored now**, on documents: where the expected documents stand (hit@1, hit@k, MRR, recall@k, as before), and how many of the **requirements** are satisfied among the first `k` (`essential_recall@k`, `all_essential@k`). `expected_behavior` groups the results, and decides one thing: a question that abstains is searched and reported apart, not scored. `run_unfiltered` adds a second run.
 - **Carried, not scored**: `must_include` and `must_not_include`. They are validated, kept on the question (`Question.must_include`) and written for each question in the JSON report, so that one file serves this harness and, later, a scorer of the answers a client generates from the documents. Nothing here reads them. Whether a response really abstains or corrects a premise is likewise a property of the answer, and is not judged here.
 
 A question written the old way, with `expected_doc_ids` alone, does not say which of its documents are essential: it is scored as before, and the two essential metrics leave it out (`null` in the JSON report, `n/a` for a line of the report without any such question). It is never counted as a zero.
@@ -69,9 +80,9 @@ rag-engine eval-check --questions eval/analytical_v2.jsonl \
     --doc-types A1 A2 A3 B1 E1 F1 --mime application/pdf
 ```
 
-The command reads the file with the rules above and nothing else: no Qdrant, no embedding model, no setting. It prints the number of questions per kind, tag, expected behaviour and language, how many carry filters and how many of these are scored again without them, how many questions name how many essential and expected documents, and what is allowed and probably not meant: question texts used twice (compared without regard to case and spacing), kinds that mix questions with and without filters, questions with more essential documents than `--k` (default 10).
+The command reads the file with the rules above and nothing else: no Qdrant, no embedding model, no setting. It prints the number of questions per kind, tag, expected behaviour and language, how many carry filters and how many of these are scored again without them, how many abstain (with and without context documents), and, for the questions that are scored, how many have how many requirements (essential documents and either-of groups) and how many expected documents. Then what is allowed and probably not meant: question texts used twice (compared without regard to case and spacing; their number and the first ten), kinds that mix questions with and without filters, questions with more requirements than `--k` (default 10: they can never have all they need) and questions with more expected documents than `--k` (their recall@k cannot reach 1). The first line names the file and is cut to 110 characters, the end of the path being kept.
 
-With `--manifests` (the catalogue of the corpus: JSON Lines files with one document per line, its `doc_id`, `mime_type` and `doc_type`; paths or glob patterns), every document a question names is looked up, and those that are not in the catalogue are listed with the questions that name them. `--doc-types` and `--mime` give the scope that was ingested: a document found in the catalogue with another doc type or MIME type is listed too, since it is not in the collection. The documents named are also counted per doc type and MIME type.
+With `--manifests` (the catalogue of the corpus: JSON Lines files with one document per line, its `doc_id`, `mime_type` and `doc_type`; paths or glob patterns), every document a question names is looked up, and those that are not in the catalogue are listed with the questions that name them and how (`essential`, `either-of`, `acceptable`, `expected`, `context`). `--doc-types` and `--mime` give the scope that was ingested: a document found in the catalogue with another doc type or MIME type is listed too, since it is not in the collection. The documents named are also counted per doc type and MIME type.
 
 Exit code 0 when the file is valid and every document it names was found (and is in the scope); 2 otherwise: a line that breaks a rule, a document that is missing, a manifest that cannot be read. From Python: `rag_engine.eval_check.check_questions`, `load_catalogue`, `format_check`.
 
@@ -89,7 +100,7 @@ The command prints a report and, with `--output`, writes every detail as JSON. E
 - the collection exists and has one unnamed vector of the dimension the settings announce (`RAG_ENGINE_DIM`); a collection with named vectors is refused with a message that says so;
 - at least one expected document is in the collection. A collection that holds none of them is almost always the wrong collection: the command stops with exit code 2. `--allow-empty` runs the evaluation all the same; nothing is scored, and a warning says so.
 
-`--fail-under-hit-at-k 0.9` makes the command exit with code 1 when the **headline** hit@k is below 0.9 (the headline is defined below; it is not the pooled mean of all questions). `--bootstrap-resamples N` sets the number of resamples of the intervals (default 1000). `--score-levels X ...` sets the scores the abstention questions are reported against (default `0.7 0.75 0.8 0.85 0.9`).
+`--fail-under-hit-at-k 0.9` makes the command exit with code 1 when the **headline** hit@k is below 0.9 (the headline is defined below; it is not the pooled mean of all questions). `--bootstrap-resamples N` sets the number of resamples of the intervals (default 1000). `--score-levels X ...` sets the scores the questions that abstain are reported against (default `0.7 0.75 0.8 0.85 0.9`).
 
 ### How a question is scored
 
@@ -103,22 +114,24 @@ The command prints a report and, with `--output`, writes every detail as JSON. E
 | hit@k | Share of questions with an expected document among the first `k`. |
 | MRR | Mean of `1 / rank` of the best-placed expected document, 0 when it is beyond `k`. |
 | recall@k | Mean share of the expected documents (those present in the collection) found among the first `k`. |
-| essential_recall@k | Mean share of the **essential** documents of a question (those present in the collection) found among the first `k`. |
-| all_essential@k | Share of questions with **all** their essential documents among the first `k`. |
+| all_essential@k | **Share of questions** with all their requirements satisfied among the first `k`. Printed with its counts: `0.75 (3/4)`. |
+| essential_recall@k | For a question, the share of its requirements that are satisfied. Printed two ways: the **mean over the questions**, and **pooled** over the requirements (satisfied / total, with the counts). |
 
-The expected documents are the essential and the acceptable ones together, and hit@1, hit@k and MRR look at the best-placed of them: **an acceptable document at rank 1 is a hit**. recall@k counts both kinds alike. Only the last two metrics tell them apart, and they are computed on the questions that state their essential documents and have at least one of them in the collection.
+A requirement is one essential document or one either-of group; it is satisfied when one of its documents is among the first `k`, and left out when none of its documents is in the collection. The expected documents are the essential ones, the members of the groups and the acceptable ones together, and hit@1, hit@k and MRR look at the best-placed of them: **an acceptable document at rank 1 is a hit**. recall@k counts them all alike. Only the last two metrics look at what the answer needs, and they are computed on the questions that state their essential documents and have at least one requirement to look for. A question that abstains is in none of these.
 
 ### Choosing `k` for chain and aggregation questions
 
-A question that needs six meetings has six essential documents; one that follows a figure over three years may have twelve. With more essential documents than `k`, `all_essential@k` is 0 and `essential_recall@k` is below 1 whatever the search returns. Such questions are not hidden in the mean: the report counts them (`unreachable`, per line and in the JSON `summary.essential_unreachable`), lists them, and marks each (`essential_unreachable`). `rag-engine eval-check` lists them before any run.
+A question that needs six meetings has six requirements; one that follows a figure over three years may have twelve. With more requirements than `k`, `all_essential@k` is 0 and `essential_recall@k` is below 1 whatever the search returns. Such questions are not hidden in the mean: the report counts them (`unreachable`, per line and in the JSON `summary.essential_unreachable`), lists them, and marks each (`essential_unreachable`). `rag-engine eval-check` lists them before any run. An either-of group is one requirement whatever the number of its documents: twenty-four minutes that all carry the same fact take one place, not twenty-four.
 
-The remedy is a larger `--k`, at least the largest number of essential documents. `k` documents cannot come out of fewer chunks, so `--k` is bounded by `--chunk-limit`, itself bounded by `RAG_ENGINE_SEARCH_MAX_LIMIT` (default 50): with the defaults `k` goes up to 50. A long document can take several of the chunks, so leave room: `--k 20` with the default `--chunk-limit 50`, or raise both limits. The other metrics move with `k` too (hit@k and recall@k can only rise), so compare two runs at the same `k`.
+The remedy is a larger `--k`, at least the largest number of requirements. `k` documents cannot come out of fewer chunks, so `--k` is bounded by `--chunk-limit`, itself bounded by `RAG_ENGINE_SEARCH_MAX_LIMIT` (default 50): with the defaults `k` goes up to 50. A long document can take several of the chunks, so leave room: `--k 20` with the default `--chunk-limit 50`, or raise both limits. The other metrics move with `k` too (hit@k and recall@k can only rise), so compare two runs at the same `k`.
+
+Long lists of *expected* documents are another matter. A question with 44 expected documents (most of them acceptable) cannot have a recall@10 above 10/44, and that says nothing against the search: the report counts these questions (`More expected documents than k`, JSON `summary.expected_beyond_k`), and recall@k should not be read for them.
 
 ### Equal scores
 
 Two chunks can have exactly the same score: the same text stored in two documents does. Qdrant returns such chunks in an order of its own, which can change from one request to the next and with the limit, so the rank of a document could change between two runs. The harness removes what it can of that: the chunks returned are put in one order (decreasing score, then `doc_id`, then `chunk_number`) before they are collapsed into documents. The same chunks therefore always give the same ranking.
 
-The order among equal scores is still arbitrary. A question is marked `tied_at_decision` when its hit@1 or its hit@k hangs on it: an expected document has the same score as documents that are not expected, across rank 1 or rank `k`, and another order of the tied documents would change the answer. The report counts these questions; the JSON report marks each.
+The order among equal scores is still arbitrary. A question is marked `tied_at_decision` when its hit@1 or its hit@k hangs on it: an expected document has the same score as documents that are not expected, across rank 1 or rank `k`, and another order of the tied documents would change the answer. The report counts these questions; the JSON report marks each. The mark concerns hit@1 and hit@k only: recall@k and the essential metrics are not checked for ties.
 
 What stays outside the harness: when chunks are tied at the edge of the chunk budget, which of them Qdrant returns is its choice, and the harness can only order what it was given.
 
@@ -147,18 +160,36 @@ Then come the questions left out, the questions with equal scores, and the **mis
 
 ### The parts of the report for format v2
 
-They are printed only when the questions call for them; the report of a file of the first version is unchanged, to the character. The tables below are the report of `fixtures/questions_v2.jsonl`.
+They are printed only when the questions call for them (a question states its essential documents or another behaviour than `answer`, abstains, or is scored again without its filters); the report of a file of the first version is unchanged, to the character. The tables below are the report of `fixtures/questions_v2.jsonl`.
 
 ```
                                  questions  documents  hit@1  hit@10  MRR   recall@10
-kind: graded                             5         13  1.00   1.00    1.00  0.81       (few documents)
-kind: graded+filters *                   4          7  1.00   1.00    1.00  0.61       (few documents)
+kind: graded                             5         13  1.00   1.00    1.00  0.82       (few documents)
+kind: graded+filters *                   5          7  1.00   1.00    1.00  0.56       (few documents)
 kind: graded+filters#unfiltered          2          3  0.67   1.00    0.83  1.00       (few documents)
-headline                                 7         13  0.97   1.00    0.99  0.83       (few documents)
-overall (pooled)                         9         13  1.00   1.00    1.00  0.83
+headline                                 7         13  0.97   1.00    0.99  0.82       (few documents)
+overall (pooled)                        10         13  1.00   1.00    1.00  0.78
 ```
 
+In such a report, a first table wider than 110 characters (long kind names with intervals) puts the interval of each line on a line of its own, under it.
+
 **A second run without filters** (`run_unfiltered`) is one more result, under the id of the question followed by `#unfiltered`. It is counted in a kind of its own, `<kind>#unfiltered`, and carries the tags of its question and `unfiltered-rerun`. That kind is asked without filters, so it is **in the headline**, next to the kinds that never had filters; the kind of the question, with its filters, stays a filtered kind marked `*`. `overall (pooled)` and the lines per expected behaviour count each question once, as it is written: the second runs are not in them. In the JSON report they are under `unfiltered_reruns`, apart from `results`.
+
+```
+Per question (the same lines as means over the questions: each question counts once):
+                                 questions  hit@1  hit@10  MRR   recall@10
+kind: graded                             5  1.00   1.00    1.00  0.95
+kind: graded+filters *                   5  1.00   1.00    1.00  0.60
+kind: graded+filters#unfiltered          2  0.50   1.00    0.75  1.00
+headline                                 7  0.86   1.00    0.93  0.97
+Which to read. Per document (the first table) when several questions ask for one document, as in
+  a known-item batch: a document asked for four times is not four observations. Per question
+  (this table, and overall (pooled) above) when questions expect many documents each: in a
+  per-document mean a question that expects 44 documents weighs 44 times one that expects one.
+More expected documents than k=10 (1 question: recall@10 cannot reach 1 for it): fx2-q05
+```
+
+**Per question.** The first table gives per-document means: right for a batch that asks for each document several times, wrong for one whose questions expect many documents each, where a question with 44 expected documents weighs 44 times a question with one. This table gives the same lines as plain means over the questions (JSON: `hit_at_1`, `hit_at_k`, `mrr`, `recall_at_k` of each aggregate, next to `per_document`). Here `fx2-q05`, with its thirteen documents, pulls the per-document recall of `graded` down to 0.82; per question it is 0.95. The last line counts the questions whose expected documents exceed `k`: their recall@k cannot reach 1.
 
 ```
 What the filter brings (2 questions scored with their filters, then without):
@@ -169,60 +200,74 @@ Means over these questions. The second runs are the kinds named #unfiltered abov
   in the headline and not in overall (pooled).
 ```
 
-**What the filter brings** compares, on the questions scored both ways and only on them, the means with and without the filters (JSON: `filter_effect`, with each pair). Here the filters put the right document first for both questions, where the search alone does it for one; and they cost a quarter of the essential documents, because a filter on the doc type left out a document that was needed.
+**What the filter brings** compares, on the questions scored both ways and only on them, the means with and without the filters (JSON: `filter_effect`, with each pair). Here the filters put the right document first for both questions, where the search alone does it for one; and they cost a quarter of the requirements, because a filter on the doc type left out a document that was needed. The essential mean is over the pairs that state requirements.
 
 ```
 Per expected behaviour (per-document means; each question once, as it is written):
                                     questions  documents  hit@1  hit@10  MRR   recall@10
-expected_behavior: answer                   6         13  1.00   1.00    1.00  0.77
+expected_behavior: answer                   8         13  1.00   1.00    1.00  0.75
 expected_behavior: correct_premise          2          3  1.00   1.00    1.00  0.67
-expected_behavior: abstain                  1          1  1.00   1.00    1.00  1.00
-correct_premise, abstain: scored on the documents they name, like any question; the answer is not.
+expected_behavior: abstain                  3  see the Abstention section
+correct_premise: scored on the documents that show the premise is false, like any question.
+  Whether the response corrects the premise is a property of the answer: it is not judged here.
+abstain: never scored, whether the question lists documents or not; in no line above.
 ```
 
-**Per expected behaviour.** A `correct_premise` question is scored on the documents that show the premise is false, like any question, and so is an `abstain` question that names documents. The lines tell whether these questions are harder to retrieve for; they say nothing on the response itself.
+**Per expected behaviour.** A `correct_premise` question is scored on the documents that show the premise is false, like any question. The lines tell whether these questions are harder to retrieve for; they say nothing on the response itself. The questions that abstain have a count and no metric: they are in the Abstention section.
 
 ```
-Essential documents (per-document means; the pooled line is over the questions):
-                                    questions  documents  essential_recall@10  all_essential@10  unreachable
-kind: graded                                4         13  0.80                 0.12                        1  (few)
-kind: graded+filters *                      4          5  0.50                 0.10                        0  (few)
-kind: graded+filters#unfiltered             2          3  1.00                 1.00                        0  (few)
-headline                                    6         13  0.82                 0.21                        1  (few)
-overall (pooled)                            8         13  0.72                 0.50                        1
-expected_behavior: answer                   5         13  0.74                 0.05                        1
-expected_behavior: correct_premise          2          2  0.50                 0.50                        0
-expected_behavior: abstain                  1          1  1.00                 1.00                        0
-questions, documents: the questions that state their essential documents, and these documents;
-  the other questions are left out of these two metrics (n/a when a line has none).
-essential_recall@10: for a question, the share of its essential documents among the first 10.
-all_essential@10: for a question, 1 when all of them are among the first 10, else 0.
-  In a per-document mean a question counts once for each of its essential documents.
-unreachable: questions with more essential documents than k=10: they can never have them all.
+Essential documents (what an answer needs, on the questions that state it):
+                                    all_essential@10  essential_recall@10  pooled        unreachable
+kind: graded                        0.75 (3/4)        0.94                 0.81 (13/16)            1
+kind: graded+filters *              0.20 (1/5)        0.50                 0.50 (4/8)              0
+kind: graded+filters#unfiltered     1.00 (2/2)        1.00                 1.00 (3/3)              0
+headline                            0.83 (5/6)        0.96                 0.84 (16/19)            1
+overall (pooled)                    0.44 (4/9)        0.70                 0.71 (17/24)            1
+expected_behavior: answer           0.43 (3/7)        0.75                 0.73 (16/22)            1
+expected_behavior: correct_premise  0.50 (1/2)        0.50                 0.50 (1/2)              0
+No interval: every line has fewer than 20 questions that state requirements.
+requirement: one document of essential_ids, or one group of essential_any_of (documents that
+  carry the same fact): satisfied when one of its documents is among the first 10. One whose
+  documents are all absent from the collection is left out.
+all_essential@10: share of the questions with every requirement satisfied (their number / the
+  questions of the line that state requirements; the others are left out, n/a without any).
+essential_recall@10: mean over these questions of the share of their requirements satisfied.
+pooled: requirements satisfied / requirements, these questions together (a long one weighs more).
+unreachable: questions with more requirements than k=10: they can never have them all.
   For chain and aggregation questions raise --k (at most --chunk-limit, itself bounded by
   RAG_ENGINE_SEARCH_MAX_LIMIT).
-(few): fewer than 20 essential documents, no interval is given.
-hit@1, hit@10 and MRR look at the first expected document, essential or acceptable.
+hit@1, hit@10, MRR and recall@10 look at every expected document: essential, either-of or
+  acceptable.
 
-More essential documents than k=10 (1):
-  fx2-q05: 13 essential documents
+More requirements than k=10 (1):
+  fx2-q05: 13 requirements
 ```
 
-**Essential documents.** One line per kind, the headline and the lines per behaviour as per-document means (the questions an essential document is essential to are averaged first, then the essential documents; a question counts once for each of its essential documents, so one with thirteen weighs thirteen times), with a 95% interval on the kinds and the headline when there are at least 20 essential documents; the pooled line is the mean over the questions. `questions` and `documents` count the questions that state their essential documents and these documents. The JSON report has both means for every group (`essential`), and the two values for every question.
+**Essential documents.** Each line is computed on its questions that state requirements (the others are left out):
+
+- `all_essential@k` is **always a share of questions**: those with every requirement satisfied among the first `k`, with the counts. In `kind: graded` three of the four questions have all they need: 0.75.
+- `essential_recall@k` is the **mean over the questions** of the share of their requirements that are satisfied: (1 + 1 + 10/13 + 1) / 4 = 0.94.
+- `pooled` is the same share **over the requirements**, all the questions of the line together: 13 of 16. One question with thirteen requirements weighs thirteen times there, and once in the mean.
+
+The kinds and the headline get a 95% interval for each of the three, from resampling the **questions** with replacement (`--bootstrap-resamples`, fixed seed), when they have at least 20 questions that state requirements (`interval_min_questions=` in Python); the intervals are printed under the table, one line per kind. The JSON report has, for every group (`essential`): `questions`, `all_essential_at_k`, `all_essential_questions`, `essential_recall_at_k`, `requirements`, `requirements_satisfied`, `pooled_essential_recall_at_k`, `question_intervals`, `few_questions`, `unreachable`, and for every question `requirements_present`, `requirements_satisfied`, `essential_recall_at_k`, `all_essential_at_k`. The keys `per_document`, `intervals` and `few_documents` of `essential` are kept with their first meaning (means over the documents of the requirements, and an interval from resampling these documents): a question counts there once for each of its documents, so they are not shares of questions, and the text report does not print them.
 
 ```
-Abstention (2 questions that expect no document: searched, in no mean, not judged):
-         top score  >=0.7  >=0.75  >=0.8  >=0.85  >=0.9  top document
-fx2-q10      1.000      1       1      1       1      1  fx-jp-minutes  Minutes of the Monetary Polic…
-fx2-q11        n/a      0       0      0       0      0  nothing was returned
+Abstention (3 questions whose expected behaviour is to abstain: searched, in no mean, not judged):
+         top score  >=0.7  >=0.75  >=0.8  >=0.85  >=0.9  context@10  top document
+fx2-q04      1.000      1       1      1       1      1  1/1         fx-gb-report-2016-08  Inflation Report - Au…
+fx2-q10      1.000      1       1      1       1      1  -           fx-jp-minutes  Minutes of the Moneta…
+fx2-q11        n/a      0       0      0       0      0  -           nothing was returned
 >=x: documents ranked with a score of at least x, among all those returned for the question.
-For comparison, top score of the 9 scored questions: min 1.000, median 1.000, max 1.000.
+context@10: the context documents of the question among the first 10, over those that are in
+  the collection. A context document is one the question lists: a system may show it while it
+  says that the corpus does not answer. Returning one is neither a hit nor a fault; - without any.
+For comparison, top score of the 10 scored questions: min 0.264, median 1.000, max 1.000.
 No threshold is applied: whether to answer is decided by the caller of the search.
 ```
 
-**Abstention.** A question whose `expected_behavior` is `"abstain"` and that expects no document has no right document: there is no rank, no hit and no miss, and it is **left out of every mean and every count of scored questions**. It is searched all the same, with its filters, and the section shows what came back: the first document and its score, and the number of documents ranked at or above each score level (among all the documents returned for the question, not the first `k` only). The last line gives, for comparison, the lowest, the median and the highest score of the first document over the scored questions of the same run.
+**Abstention.** A question whose `expected_behavior` is `"abstain"` has no right document: there is no rank, no hit and no miss, and it is **left out of every mean and every count of scored questions**, whether it lists documents or not. It is searched all the same, with its filters, and the section shows what came back: the first document and its score, the number of documents ranked at or above each score level (among all the documents returned for the question, not the first `k` only), and how many of its context documents are among the first `k` (`fx2-q04` lists one, and it comes first: that is not a hit). The last lines give, for comparison, the lowest, the median and the highest score of the first document over the scored questions of the same run; a scored question whose search returned nothing has no top score, and the line then says how many have one.
 
-What the section is for: seeing whether the scores separate the questions the corpus cannot answer from those it can, so that a threshold below which a client should answer "this is not in the corpus" can be studied on real data. What it is not: a verdict. **No threshold is applied and nothing passes or fails**; the engine returns documents, and abstaining is a decision of the client that writes the answer. The levels are a parameter (`--score-levels`, `score_levels=`); the defaults suit cosine scores of the multilingual E5 model and mean nothing for the test embedder of the fixture. JSON: `abstentions` (`score_levels`, `top_score_of_scored_questions`, and one entry per question with its first documents).
+What the section is for: seeing whether the scores separate the questions the corpus cannot answer from those it can, so that a threshold below which a client should answer "this is not in the corpus" can be studied on real data. What it is not: a verdict. **No threshold is applied and nothing passes or fails**; the engine returns documents, and abstaining is a decision of the client that writes the answer. The levels are a parameter (`--score-levels`, `score_levels=`); the defaults suit cosine scores of the multilingual E5 model and mean nothing for the test embedder of the fixture. JSON: `abstentions` (`score_levels`, `top_score_of_scored_questions`, and one entry per question with its first documents, `context_doc_ids`, `absent_context_doc_ids` and `context_documents_at_k`).
 
 ## The known-item batch
 
@@ -443,4 +488,4 @@ What the questions cover, by tag: chains over several meetings (`chain`), compar
 
 Every part of the report has a known value there. One question expects a document that is not in the corpus, one a document that a date filter leaves out, one is ranked second on purpose. One document, the combined decisions and statement, repeats a chunk of two others: a question that expects only one of the two documents holding the chunk is second by the order of equal scores (`tied_at_decision`), and the same question expecting both is first. Two questions ask for the same document, so that the per-document means differ from the means over the questions; every question carries several tags; the kind `verbatim` is asked without filters and makes the headline, the kinds `filtered` and `second` are not. `tests/eval_fixture.py` loads the corpus into a collection; `tests/test_eval.py` checks the metrics.
 
-`fixtures/questions_v2.jsonl` asks eleven more questions of the same corpus, with the fields of the second version, and again every number is known. One question has an acceptable document first and its essential document second, by the order of equal scores: a hit at rank 1. One names all thirteen documents as essential: with `k = 10` ten of them are among the first ten, whichever they are, and the question is out of reach. Filters leave an essential document out for two questions, and the essential one out while the acceptable one is first for a third. Two questions are scored again without their filters, and one of them is second without them. One states only `expected_doc_ids`, so the essential metrics leave it out. Two correct a premise; one abstains and names a document; two abstain and name none, one of which is the text of a chunk (its first document and score are known) while the filter of the other leaves nothing. `tests/test_eval_v2.py` checks the values, and `tests/test_eval_check.py` the counts `rag-engine eval-check` prints for both files.
+`fixtures/questions_v2.jsonl` asks thirteen more questions of the same corpus, with the fields of the second version, and again every number is known. One question has an acceptable document first and its essential document second, by the order of equal scores: a hit at rank 1. One names all thirteen documents as essential: with `k = 10` ten of them are among the first ten, whichever they are, and the question is out of reach. Filters leave an essential document out for two questions, and the essential one out while the acceptable one is first for a third. Two questions are scored again without their filters, and one of them is second without them. One states only `expected_doc_ids`, so the essential metrics leave it out. Two have an either-of group: one needs the statement or the combined document, which hold the same chunk; the other needs the decision and one of these two, and its filters leave the combined document alone, so the group is satisfied and the decision is not. Two correct a premise. Three abstain: one lists a context document, which holds the text of the question and comes first without being a hit; two list none, one of which is the text of a chunk (its first document and score are known) while the filter of the other leaves nothing. `tests/test_eval_v2.py` checks the values, and `tests/test_eval_check.py` the counts `rag-engine eval-check` prints for both files.

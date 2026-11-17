@@ -78,31 +78,37 @@ def run(*arguments: str) -> int:
 def test_counts_of_the_second_fixture():
     check = check_questions(load_questions(QUESTIONS_V2))
     assert isinstance(check, QuestionCheck)
-    assert (check.questions, check.k) == (11, 10)
-    assert check.by_kind == {"graded": 5, "graded+filters": 4, "abstention": 2}
+    assert (check.questions, check.k) == (13, 10)
+    assert check.by_kind == {"graded": 6, "graded+filters": 5, "abstention": 2}
     assert list(check.by_kind) == ["graded", "graded+filters", "abstention"]  # most frequent first
     assert check.by_tag == {
-        "bank:ecb": 4,
+        "bank:ecb": 6,
         "factual": 4,
         "out-of-corpus": 3,
         "bank:gb": 2,
         "chain": 2,
+        "either-of": 2,
         "false-premise": 2,
         "aggregation": 1,
         "bank:au": 1,
         "bank:us": 1,
         "short-query": 1,
     }
-    assert check.by_behavior == {"answer": 6, "correct_premise": 2, "abstain": 3}
-    assert check.by_language == {"en": 10, "(none)": 1}
-    assert (check.with_filters, check.run_unfiltered) == (5, 2)
-    # fx2-q03 and fx2-q11 do not say which documents are essential; fx2-q10 says there is none.
-    assert check.essential_not_stated == 2
-    assert check.essential_counts == {0: 1, 1: 5, 2: 2, 13: 1}
-    assert check.expected_counts == {0: 2, 1: 3, 2: 4, 3: 1, 13: 1}
-    assert check.without_documents == 2
-    assert check.more_essential_than_k == ("fx2-q05",)
-    assert check.duplicate_texts == (("fx2-q01", "fx2-q07"),)
+    assert check.by_behavior == {"answer": 8, "correct_premise": 2, "abstain": 3}
+    assert check.by_language == {"en": 12, "(none)": 1}
+    assert (check.with_filters, check.run_unfiltered) == (6, 2)
+    # Three questions abstain, one of them with a context document: they are counted apart.
+    assert (check.abstentions, check.abstentions_with_context, check.without_documents) == (3, 1, 2)
+    # Of the ten others, fx2-q03 does not say which documents are essential.
+    assert check.essential_not_stated == 1
+    # A requirement is an essential document or a group: fx2-q12 has one (a group of two documents),
+    # fx2-q13 two (a document and a group).
+    assert check.requirement_counts == {1: 5, 2: 3, 13: 1}
+    assert (check.either_of_questions, check.either_of_groups) == (2, 2)
+    assert check.expected_counts == {1: 2, 2: 5, 3: 2, 13: 1}
+    assert check.more_requirements_than_k == ("fx2-q05",)
+    assert check.more_expected_than_k == ("fx2-q05",)
+    assert check.duplicate_texts == (("fx2-q01", "fx2-q07"), ("fx2-q08", "fx2-q12"))
     assert check.mixed_kinds == ()
     assert check.documents == 14  # the thirteen of the corpus and one that is not in it
     assert (check.catalogue_documents, check.missing, check.out_of_scope) == (None, (), ())
@@ -117,12 +123,13 @@ def test_counts_of_the_first_fixture():
     assert check.by_behavior == {"answer": 13}
     assert check.by_language == {"(none)": 12, "fr": 1}
     assert (check.with_filters, check.run_unfiltered) == (6, 0)
-    assert (check.essential_not_stated, check.essential_counts) == (13, {})
+    assert (check.essential_not_stated, check.requirement_counts) == (13, {})
     assert check.expected_counts == {1: 10, 2: 3}
     assert check.duplicate_texts == (("fx-q12", "fx-q13"),)
     # fx-q09 is of the kind "filtered" and carries no filter.
     assert check.mixed_kinds == ("filtered",)
-    assert (check.without_documents, check.more_essential_than_k) == (0, ())
+    assert (check.without_documents, check.more_requirements_than_k) == (0, ())
+    assert (check.abstentions, check.more_expected_than_k) == (0, ())
 
 
 def test_what_deserves_a_look():
@@ -145,16 +152,35 @@ def test_what_deserves_a_look():
             filters=filters,
         ),
         Question(id="q8", question="Also apart", expected_doc_ids=("a",), kind="apart", filters=filters),
+        Question(
+            id="q9",
+            question="A context document",
+            acceptable_ids=("a",),
+            expected_behavior="abstain",
+            kind="plain",
+            filters=filters,
+        ),
+        Question(id="q10", question="Groups", essential_any_of=[("a", "b", "c"), ("d",)], kind="plain"),
+        Question(id="q11", question="Three groups", essential_any_of=[("a",), ("b",), ("c",)], kind="plain"),
     ]
     check = check_questions(questions, k=2)
     # Compared without regard to case and spacing; in the order of the file.
     assert check.duplicate_texts == (("q1", "q2", "q4"),)
     # "(none)" mixes q3 (filters) and q4. "apart" does not: its question without filters is not scored.
+    # Nor does "plain": q9 carries filters, and abstains (with a context document or not, it is not scored).
     assert check.mixed_kinds == ("(none)", "mixed")
-    assert check.more_essential_than_k == ("q5",)  # three essential documents; q6 has two, and one acceptable
-    assert check_questions(questions, k=3).more_essential_than_k == ()
-    assert check.by_kind == {"mixed": 2, "(none)": 2, "apart": 2, "plain": 2}
-    assert check.essential_counts == {2: 1, 3: 1} and check.essential_not_stated == 6
+    # Three requirements: q5 (three essential documents) and q11 (three groups). q6 has two and an
+    # acceptable document; q10 two groups, of three documents and of one.
+    assert check.more_requirements_than_k == ("q5", "q11")
+    assert check_questions(questions, k=3).more_requirements_than_k == ()
+    # More expected documents than k: recall@k cannot reach 1, although q6 and q10 can have all they need.
+    assert check.more_expected_than_k == ("q5", "q6", "q10", "q11")
+    assert check_questions(questions, k=3).more_expected_than_k == ("q10",)
+    assert check.by_kind == {"plain": 5, "(none)": 2, "apart": 2, "mixed": 2}
+    assert check.requirement_counts == {2: 2, 3: 2} and check.essential_not_stated == 5
+    assert (check.either_of_questions, check.either_of_groups) == (2, 5)
+    assert (check.abstentions, check.abstentions_with_context, check.without_documents) == (2, 1, 1)
+    assert check.expected_counts == {1: 5, 3: 3, 4: 1}
 
 
 @pytest.mark.parametrize("k", [0, -1, True, 2.0, "10"])
@@ -287,31 +313,76 @@ def test_a_valid_file_is_described_and_exits_with_0(capsys, no_engine):
     expected = format_check(check_questions(questions), name=str(QUESTIONS_V2), sha256=questions.sha256)
     assert captured.out == expected + "\n"
     lines = captured.out.splitlines()
-    assert lines[0].endswith(f"questions_v2.jsonl: 11 questions (sha256 {questions.sha256[:12]})")
-    assert "kind: graded 5, graded+filters 4, abstention 2" in lines
-    assert "expected_behavior: answer 6, correct_premise 2, abstain 3" in lines
-    assert "language: en 10, (none) 1" in lines
-    assert "filters: 5 with filters, 2 of them scored again without (run_unfiltered)" in lines
+    assert lines[0].endswith(f"questions_v2.jsonl: 13 questions (sha256 {questions.sha256[:12]})")
+    assert "kind: graded 6, graded+filters 5, abstention 2" in lines
+    assert "expected_behavior: answer 8, correct_premise 2, abstain 3" in lines
+    assert "language: en 12, (none) 1" in lines
+    assert "filters: 6 with filters, 2 of them scored again without (run_unfiltered)" in lines
     assert (
-        "essential documents per question (documents: questions): not stated: 2, 0: 1, 1: 5, 2: 2, 13: 1"
-        in lines
+        "abstain: 3 (searched and reported apart, never scored); 1 with context documents, 2 without" in lines
     )
-    assert "expected documents per question (documents: questions): 0: 2, 1: 3, 2: 4, 3: 1, 13: 1" in lines
+    assert "requirements per question (requirements: questions): not stated: 1, 1: 5, 2: 3, 13: 1" in lines
+    assert (
+        "  a requirement is one essential document or one either-of group: 2 groups in 2 questions" in lines
+    )
+    assert "expected documents per question (documents: questions): 1: 2, 2: 5, 3: 2, 13: 1" in lines
     assert "distinct documents named: 14" in lines
-    assert any(line.startswith("without any document: 2 ") for line in lines)
-    assert "duplicate question texts: 1" in lines and "  the same text: fx2-q01, fx2-q07" in lines
-    assert "more essential documents than k=10: fx2-q05" in lines
-    assert "tag: bank:ecb 4, factual 4, out-of-corpus 3" in captured.out
+    assert "duplicate question texts: 2" in lines and "  the same text: fx2-q01, fx2-q07" in lines
+    assert "more requirements than k=10: fx2-q05" in lines
+    assert "more expected documents than k=10: fx2-q05" in lines
+    assert "tag: bank:ecb 6, factual 4, out-of-corpus 3" in captured.out
     assert lines[-1] == "The file is valid."
     assert "catalogue" not in captured.out
-    assert all(len(line) <= 120 for line in lines)
+    # Whatever the directory of the checkout: the line that names the file is cut, the others are short.
+    assert all(len(line) <= 110 for line in lines)
+
+
+def test_the_first_line_fits_the_width_whatever_the_path(tmp_path, capsys, no_engine):
+    folder = tmp_path / ("a-long-directory-name-" * 9) / ("another-one-" * 12)
+    folder.mkdir(parents=True)
+    path = folder / "questions_of_the_batch.jsonl"
+    path.write_text(QUESTIONS_V2.read_text(encoding="utf-8"), encoding="utf-8")
+    assert len(str(path)) > 300
+    assert run("--questions", str(path)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    sha256 = load_questions(QUESTIONS_V2).sha256
+    # The end of the path is kept: it names the file.
+    assert lines[0].startswith("…") and len(lines[0]) == 110
+    assert lines[0].endswith(
+        f"another-one-/questions_of_the_batch.jsonl: 13 questions (sha256 {sha256[:12]})"
+    )
+    assert all(len(line) <= 110 for line in lines)
+    short = format_check(check_questions(load_questions(QUESTIONS_V2)), name="q.jsonl", sha256=sha256)
+    assert short.splitlines()[0] == f"q.jsonl: 13 questions (sha256 {sha256[:12]})"
+    assert format_check(check_questions(load_questions(QUESTIONS_V2))).splitlines()[0] == "13 questions"
+
+
+def test_many_duplicate_texts_are_counted_and_the_first_ten_shown():
+    questions = [
+        Question(id=f"q{n}-{copy}", question=f"Text number {n}", expected_doc_ids=("a",))
+        for n in range(12)
+        for copy in ("a", "b")
+    ]
+    check = check_questions(questions)
+    assert len(check.duplicate_texts) == 12  # all of them are in the result
+    lines = format_check(check).splitlines()
+    assert "duplicate question texts: 12" in lines
+    shown = [line for line in lines if line.startswith("  the same text:")]
+    assert len(shown) == 10 and shown[-1] == "  the same text: q9-a, q9-b"
+    assert "  and 2 more (the first 10 are shown)" in lines
+    ten = format_check(check_questions(questions[:20]))
+    assert ten.count("the same text:") == 10 and "more (the first" not in ten
 
 
 def test_k_is_an_option_of_the_check(capsys, no_engine):
     assert run("--questions", str(QUESTIONS_V2), "--k", "13") == 0
-    assert "more essential documents" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "more requirements" not in out and "more expected documents" not in out
     assert run("--questions", str(QUESTIONS_V2), "--k", "1") == 0
-    assert "more essential documents than k=1: fx2-q05, fx2-q06, fx2-q08" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # fx2-q12 is not there: its two documents are one requirement.
+    assert "more requirements than k=1: fx2-q05, fx2-q06, fx2-q08, fx2-q13" in out
+    assert "more expected documents than k=1: fx2-q01, fx2-q02, fx2-q05, fx2-q06, fx2-q08, fx2-q09," in out
     assert run("--questions", str(QUESTIONS_V2), "--k", "0") == 2
     assert "--k must be at least 1" in capsys.readouterr().err
 
@@ -321,7 +392,8 @@ def test_a_kind_that_mixes_filters_is_pointed_at(capsys, no_engine):
     out = capsys.readouterr().out
     assert "kinds with and without filters: filtered" in out
     assert "the whole kind is kept out of the" in out
-    assert "essential documents per question (documents: questions): not stated: 13" in out
+    assert "requirements per question (requirements: questions): not stated: 13" in out
+    assert "abstain:" not in out and "the scored questions:" not in out
 
 
 @pytest.mark.parametrize(
@@ -399,7 +471,7 @@ def test_a_document_missing_from_the_manifests_exits_with_2(capsys, no_engine, m
     assert run("--questions", str(QUESTIONS_V2), "--manifests", files[0]) == 2
     captured = capsys.readouterr()
     assert "not in the catalogue: 8" in captured.out
-    assert "  fx-gb-report-2016-08: fx2-q04 (essential, line 4), fx2-q05 (essential, line 5)," in captured.out
+    assert "  fx-gb-report-2016-08: fx2-q04 (context, line 4), fx2-q05 (essential, line 5)," in captured.out
     assert "8 documents named by" in captured.err and "are not in the catalogue" in captured.err
 
 
@@ -443,3 +515,27 @@ def test_the_committed_question_files_are_valid(capsys, no_engine):
     assert "kind: described 393, described+filters 210, label 158, title 36" in out
     assert "filters: 210 with filters, 0 of them scored again without" in out
     assert out.splitlines()[-1] == "The file is valid."
+
+
+def test_a_missing_document_says_how_each_question_names_it():
+    questions = [
+        Question(id="q1", question="One", essential_ids=("a",), essential_any_of=[("b", "gone")]),
+        Question(id="q2", question="Two", essential_ids=("gone",), acceptable_ids=("a",)),
+        Question(id="q3", question="Three", acceptable_ids=("gone",), expected_behavior="abstain"),
+        Question(id="q4", question="Four", expected_doc_ids=("gone",)),
+        Question(id="q5", question="Five", essential_ids=("a",), acceptable_ids=("gone",)),
+    ]
+    catalogue = {name: CatalogueEntry(name, "application/pdf", "A1") for name in ("a", "b")}
+    check = check_questions(questions, catalogue=catalogue)
+    (missing,) = check.missing
+    assert [(id_, role) for id_, _line, role in missing.questions] == [
+        ("q1", "either-of"),
+        ("q2", "essential"),
+        ("q3", "context"),
+        ("q4", "expected"),
+        ("q5", "acceptable"),
+    ]
+    assert (
+        "gone: q1 (either-of), q2 (essential), q3 (context), q4 (expected), q5 (acceptable)"
+        in format_check(check)
+    )

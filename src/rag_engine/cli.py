@@ -130,7 +130,8 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_K,
         help=(
             f"documents the metrics look at (default {DEFAULT_K}; at most --chunk-limit). A question with "
-            "more essential documents than this can never have them all: raise it for such questions"
+            "more requirements (essential documents and either-of groups) than this can never have them "
+            "all: raise it for such questions"
         ),
     )
     evaluation.add_argument(
@@ -173,7 +174,7 @@ def _parser() -> argparse.ArgumentParser:
         default=list(DEFAULT_SCORE_LEVELS),
         metavar="X",
         help=(
-            "scores the documents returned for a question that expects no document are counted "
+            "scores the documents returned for a question that abstains are counted "
             f"against (default {' '.join(f'{level:g}' for level in DEFAULT_SCORE_LEVELS)}); they are "
             "reported, never used as a threshold"
         ),
@@ -226,7 +227,8 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_K,
         help=(
             "documents the evaluation will look at "
-            f"(default {DEFAULT_K}): the questions with more essential documents are listed"
+            f"(default {DEFAULT_K}): the questions with more requirements, or more expected documents, "
+            "are listed"
         ),
     )
     return parser
@@ -288,7 +290,14 @@ def _dimensions(collection: str, size: int, model: str) -> str:
 
 def _check_documents(store: Any, collection: str, questions: QuestionSet, allow_empty: bool) -> None:
     """Refuse a collection that holds none of the expected documents, unless ``allow_empty``."""
-    wanted = sorted({doc_id for question in questions for doc_id in question.expected_doc_ids})
+    wanted = sorted(
+        {
+            doc_id
+            for question in questions
+            if question.expected_behavior != "abstain"  # its documents are context: nothing to score
+            for doc_id in question.expected_doc_ids
+        }
+    )
     if not wanted:  # every question abstains: there is no document to find, and nothing to score
         return
     if store.existing_doc_ids(collection, wanted):

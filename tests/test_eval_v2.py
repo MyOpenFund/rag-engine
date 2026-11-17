@@ -7,6 +7,7 @@ are in ``test_eval.py`` and are not touched by any of this.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from fractions import Fraction
 
@@ -107,14 +108,17 @@ def test_the_fields_of_the_first_version_keep_their_place():
         "must_include",
         "must_not_include",
         "run_unfiltered",
+        "essential_any_of",
     )
     assert BEHAVIORS == ("answer", "correct_premise", "abstain")
 
 
 def test_load_the_second_fixture(questions):
-    assert [question.id for question in questions] == [f"fx2-q{n:02d}" for n in range(1, 12)]
-    first, second, third, fifth, sixth, seventh, tenth, eleventh = (
-        questions[index] for index in (0, 1, 2, 4, 5, 6, 9, 10)
+    assert [question.id for question in questions] == [
+        f"fx2-q{n:02d}" for n in (1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 10, 11)
+    ]
+    first, second, third, fourth, fifth, sixth, seventh, twelfth, thirteenth, tenth, eleventh = (
+        questions[index] for index in (0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12)
     )
     assert first.expected_behavior == "answer"
     assert first.essential_ids == ("fx-ecb-decision-2016-03",)
@@ -141,6 +145,18 @@ def test_load_the_second_fixture(questions):
     assert (tenth.expected_behavior, tenth.expected_doc_ids) == ("abstain", ())
     assert (tenth.essential_ids, tenth.acceptable_ids) == ((), ())
     assert (eleventh.expected_doc_ids, eleventh.essential_ids, eleventh.run_unfiltered) == ((), None, False)
+    # An abstention with a context document: nothing essential.
+    assert (fourth.expected_behavior, fourth.essential_ids) == ("abstain", ())
+    assert fourth.acceptable_ids == fourth.expected_doc_ids == ("fx-gb-report-2016-08",)
+    # Either-of groups: alone, and next to an essential document.
+    group = ("fx-ecb-statement-2016-03", "fx-ecb-combined-2016-03")
+    assert (twelfth.essential_ids, twelfth.essential_any_of, twelfth.expected_doc_ids) == (
+        (),
+        (group,),
+        group,
+    )
+    assert thirteenth.requirements == (("fx-ecb-decision-2016-03",), group)
+    assert thirteenth.expected_doc_ids == ("fx-ecb-decision-2016-03", *group)
 
 
 def test_a_question_is_written_back_as_it_was_read(questions, tmp_path):
@@ -153,7 +169,8 @@ def test_a_question_is_written_back_as_it_was_read(questions, tmp_path):
     assert lines[1]["expected_behavior"] == "correct_premise"
     assert lines[6]["run_unfiltered"] is True
     assert "essential_ids" not in lines[2] and "must_include" not in lines[2]
-    assert lines[9]["expected_doc_ids"] == [] and lines[9]["must_not_include"] == ["minus 0.1 percent"]
+    assert lines[11]["expected_doc_ids"] == [] and lines[11]["must_not_include"] == ["minus 0.1 percent"]
+    assert lines[9]["essential_any_of"] == [["fx-ecb-statement-2016-03", "fx-ecb-combined-2016-03"]]
 
 
 def test_the_document_lists_of_a_question(tmp_path):
@@ -187,7 +204,7 @@ def test_only_a_question_that_abstains_may_expect_no_document(tmp_path):
     assert (one.expected_doc_ids, one.essential_ids) == ((), None)
     assert (two.expected_doc_ids, two.essential_ids, two.acceptable_ids) == ((), (), ())
     assert three.expected_doc_ids == ()
-    assert four.expected_doc_ids == ("d1",)  # an abstention may name documents
+    assert four.expected_doc_ids == ("d1",)  # an abstention may list documents: its context documents
 
 
 def test_optional_fields_may_be_null_or_left_out(tmp_path):
@@ -364,7 +381,8 @@ def exactly(group: Aggregate, questions, documents, per_question, per_document):
     assert got == pytest.approx([float(value) for value in per_document], abs=1e-12)
 
 
-def essential_exactly(group: Aggregate, questions, documents, unreachable, per_question, per_document):
+def essential_exactly(group: Aggregate, questions, documents, unreachable, complete, mean, satisfied, needed):
+    """``complete`` questions have all they need; ``satisfied`` of ``needed`` requirements; ``mean`` share."""
     essential = group.essential
     assert isinstance(essential, EssentialAggregate)
     assert (essential.questions, essential.documents, essential.unreachable) == (
@@ -372,23 +390,27 @@ def essential_exactly(group: Aggregate, questions, documents, unreachable, per_q
         documents,
         unreachable,
     )
-    got = (essential.essential_recall_at_k, essential.all_essential_at_k)
-    assert got == pytest.approx([float(value) for value in per_question], abs=1e-12)
+    assert essential.all_essential_questions == complete
+    assert essential.all_essential_at_k == pytest.approx(complete / questions, abs=1e-12)
+    assert essential.essential_recall_at_k == pytest.approx(float(mean), abs=1e-12)
+    assert (essential.requirements_satisfied, essential.requirements) == (satisfied, needed)
+    assert essential.pooled_essential_recall_at_k == pytest.approx(satisfied / needed, abs=1e-12)
     assert isinstance(essential.per_document, EssentialMeans)
-    got = (essential.per_document.essential_recall_at_k, essential.per_document.all_essential_at_k)
-    assert got == pytest.approx([float(value) for value in per_document], abs=1e-12)
+
+
+SCORED = (1, 2, 3, 5, 6, 7, 8, 9, 12, 13)
 
 
 def test_what_is_scored_and_what_is_not(report):
-    assert [result.id for result in report.results] == [f"fx2-q{n:02d}" for n in range(1, 10)]
+    assert [result.id for result in report.results] == [f"fx2-q{n:02d}" for n in SCORED]
     assert [result.id for result in report.unfiltered_reruns] == ["fx2-q07#unfiltered", "fx2-q08#unfiltered"]
-    assert [entry.id for entry in report.abstentions] == ["fx2-q10", "fx2-q11"]
+    # Every question that abstains, with a context document (fx2-q04) or without.
+    assert [entry.id for entry in report.abstentions] == ["fx2-q04", "fx2-q10", "fx2-q11"]
     assert report.not_in_collection == ()
     assert [result.id for result in report.searches] == [
         "fx2-q01",
         "fx2-q02",
         "fx2-q03",
-        "fx2-q04",
         "fx2-q05",
         "fx2-q06",
         "fx2-q07",
@@ -396,6 +418,8 @@ def test_what_is_scored_and_what_is_not(report):
         "fx2-q08",
         "fx2-q08#unfiltered",
         "fx2-q09",
+        "fx2-q12",
+        "fx2-q13",
     ]
 
 
@@ -428,7 +452,7 @@ def test_per_question_values_of_the_second_fixture(report):
     assert by_id["fx2-q02"].absent_doc_ids == ("fx-us-statement-2016-01",)
     # Essential documents not stated: the two metrics are not computed.
     assert values("fx2-q03") == (1, True, 1.0, 1.0, None, None, None, False)
-    assert values("fx2-q04") == (1, True, 1.0, 1.0, 1, 1.0, True, False)
+    assert "fx2-q04" not in by_id  # it abstains
     # Thirteen essential documents and k = 10: ten of them are among the first ten, whichever.
     assert values("fx2-q05") == (
         1,
@@ -451,17 +475,27 @@ def test_per_question_values_of_the_second_fixture(report):
     # The acceptable document is a hit; the essential one is left out by the filter.
     assert values("fx2-q09") == (1, True, 1.0, 0.5, 1, 0.0, False, False)
     assert by_id["fx2-q09"].top_documents[0].doc_id == "fx-ecb-account-2016-04"
+    # One requirement, two documents that hold the chunk: both first, no essential_ids.
+    assert values("fx2-q12") == (1, True, 1.0, 1.0, 0, 1.0, True, False)
+    assert (by_id["fx2-q12"].requirements_present, by_id["fx2-q12"].requirements_satisfied) == (1, 1)
+    assert by_id["fx2-q12"].tied_at_decision is False
+    # The filters leave the combined document alone: it satisfies the group; the decision is left out.
+    assert values("fx2-q13") == (1, True, 1.0, pytest.approx(1 / 3), 1, 0.5, False, False)
+    assert (by_id["fx2-q13"].requirements_present, by_id["fx2-q13"].requirements_satisfied) == (2, 1)
+    assert [document.doc_id for document in by_id["fx2-q13"].top_documents] == ["fx-ecb-combined-2016-03"]
     assert [result.expected_behavior for result in report.results] == [
         "answer",
         "correct_premise",
         "answer",
-        "abstain",
         "answer",
         "answer",
         "answer",
         "answer",
         "correct_premise",
+        "answer",
+        "answer",
     ]
+    assert [result.id for result in report.results if result.expected_beyond_k] == ["fx2-q05"]
 
 
 def test_a_second_run_is_the_question_without_its_filters(report, questions):
@@ -495,15 +529,15 @@ def test_kinds_and_headline_of_the_second_fixture(report):
         5,
         13,
         per_question=(1, 1, 1, F(62, 65)),
-        per_document=(1, 1, 1, F(275, 338)),
+        per_document=(1, 1, 1, F(138, 169)),
     )
-    # The four questions as written: the second runs (one of them second) are not here.
+    # The five questions as written: the second runs (one of them second) are not here.
     exactly(
         report.by_kind["graded+filters"],
-        4,
+        5,
         7,
-        per_question=(1, 1, 1, F(2, 3)),
-        per_document=(1, 1, 1, F(17, 28)),
+        per_question=(1, 1, 1, F(3, 5)),
+        per_document=(1, 1, 1, F(71, 126)),
     )
     exactly(
         report.by_kind["graded+filters#unfiltered"],
@@ -519,60 +553,48 @@ def test_kinds_and_headline_of_the_second_fixture(report):
         7,
         13,
         per_question=(F(6, 7), 1, F(13, 14), F(88, 91)),
-        per_document=(F(38, 39), 1, F(77, 78), F(140, 169)),
+        per_document=(F(38, 39), 1, F(77, 78), F(557, 676)),
     )
-    # Pooled: each question once, as written. No second run, no abstention without documents.
+    # Pooled: each question once, as written. No second run, no question that abstains.
     overall = report.overall
-    assert (overall.questions, overall.documents) == (9, 13)
+    assert (overall.questions, overall.documents) == (10, 13)
     assert (overall.hit_at_1, overall.hit_at_k, overall.mrr) == (1.0, 1.0, 1.0)
-    assert overall.recall_at_k == pytest.approx(float(F(290, 351)), abs=1e-12)
+    assert overall.recall_at_k == pytest.approx(float(F(101, 130)), abs=1e-12)
 
 
 def test_essential_metrics_of_the_second_fixture(report):
-    # graded: fx2-q01, 02 and 04 have their one essential document; fx2-q05 ten of thirteen; fx2-q03
-    # does not state any and is left out.
+    # graded: fx2-q01, 02 and 12 have their one requirement; fx2-q05 ten of thirteen; fx2-q03 does not
+    # state any and is left out. Three questions of four; 13 requirements of 16.
+    graded = report.by_kind["graded"]
+    essential_exactly(graded, 4, 13, 1, complete=3, mean=F(49, 52), satisfied=13, needed=16)
+    # graded+filters: 1 of 2, 1 of 1, 1 of 2, 0 of 1 and 1 of 2 (the group, by the combined document).
     essential_exactly(
-        report.by_kind["graded"],
-        4,
-        13,
-        1,
-        per_question=(F(49, 52), F(3, 4)),
-        per_document=(F(269, 338), F(3, 26)),
-    )
-    # graded+filters: 1/2, 1, 1/2 and 0. The decision is essential to two of them (1 and 0).
-    essential_exactly(
-        report.by_kind["graded+filters"],
-        4,
-        5,
-        0,
-        per_question=(F(1, 2), F(1, 4)),
-        per_document=(F(1, 2), F(1, 10)),
+        report.by_kind["graded+filters"], 5, 5, 0, complete=1, mean=F(1, 2), satisfied=4, needed=8
     )
     essential_exactly(
-        report.by_kind["graded+filters#unfiltered"], 2, 3, 0, per_question=(1, 1), per_document=(1, 1)
+        report.by_kind["graded+filters#unfiltered"], 2, 3, 0, complete=2, mean=1, satisfied=3, needed=3
     )
-    essential_exactly(
-        report.headline,
-        6,
-        13,
-        1,
-        per_question=(F(25, 26), F(5, 6)),
-        per_document=(F(138, 169), F(8, 39)),
+    essential_exactly(report.headline, 6, 13, 1, complete=5, mean=F(25, 26), satisfied=16, needed=19)
+    essential_exactly(report.overall, 9, 13, 1, complete=4, mean=F(163, 234), satisfied=17, needed=24)
+    # The share of questions is not the per-document mean kept in the JSON report: there fx2-q05
+    # counts for each of its thirteen documents.
+    assert graded.essential.all_essential_at_k == 0.75
+    assert graded.essential.per_document == EssentialMeans(
+        pytest.approx(float(F(136, 169))), pytest.approx(float(F(2, 13)))
     )
-    essential_exactly(
-        report.overall,
-        8,
-        13,
-        1,
-        per_question=(F(75, 104), F(1, 2)),
-        # The decision is essential to four questions (1, 10/13, 1, 0), the report to three, ...
-        per_document=(F(1501, 2028), F(4, 39)),
+    assert report.headline.essential.per_document == EssentialMeans(
+        pytest.approx(float(F(275, 338))), pytest.approx(float(F(5, 26)))
     )
     assert report.essential_unreachable == 1
     assert [result.id for result in report.results if result.essential_unreachable] == ["fx2-q05"]
-    # No interval on thirteen documents, and none asked for the pooled line.
-    assert (report.headline.essential.intervals, report.headline.essential.few_documents) == (None, True)
-    assert (report.overall.essential.intervals, report.overall.essential.few_documents) == (None, False)
+    # No interval on six questions, and none asked for the pooled line.
+    essential = report.headline.essential
+    assert (essential.question_intervals, essential.few_questions) == (None, True)
+    assert (essential.intervals, essential.few_documents) == (None, True)
+    assert (report.overall.essential.question_intervals, report.overall.essential.few_questions) == (
+        None,
+        False,
+    )
     # The essential metrics are not the expected-document ones under another name.
     filtered = report.by_kind["graded+filters"]
     assert filtered.essential.essential_recall_at_k != pytest.approx(filtered.recall_at_k)
@@ -580,21 +602,17 @@ def test_essential_metrics_of_the_second_fixture(report):
 
 
 def test_breakdown_by_expected_behavior(report):
-    assert list(report.by_behavior) == ["answer", "correct_premise", "abstain"]
-    answer, premise, abstain = report.by_behavior.values()
-    assert (answer.questions, answer.documents) == (6, 13)
+    # The three questions that abstain are scored nowhere: there is no line for them.
+    assert list(report.by_behavior) == ["answer", "correct_premise"]
+    answer, premise = report.by_behavior.values()
+    assert (answer.questions, answer.documents) == (8, 13)
     assert (answer.hit_at_1, answer.mrr) == (1.0, 1.0)
-    assert answer.recall_at_k == pytest.approx(float(F(385, 468)), abs=1e-12)
-    essential_exactly(
-        answer, 5, 13, 1, per_question=(F(49, 65), F(2, 5)), per_document=(F(125, 169), F(2, 39))
-    )
+    assert answer.recall_at_k == pytest.approx(float(F(163, 208)), abs=1e-12)
+    essential_exactly(answer, 7, 13, 1, complete=3, mean=F(137, 182), satisfied=16, needed=22)
     # fx2-q02 and fx2-q09: a premise to correct is scored on its documents like any question.
     exactly(premise, 2, 3, per_question=(1, 1, 1, F(3, 4)), per_document=(1, 1, 1, F(2, 3)))
-    essential_exactly(premise, 2, 2, 0, per_question=(F(1, 2), F(1, 2)), per_document=(F(1, 2), F(1, 2)))
-    # fx2-q04 abstains and names a document: it is scored. fx2-q10 and fx2-q11 name none: they are not.
-    exactly(abstain, 1, 1, per_question=(1, 1, 1, 1), per_document=(1, 1, 1, 1))
-    essential_exactly(abstain, 1, 1, 0, per_question=(1, 1), per_document=(1, 1))
-    assert sum(group.questions for group in report.by_behavior.values()) == len(report.results) == 9
+    essential_exactly(premise, 2, 2, 0, complete=1, mean=F(1, 2), satisfied=1, needed=2)
+    assert sum(group.questions for group in report.by_behavior.values()) == len(report.results) == 10
     assert all(group.intervals is None and not group.few_documents for group in report.by_behavior.values())
 
 
@@ -611,9 +629,11 @@ def test_breakdown_by_tag_counts_the_second_runs_under_their_tags(report):
     )
     # fx2-q05, fx2-q08 and the second run of fx2-q08.
     assert (report.by_tag["chain"].questions, report.by_tag["chain"].documents) == (3, 13)
-    # The abstention questions without documents give no line: nothing of theirs is scored.
-    assert report.by_tag["out-of-corpus"].questions == 1
+    # The questions that abstain give no line: nothing of theirs is scored.
+    assert "out-of-corpus" not in report.by_tag and "bank:gb" in report.by_tag
+    assert report.by_tag["bank:gb"].questions == 1  # fx2-q06; fx2-q04 abstains
     assert "short-query" not in report.by_tag and "abstention" not in report.by_kind
+    assert report.by_tag["either-of"].questions == 2
 
 
 def test_what_the_filter_brings(report):
@@ -649,8 +669,17 @@ def test_what_the_filter_brings(report):
 
 
 def test_abstention_questions_are_searched_and_not_scored(report):
-    tenth, eleventh = report.abstentions
+    fourth, tenth, eleventh = report.abstentions
     assert isinstance(tenth, Abstention)
+    # fx2-q04 lists a context document, which holds the text of the question: it comes first, and
+    # that is not a hit. One context document, among the first ten.
+    assert (fourth.top_document.doc_id, fourth.kind) == ("fx-gb-report-2016-08", "graded")
+    assert (fourth.context_doc_ids, fourth.absent_context_doc_ids, fourth.context_at_k) == (
+        ("fx-gb-report-2016-08",),
+        (),
+        1,
+    )
+    assert (tenth.context_doc_ids, tenth.context_at_k) == ((), None)
     # The text is a chunk of the minutes of the Bank of Japan: that document is first, with a score of 1.
     assert tenth.top_document.doc_id == "fx-jp-minutes"
     assert tenth.top_document.title == "Minutes of the Monetary Policy Meeting on January 28 and 29, 2016"
@@ -672,13 +701,14 @@ def test_abstention_questions_are_searched_and_not_scored(report):
     assert eleventh.filters == SearchFilters(source_codes=["ch"])
     # They are in no result, no kind, no tag, no miss, no count of the scored questions.
     scored = {result.id for result in report.searches}
-    assert not scored & {"fx2-q10", "fx2-q11"}
-    assert not {result.id for result in report.misses} & {"fx2-q10", "fx2-q11"}
-    assert report.overall.questions == 9 and report.fewer_than_k_documents == 4
-    # For comparison: every scored question is the text of a chunk, so its first document scores 1.
+    assert not scored & {"fx2-q04", "fx2-q10", "fx2-q11"}
+    assert not {result.id for result in report.misses} & {"fx2-q04", "fx2-q10", "fx2-q11"}
+    assert report.overall.questions == 10 and report.fewer_than_k_documents == 5
+    # For comparison: nine scored questions are the text of a chunk they can reach, so their first
+    # document scores 1; the filters of fx2-q13 leave a document that does not hold its text.
     top = report.top_scores
-    assert isinstance(top, TopScores) and top.questions == 9
-    assert (top.min, top.median, top.max) == pytest.approx((1.0, 1.0, 1.0), abs=1e-5)
+    assert isinstance(top, TopScores) and top.questions == 10
+    assert (top.median, top.max) == pytest.approx((1.0, 1.0), abs=1e-5) and top.min < 0.999
 
 
 def test_the_first_fixture_has_none_of_this(store):
@@ -692,8 +722,19 @@ def test_the_first_fixture_has_none_of_this(store):
     assert old.essential_unreachable == 0
     assert old.searches == old.results
     text = format_report(old)
-    for word in ("essential", "expected_behavior", "Abstention", "What the filter brings", "#unfiltered"):
+    for word in (
+        "essential",
+        "expected_behavior",
+        "Abstention",
+        "What the filter brings",
+        "#unfiltered",
+        "Per question",
+        "More expected documents",
+        "requirement",
+        "context@",
+    ):
         assert word not in text
+    assert all(result.requirements_present is None and not result.essential_any_of for result in old.results)
 
 
 def test_a_larger_k_reaches_every_essential_document(store, questions):
@@ -705,7 +746,8 @@ def test_a_larger_k_reaches_every_essential_document(store, questions):
         False,
     )
     assert report.essential_unreachable == 0 and report.headline.essential.unreachable == 0
-    assert "More essential documents" not in format_report(report)
+    assert "More requirements" not in format_report(report)
+    assert "More expected documents" not in format_report(report) and report.expected_beyond_k == 0
     one = evaluate(questions, collection=COLLECTION, store=store, embedder=fixture_embedder(), k=1)
     by_id = {result.id: result for result in one.searches}
     # At k = 1: one of thirteen; the acceptable document of fx2-q01 takes the only place.
@@ -713,7 +755,9 @@ def test_a_larger_k_reaches_every_essential_document(store, questions):
     assert (by_id["fx2-q01"].hit_at_k, by_id["fx2-q01"].essential_recall_at_k) == (True, 0.0)
     assert by_id["fx2-q01"].all_essential_at_k is False
     assert (by_id["fx2-q08"].essential_unreachable, by_id["fx2-q07"].essential_unreachable) == (True, False)
-    assert one.essential_unreachable == 3  # fx2-q05, fx2-q06 and fx2-q08: each question once
+    # A group is one requirement, whatever the number of its documents: fx2-q12 can be satisfied.
+    assert (by_id["fx2-q12"].essential_unreachable, by_id["fx2-q12"].all_essential_at_k) == (False, True)
+    assert one.essential_unreachable == 4  # fx2-q05, 06, 08 and 13: each question once
 
 
 def test_intervals_cover_the_essential_metrics_on_the_kinds_and_the_headline(store, questions):
@@ -723,20 +767,31 @@ def test_intervals_cover_the_essential_metrics_on_the_kinds_and_the_headline(sto
         store=store,
         embedder=fixture_embedder(),
         interval_min_documents=4,
+        interval_min_questions=4,
         bootstrap_resamples=200,
     )
+    assert report.parameters["interval_min_questions"] == 4
     essential = report.headline.essential
-    assert essential.few_documents is False
-    assert set(essential.intervals) == {"essential_recall_at_k", "all_essential_at_k"}
-    low, high = essential.intervals["essential_recall_at_k"]
-    # Thirteen documents whose means lie between 10/13 and 12/13.
-    assert 10 / 13 <= low <= 138 / 169 <= high <= 12 / 13 and low < high
-    low, high = essential.intervals["all_essential_at_k"]
-    assert 0.0 <= low <= 8 / 39 <= high <= 2 / 3 and low < high
+    assert essential.few_questions is False
+    assert set(essential.question_intervals) == {
+        "essential_recall_at_k",
+        "all_essential_at_k",
+        "pooled_essential_recall_at_k",
+    }
+    # Six questions drawn again: five have all they need, and one has ten of thirteen.
+    low, high = essential.question_intervals["all_essential_at_k"]
+    assert 0.0 <= low <= 5 / 6 <= high <= 1.0 and low < high
+    low, high = essential.question_intervals["essential_recall_at_k"]
+    assert 10 / 13 <= low <= 25 / 26 <= high <= 1.0 and low < high
+    low, high = essential.question_intervals["pooled_essential_recall_at_k"]
+    assert 10 / 13 <= low <= 16 / 19 <= high <= 1.0 and low < high
     assert set(report.headline.intervals) == {"hit_at_1", "hit_at_k", "mrr"}  # as before
-    assert report.by_kind["graded+filters"].essential.intervals is not None
-    assert report.by_kind["graded+filters#unfiltered"].essential.few_documents is True
-    assert report.overall.essential.intervals is None and report.by_tag["chain"].essential.intervals is None
+    assert report.by_kind["graded+filters"].essential.question_intervals is not None
+    assert report.by_kind["graded+filters#unfiltered"].essential.few_questions is True
+    assert report.overall.essential.question_intervals is None
+    assert report.by_tag["chain"].essential.question_intervals is None
+    # The interval of the first form, over the documents, is still in the JSON report.
+    assert set(essential.intervals) == {"essential_recall_at_k", "all_essential_at_k"}
     # The same results give the same intervals.
     again = evaluate(
         questions,
@@ -744,12 +799,26 @@ def test_intervals_cover_the_essential_metrics_on_the_kinds_and_the_headline(sto
         store=store,
         embedder=fixture_embedder(),
         interval_min_documents=4,
+        interval_min_questions=4,
         bootstrap_resamples=200,
     )
-    assert again.headline.essential.intervals == essential.intervals
+    assert again.headline.essential.question_intervals == essential.question_intervals
     text = format_report(report)
-    assert f"{138 / 169:.2f} [{essential.intervals['essential_recall_at_k'][0]:.2f}, " in text
-    assert "(few): fewer than 4 essential documents" in text
+    assert "95% intervals, from 200 resamples of the questions (seed 1):" in text
+    lines = text.splitlines()
+    start = lines.index("95% intervals, from 200 resamples of the questions (seed 1):")
+    low, high = essential.question_intervals["all_essential_at_k"]
+    (headline,) = [line for line in lines[start:] if line.startswith("headline")]
+    assert headline.split()[1:3] == f"[{low:.2f}, {high:.2f}]".split()  # the first column: all_essential
+    assert "kind: graded+filters#unfiltered: fewer than 4 questions: no interval" in lines[start:]
+    with pytest.raises(EvalError, match="interval_min_questions must be an integer >= 1"):
+        evaluate(
+            questions,
+            collection=COLLECTION,
+            store=store,
+            embedder=fixture_embedder(),
+            interval_min_questions=0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -770,18 +839,19 @@ def test_json_report_of_the_second_fixture(report, questions):
     ]
     assert data["parameters"]["score_levels"] == [-1.0, 0.999]
     assert data["summary"] == {
-        "questions": 11,
-        "scored": 9,
+        "questions": 13,
+        "scored": 10,
         "not_in_collection": 0,
         "partially_absent": 1,
-        "fewer_than_k_documents": 4,
+        "fewer_than_k_documents": 5,
         "chunk_budget_exhausted": 0,
         "tied_at_decision": 1,
         "unfiltered_reruns": 2,
-        "abstentions": 2,
+        "abstentions": 3,
         "essential_unreachable": 1,
+        "expected_beyond_k": 1,
     }
-    assert len(data["results"]) == 9 and len(data["unfiltered_reruns"]) == 2
+    assert len(data["results"]) == 10 and len(data["unfiltered_reruns"]) == 2
     first = data["results"][0]
     assert first["expected_behavior"] == "answer"
     assert first["essential_ids"] == ["fx-ecb-decision-2016-03"]
@@ -795,7 +865,19 @@ def test_json_report_of_the_second_fixture(report, questions):
     assert (third["essential_ids"], third["acceptable_ids"]) == (None, None)
     assert (third["essential_recall_at_k"], third["all_essential_at_k"]) == (None, None)
     assert (third["must_include"], third["must_not_include"]) == ([], [])
-    assert data["results"][4]["essential_unreachable"] is True
+    assert (first["requirements_present"], first["requirements_satisfied"]) == (1, 1)
+    assert (first["essential_any_of"], first["expected_beyond_k"]) == ([], False)
+    assert (third["requirements_present"], third["requirements_satisfied"]) == (None, None)
+    fifth = data["results"][3]
+    assert (fifth["id"], fifth["essential_unreachable"], fifth["expected_beyond_k"]) == (
+        "fx2-q05",
+        True,
+        True,
+    )
+    thirteenth = data["results"][9]
+    assert thirteenth["essential_any_of"] == [["fx-ecb-statement-2016-03", "fx-ecb-combined-2016-03"]]
+    assert (thirteenth["requirements_present"], thirteenth["requirements_satisfied"]) == (2, 1)
+    assert (thirteenth["essential_present"], thirteenth["essential_recall_at_k"]) == (1, 0.5)
     rerun = data["unfiltered_reruns"][0]
     assert (rerun["id"], rerun["rerun_of"], rerun["kind"]) == (
         "fx2-q07#unfiltered",
@@ -815,24 +897,34 @@ def test_json_report_of_the_second_fixture(report, questions):
         "essential_recall_at_k": pytest.approx(25 / 26),
         "all_essential_at_k": pytest.approx(5 / 6),
         "per_document": {
-            "essential_recall_at_k": pytest.approx(138 / 169),
-            "all_essential_at_k": pytest.approx(8 / 39),
+            "essential_recall_at_k": pytest.approx(275 / 338),
+            "all_essential_at_k": pytest.approx(5 / 26),
         },
         "intervals": None,
         "few_documents": True,
+        "all_essential_questions": 5,
+        "requirements": 19,
+        "requirements_satisfied": 16,
+        "pooled_essential_recall_at_k": pytest.approx(16 / 19),
+        "question_intervals": None,
+        "few_questions": True,
     }
-    assert list(metrics["by_expected_behavior"]) == ["answer", "correct_premise", "abstain"]
+    # No question that abstains is scored: there is no aggregate for that behaviour.
+    assert list(metrics["by_expected_behavior"]) == ["answer", "correct_premise"]
     assert metrics["by_expected_behavior"]["correct_premise"]["questions"] == 2
     assert data["filter_effect"]["unfiltered"]["mrr"] == 0.75
     abstentions = data["abstentions"]
     assert abstentions["score_levels"] == [-1.0, 0.999]
     assert abstentions["top_score_of_scored_questions"] == {
-        "questions": 9,
-        "min": pytest.approx(1.0, abs=1e-5),
+        "questions": 10,
+        "min": pytest.approx(report.top_scores.min),
         "median": pytest.approx(1.0, abs=1e-5),
         "max": pytest.approx(1.0, abs=1e-5),
     }
-    tenth, eleventh = abstentions["questions"]
+    fourth, tenth, eleventh = abstentions["questions"]
+    assert (fourth["id"], fourth["context_doc_ids"]) == ("fx2-q04", ["fx-gb-report-2016-08"])
+    assert (fourth["absent_context_doc_ids"], fourth["context_documents_at_k"]) == ([], 1)
+    assert (tenth["context_doc_ids"], tenth["context_documents_at_k"]) == ([], None)
     assert tenth["id"] == "fx2-q10" and tenth["top_document"]["doc_id"] == "fx-jp-minutes"
     assert tenth["top_score"] == tenth["top_document"]["score"] == pytest.approx(1.0, abs=1e-5)
     assert tenth["documents_at_or_above"] == [
@@ -864,11 +956,11 @@ def test_text_report_of_the_second_fixture(report):
     lines = text.splitlines()
     assert all(len(line) <= 120 for line in lines)
     assert not text.endswith("\n")
-    assert "9 questions scored (11 read, 0 not in the collection)" in lines[0]
-    assert lines[1] == "and 2 questions that expect no document (not scored), 2 second runs without filters"
+    assert "10 questions scored (13 read, 0 not in the collection)" in lines[0]
+    assert lines[1] == "and 3 questions that abstain (searched, not scored), 2 second runs without filters"
     main = rows_of(text, "questions: ")
-    assert main["kind: graded"] == ["5", "13", "1.00", "1.00", "1.00", "0.81", "(few documents)"]
-    assert main["kind: graded+filters *"] == ["4", "7", "1.00", "1.00", "1.00", "0.61", "(few documents)"]
+    assert main["kind: graded"] == ["5", "13", "1.00", "1.00", "1.00", "0.82", "(few documents)"]
+    assert main["kind: graded+filters *"] == ["5", "7", "1.00", "1.00", "1.00", "0.56", "(few documents)"]
     assert main["kind: graded+filters#unfiltered"] == [
         "2",
         "3",
@@ -878,10 +970,22 @@ def test_text_report_of_the_second_fixture(report):
         "1.00",
         "(few documents)",
     ]
-    assert main["headline"] == ["7", "13", "0.97", "1.00", "0.99", "0.83", "(few documents)"]
-    assert main["overall (pooled)"] == ["9", "13", "1.00", "1.00", "1.00", "0.83"]
+    assert main["headline"] == ["7", "13", "0.97", "1.00", "0.99", "0.82", "(few documents)"]
+    assert main["overall (pooled)"] == ["10", "13", "1.00", "1.00", "1.00", "0.78"]
     assert "headline: the kinds asked without filters (graded, graded+filters#unfiltered)." in text
     assert "#unfiltered: the questions of a kind that ask for it (run_unfiltered)" in text
+
+    # The same lines per question: fx2-q05 and its thirteen documents count once.
+    per_question = rows_of(text, "Per question")
+    assert per_question == {
+        "kind: graded": ["5", "1.00", "1.00", "1.00", "0.95"],
+        "kind: graded+filters *": ["5", "1.00", "1.00", "1.00", "0.60"],
+        "kind: graded+filters#unfiltered": ["2", "0.50", "1.00", "0.75", "1.00"],
+        "headline": ["7", "0.86", "1.00", "0.93", "0.97"],
+    }
+    assert "Which to read. Per document (the first table) when several questions ask for one document" in text
+    assert "More expected documents than k=10 (1 question: recall@10 cannot reach 1 for it): fx2-q05" in lines
+    assert all(len(line) <= 110 for line in lines)
 
     behaviors = rows_of(text, "Per expected behaviour")
     assert list(behaviors) == [
@@ -890,23 +994,35 @@ def test_text_report_of_the_second_fixture(report):
         "expected_behavior: abstain",
     ]
     assert behaviors["expected_behavior: correct_premise"] == ["2", "3", "1.00", "1.00", "1.00", "0.67"]
+    # The questions that abstain have a count and no metric.
+    assert behaviors["expected_behavior: abstain"] == ["3", "see the Abstention section"]
+    assert "correct_premise: scored on the documents that show the premise is false" in text
+    assert "abstain: never scored, whether the question lists documents or not" in text
 
     essential = rows_of(text, "Essential documents")
-    assert essential["kind: graded"] == ["4", "13", "0.80", "0.12", "1", "(few)"]
-    assert essential["kind: graded+filters *"] == ["4", "5", "0.50", "0.10", "0", "(few)"]
-    assert essential["headline"] == ["6", "13", "0.82", "0.21", "1", "(few)"]
-    assert essential["overall (pooled)"] == ["8", "13", "0.72", "0.50", "1"]  # over the questions
-    assert essential["expected_behavior: correct_premise"] == ["2", "2", "0.50", "0.50", "0"]
+    # all_essential is a share of questions, with its counts; the recall both ways.
+    assert essential == {
+        "kind: graded": ["0.75 (3/4)", "0.94", "0.81 (13/16)", "1"],
+        "kind: graded+filters *": ["0.20 (1/5)", "0.50", "0.50 (4/8)", "0"],
+        "kind: graded+filters#unfiltered": ["1.00 (2/2)", "1.00", "1.00 (3/3)", "0"],
+        "headline": ["0.83 (5/6)", "0.96", "0.84 (16/19)", "1"],
+        "overall (pooled)": ["0.44 (4/9)", "0.70", "0.71 (17/24)", "1"],
+        "expected_behavior: answer": ["0.43 (3/7)", "0.75", "0.73 (16/22)", "1"],
+        "expected_behavior: correct_premise": ["0.50 (1/2)", "0.50", "0.50 (1/2)", "0"],
+    }
     for legend in (
-        "essential_recall@10: for a question, the share of its essential documents among the first 10.",
-        "all_essential@10: for a question, 1 when all of them are among the first 10, else 0.",
-        "In a per-document mean a question counts once for each of its essential documents.",
-        "unreachable: questions with more essential documents than k=10",
+        "requirement: one document of essential_ids, or one group of essential_any_of",
+        "all_essential@10: share of the questions with every requirement satisfied",
+        "essential_recall@10: mean over these questions of the share of their requirements satisfied.",
+        "pooled: requirements satisfied / requirements, these questions together",
+        "unreachable: questions with more requirements than k=10",
         "raise --k (at most --chunk-limit",
-        "hit@1, hit@10 and MRR look at the first expected document, essential or acceptable.",
+        "hit@1, hit@10, MRR and recall@10 look at every expected document",
+        "No interval: every line has fewer than 20 questions that state requirements.",
     ):
         assert legend in text
-    assert "More essential documents than k=10 (1):\n  fx2-q05: 13 essential documents" in text
+    assert "per-document" not in text[text.index("Essential documents") : text.index("What the filter")]
+    assert "More requirements than k=10 (1):\n  fx2-q05: 13 requirements" in text
 
     effect = rows_of(text, "What the filter brings (2 questions")
     assert effect == {
@@ -914,14 +1030,16 @@ def test_text_report_of_the_second_fixture(report):
         "without filters": ["2", "0.50", "1.00", "0.75", "1.00"],
     }
 
-    assert "Abstention (2 questions that expect no document" in text
-    (tenth,) = [line for line in lines if line.startswith("fx2-q10")]
-    assert tenth.split()[:5] == ["fx2-q10", "1.000", "13", "1", "fx-jp-minutes"]
-    (eleventh,) = [line for line in lines if line.startswith("fx2-q11")]
-    assert eleventh.split()[:4] == ["fx2-q11", "n/a", "0", "0"] and "nothing was returned" in eleventh
-    assert ">=-1" in text and ">=0.999" in text
-    assert "top score of the 9 scored questions: min 1.000, median 1.000, max 1.000." in text
+    assert "Abstention (3 questions whose expected behaviour is to abstain" in text
+    abstentions = rows_of(text, "Abstention (")
+    assert abstentions["fx2-q04"][:4] == ["1.000", "13", "1", "1/1"]
+    assert abstentions["fx2-q04"][4] == "fx-gb-report-2016-08"
+    assert abstentions["fx2-q10"][:5] == ["1.000", "13", "1", "-", "fx-jp-minutes"]
+    assert abstentions["fx2-q11"] == ["n/a", "0", "0", "-", "nothing was returned"]
+    assert ">=-1" in text and ">=0.999" in text and "context@10" in text
+    assert "top score of the 10 scored questions: min " in text
     assert "No threshold is applied" in text
+    assert "tied_at_decision concerns hit@1 and hit@10 only" in text
     assert "Misses (0)" in text
 
 
@@ -929,7 +1047,7 @@ def test_the_default_score_levels_are_reported(store, questions):
     report = evaluate(questions, collection=COLLECTION, store=store, embedder=fixture_embedder())
     assert DEFAULT_SCORE_LEVELS == (0.7, 0.75, 0.8, 0.85, 0.9)
     assert report.parameters["score_levels"] == [0.7, 0.75, 0.8, 0.85, 0.9]
-    tenth = report.abstentions[0]
+    tenth = report.abstentions[1]
     assert [level for level, _count in tenth.documents_at_or_above] == [0.7, 0.75, 0.8, 0.85, 0.9]
     counts = [count for _level, count in tenth.documents_at_or_above]
     assert counts == sorted(counts, reverse=True) and counts[-1] == 1
@@ -1238,8 +1356,9 @@ def test_abstentions_do_not_leak_into_any_mean(monkeypatch):
     }
     text = format_report(mixed)
     assert "3 questions scored (5 read, 0 not in the collection)" in text
-    assert "and 2 questions that expect no document (not scored)" in text
+    assert "and 2 questions that abstain (searched, not scored)" in text
     assert "top score of the 3 scored questions: min 0.500, median 0.700, max 0.900." in text
+    assert "expected_behavior: answer" in text and "see the Abstention section" in text
     assert "a2#unfiltered" in text and ">=0.6  >=0.85  >=0.9" in text
 
 
@@ -1256,21 +1375,28 @@ def test_a_file_of_abstentions_only_is_searched_and_scores_nothing(monkeypatch):
     assert [entry.top_score for entry in report.abstentions] == [0.5]
     text = format_report(report)
     assert "0 questions scored (1 read, 0 not in the collection)" in text
-    assert "and 1 question that expect no document (not scored)" in text
+    assert "and 1 question that abstain (searched, not scored)" in text
+    assert "expected_behavior: abstain" in text and "Per question" in text
     assert "No question was scored: there is no top score to compare with." in text
     assert json.loads(report.to_json())["abstentions"]["top_score_of_scored_questions"] is None
 
 
-def test_an_abstention_that_names_documents_is_scored(monkeypatch):
-    store, _calls = answering(monkeypatch, {("x", False): {"b": 0.9, "a": 0.8}})
-    asked = Question(id="q1", question="x", essential_ids=("a",), expected_behavior="abstain")
-    report = ask(store, [asked])
-    assert report.abstentions == ()
-    (result,) = report.results
-    assert (result.rank, result.expected_behavior, result.essential_recall_at_k) == (2, "abstain", 1.0)
-    assert list(report.by_behavior) == ["abstain"] and report.overall.questions == 1
-    assert "expected_behavior: abstain" in format_report(report)
-    assert "Abstention (" not in format_report(report)
+def test_a_scored_question_that_was_returned_nothing_has_no_top_score(monkeypatch):
+    answers = {("x", False): {"a": 0.9}, ("y", True): {}, ("nothing", False): {"b": 0.4}}
+    store, _calls = answering(monkeypatch, answers)
+    questions = [
+        Question(id="q1", question="x", expected_doc_ids=("a",)),
+        Question(id="q2", question="y", expected_doc_ids=("a",), filters=FILTER),
+        Question(id="a1", question="nothing", expected_doc_ids=(), expected_behavior="abstain"),
+    ]
+    report = ask(store, questions)
+    assert len(report.results) == 2 and report.top_scores == TopScores(1, 0.9, 0.9, 0.9)
+    # The line says why it compares with one question when two were scored.
+    text = format_report(report)
+    assert (
+        "For comparison, top score of 1 of the 2 scored questions (1 returned no document):\n  min 0.900"
+        in text
+    )
 
 
 @pytest.mark.parametrize(
@@ -1355,6 +1481,12 @@ def test_the_questions_of_an_essential_document_are_averaged_before_the_document
         "per_document": {"essential_recall_at_k": 0.5, "all_essential_at_k": 0.5},
         "intervals": None,
         "few_documents": False,
+        "all_essential_questions": 3,
+        "requirements": 4,
+        "requirements_satisfied": 3,
+        "pooled_essential_recall_at_k": 0.75,
+        "question_intervals": None,
+        "few_questions": False,
     }
 
 
@@ -1456,9 +1588,16 @@ def test_the_tables_shown_in_the_documentation_are_those_of_the_second_fixture(s
     report = evaluate(questions, collection=COLLECTION, store=store, embedder=fixture_embedder())
     parts = format_report(report).split("\n\n")
     shown = [parts[1]]
-    for start in ("Per expected behaviour", "Essential documents", "What the filter brings", "Abstention ("):
+    for start in (
+        "Per question",
+        "Per expected behaviour",
+        "Essential documents",
+        "More requirements than",
+        "What the filter brings",
+        "Abstention (",
+    ):
         shown += [part for part in parts if part.startswith(start)]
-    assert len(shown) == 5
+    assert len(shown) == 7
     for part in shown:
         assert part in readme, part.splitlines()[0]
 
@@ -1468,9 +1607,494 @@ def test_the_example_line_of_the_documentation_is_a_valid_question(tmp_path):
 
     root = Path(__file__).resolve().parent.parent
     readme = (root / "eval" / "README.md").read_text(encoding="utf-8")
-    (line,) = [line for line in readme.splitlines() if line.startswith('{"id": "an-21"')]
+    assert '"id": "an-' not in readme  # an example is not a question of the analytical batch
+    (line,) = [line for line in readme.splitlines() if line.startswith('{"id": "ex-01"')]
     assert set(json.loads(line)) == set(QUESTION_FIELDS)  # complete: every field of the format
     (question,) = load_questions(write(tmp_path, line))
     assert (question.expected_behavior, question.run_unfiltered) == ("answer", True)
-    assert question.expected_doc_ids == question.essential_ids + question.acceptable_ids
+    members = tuple(doc_id for group in question.essential_any_of for doc_id in group)
+    assert len(question.essential_any_of) == 1 and len(members) == 2
+    assert question.expected_doc_ids == question.essential_ids + members + question.acceptable_ids
     assert question.must_include == ("unanimously", "0.25 percent") and question.must_not_include == ("6-3",)
+
+
+# ---------------------------------------------------------------------------
+# Either-of requirements
+# ---------------------------------------------------------------------------
+def test_either_of_groups_are_read_and_written_back(tmp_path):
+    line = graded(essential_ids=["d1"], essential_any_of=[["d3", "d4"], ["d5"]], acceptable_ids=["d2"])
+    given = graded(
+        id="q2", essential_any_of=[["d3", "d4"]], acceptable_ids=[], expected_doc_ids=["d4", "d1", "d3"]
+    )
+    one, two, three = load_questions(write(tmp_path, line, given, graded(id="q3", essential_any_of=None)))
+    assert one.essential_any_of == (("d3", "d4"), ("d5",))
+    # One requirement per essential document, then one per group.
+    assert one.requirements == (("d1",), ("d3", "d4"), ("d5",))
+    # Left out, expected_doc_ids is the essential documents, the members of the groups, the acceptable ones.
+    assert one.expected_doc_ids == ("d1", "d3", "d4", "d5", "d2")
+    written = one.to_dict()
+    assert written["essential_any_of"] == [["d3", "d4"], ["d5"]]
+    assert list(written)[:6] == [
+        "id",
+        "question",
+        "essential_ids",
+        "essential_any_of",
+        "acceptable_ids",
+        "expected_doc_ids",
+    ]
+    assert two.expected_doc_ids == ("d4", "d1", "d3")  # given in another order: kept
+    assert three.essential_any_of == () and "essential_any_of" not in three.to_dict()
+    assert three.requirements == (("d1",),)
+    again = load_questions(write(tmp_path, one.to_dict(), two.to_dict(), three.to_dict()))
+    assert list(again) == [one, two, three]
+
+
+def test_a_question_may_state_groups_only():
+    built = Question(id="q", question="alpha", essential_any_of=[["a", "b"]])
+    assert (built.essential_ids, built.acceptable_ids, built.expected_doc_ids) == ((), (), ("a", "b"))
+    assert built.requirements == (("a", "b"),)
+    old = Question(id="q", question="alpha", expected_doc_ids=["a"])
+    assert old.essential_any_of == () and old.requirements is None
+    assert Question(id="q", question="alpha", essential_ids=[], acceptable_ids=["a"]).requirements == ()
+
+
+@pytest.mark.parametrize(
+    ("line", "match"),
+    [
+        (graded(essential_any_of="d3"), "'essential_any_of' must be a list of groups"),
+        (graded(essential_any_of=["d3"]), "'essential_any_of' must be a list of groups"),
+        (graded(essential_any_of=[{"d3": 1}]), "'essential_any_of' must be a list of groups"),
+        (graded(essential_any_of=[[]]), "'essential_any_of' holds an empty group"),
+        (graded(essential_any_of=[["d3", ""]]), r"'essential_any_of\[1\]'"),
+        (graded(essential_any_of=[["d3", 4]]), r"'essential_any_of\[1\]'"),
+        (graded(essential_any_of=[["d3"], ["d4", "d4"]]), r"'essential_any_of\[2\]' names 'd4' twice"),
+        (graded(essential_any_of=[["d3", "d4"], ["d5", "d3"]]), "names 'd3' in two groups"),
+        (graded(essential_any_of=[["d3", "d1"]]), "'essential_ids' and 'essential_any_of' both name 'd1'"),
+        (graded(essential_any_of=[["d3", "d2"]]), "'acceptable_ids' and 'essential_any_of' both name 'd2'"),
+        (
+            graded(essential_any_of=[["d3", "d4"]], expected_doc_ids=["d1", "d2", "d3"]),
+            "'expected_doc_ids' must name.*it lacks 'd4'",
+        ),
+        (
+            graded(essential_any_of=[["d3"]], expected_doc_ids=["d1", "d2", "d3", "d9"]),
+            "'expected_doc_ids' must name.*it adds 'd9'",
+        ),
+        (
+            q(expected_doc_ids=..., essential_any_of=[["d3"]], expected_behavior="abstain"),
+            "'essential_any_of'.*'abstain'",
+        ),
+        (graded(essential_any_of=[[" d3"]]), "leading or trailing whitespace"),
+    ],
+)
+def test_a_bad_group_is_refused_with_its_line(tmp_path, line, match):
+    with pytest.raises(EvalError, match=match) as info:
+        load_questions(write(tmp_path, q(id="q0"), line))
+    assert "questions.jsonl, line 2:" in str(info.value)
+
+
+def test_a_group_is_satisfied_by_any_of_its_documents(monkeypatch):
+    # The ranking is a, b, c, d and k = 2: "a" and "b" are among the first two.
+    ranking = {"a": 0.9, "b": 0.8, "c": 0.7, "d": 0.6}
+    store, _calls = answering(monkeypatch, {("x", False): ranking})
+    questions = [
+        Question(id="sibling", question="x", essential_any_of=[("c", "a")]),
+        Question(id="mixed", question="x", essential_ids=("d",), essential_any_of=[("b", "c")]),
+        Question(id="none", question="x", essential_any_of=[("c", "d")], acceptable_ids=("a",)),
+        Question(id="absent-group", question="x", essential_ids=("a",), essential_any_of=[("ghost", "g2")]),
+        Question(id="half-absent", question="x", essential_any_of=[("ghost", "b")]),
+        Question(id="three", question="x", essential_ids=("a",), essential_any_of=[("b", "c"), ("d", "e")]),
+        Question(id="large-group", question="x", essential_any_of=[("d", "c", "b", "a")]),
+        Question(id="no-group-there", question="x", essential_any_of=[("ghost",)], acceptable_ids=("a",)),
+    ]
+    report = ask(store, questions, k=2)
+    by_id = {result.id: result for result in report.results}
+
+    def values(id_):
+        result = by_id[id_]
+        return (
+            result.requirements_present,
+            result.requirements_satisfied,
+            result.essential_recall_at_k,
+            result.all_essential_at_k,
+            result.essential_unreachable,
+        )
+
+    # One document of the group among the first two is enough, whichever it is.
+    assert values("sibling") == (1, 1, 1.0, True, False)
+    assert values("mixed") == (2, 1, 0.5, False, False)
+    assert values("none") == (1, 0, 0.0, False, False)
+    # A group none of whose documents is in the collection is left out, like an absent essential document.
+    assert values("absent-group") == (1, 1, 1.0, True, False)
+    assert values("half-absent") == (1, 1, 1.0, True, False)
+    # Three requirements for two places: out of reach, although two of them are satisfied.
+    assert values("three") == (3, 2, pytest.approx(2 / 3), False, True)
+    # Four documents and one requirement: nothing is out of reach.
+    assert values("large-group") == (1, 1, 1.0, True, False)
+    assert values("no-group-there") == (0, None, None, None, False)
+    # hit@1, MRR and recall@k look at every expected document, the members of the groups among them.
+    sibling = by_id["sibling"]
+    assert (sibling.rank, sibling.hit_at_1, sibling.recall_at_k) == (1, True, 0.5)
+    assert sibling.expected_doc_ids == ("c", "a") and sibling.essential_any_of == (("c", "a"),)
+    assert (by_id["none"].rank, by_id["none"].recall_at_k) == (1, pytest.approx(1 / 3))
+    # essential_present keeps its meaning: the documents of essential_ids that are in the collection.
+    assert [by_id[id_].essential_present for id_ in ("sibling", "mixed", "three")] == [0, 1, 1]
+    data = sibling.to_dict()
+    assert data["essential_any_of"] == [["c", "a"]]
+    assert (data["requirements_present"], data["requirements_satisfied"]) == (1, 1)
+
+    essential = report.overall.essential
+    assert (essential.questions, essential.unreachable) == (7, 1)
+    assert (essential.requirements, essential.requirements_satisfied) == (10, 7)
+    assert essential.pooled_essential_recall_at_k == pytest.approx(0.7)
+    assert essential.essential_recall_at_k == pytest.approx((1 + 0.5 + 0 + 1 + 1 + 2 / 3 + 1) / 7)
+    assert (essential.all_essential_questions, essential.all_essential_at_k) == (4, pytest.approx(4 / 7))
+    assert essential.documents == 5  # a, b, c, d and e; the ghosts are not documents of the collection
+    assert report.essential_unreachable == 1
+    text = format_report(report)
+    assert "More requirements than k=2 (1):\n  three: 3 requirements" in text
+
+
+# ---------------------------------------------------------------------------
+# The essential metrics as they are shown
+# ---------------------------------------------------------------------------
+PARAMETERS = {
+    "collection": "c",
+    "k": 10,
+    "chunk_limit": 50,
+    "model": "fake",
+    "backend": "fake",
+    "query_normalization": None,
+    "engine_version": "0",
+}
+
+
+def test_the_essential_table_counts_questions_and_requirements():
+    results = [
+        scored("q1", ["a", "b", "c", "d"], 1, kind="chain"),  # one of four, not all
+        scored("q2", ["e"], 1, kind="chain"),
+        scored("q3", ["f"], 1, kind="chain"),
+    ]
+    report = EvalReport(parameters=PARAMETERS, results=tuple(results))
+    essential = report.by_kind["chain"].essential
+    # Two questions of three have all they need; the mean share is (1/4 + 1 + 1) / 3; three of six pooled.
+    assert (essential.all_essential_questions, essential.all_essential_at_k) == (2, pytest.approx(2 / 3))
+    assert essential.essential_recall_at_k == pytest.approx(0.75)
+    assert (essential.requirements, essential.requirements_satisfied) == (6, 3)
+    assert essential.pooled_essential_recall_at_k == 0.5
+    # The per-document mean of before is kept in the JSON report: 1/6 of the documents are those of a
+    # question that has them all... it is not a share of questions, and the table does not print it.
+    assert essential.per_document.all_essential_at_k == pytest.approx(2 / 6)
+    data = essential.to_dict()
+    assert list(data) == [
+        "questions",
+        "documents",
+        "unreachable",
+        "essential_recall_at_k",
+        "all_essential_at_k",
+        "per_document",
+        "intervals",
+        "few_documents",
+        "all_essential_questions",
+        "requirements",
+        "requirements_satisfied",
+        "pooled_essential_recall_at_k",
+        "question_intervals",
+        "few_questions",
+    ]
+    rows = rows_of(format_report(report), "Essential documents")
+    assert rows["kind: chain"] == ["0.67 (2/3)", "0.75", "0.50 (3/6)", "0"]
+    assert rows["headline"] == rows["kind: chain"] == rows["overall (pooled)"]
+
+
+def test_essential_intervals_come_from_resampling_the_questions():
+    # Forty questions, every other one with what it needs: one requirement each.
+    spread = [scored(f"q{n}", [f"d{n}"], n % 2) for n in range(40)]
+    essential = Aggregate.of(spread, interval="x").essential
+    assert essential.few_questions is False
+    assert set(essential.question_intervals) == {
+        "essential_recall_at_k",
+        "all_essential_at_k",
+        "pooled_essential_recall_at_k",
+    }
+    for low, high in essential.question_intervals.values():
+        assert 0.0 < low < 0.5 < high < 1.0
+    assert Aggregate.of(spread, interval="x").essential.question_intervals == essential.question_intervals
+    # The name of the group seeds its draws: another group, other draws.
+    many = [scored(f"q{n}", [f"d{n}", f"e{n}", f"f{n}"], n % 4) for n in range(203)]
+    assert (
+        Aggregate.of(many, interval="y").essential.question_intervals
+        != Aggregate.of(many, interval="x").essential.question_intervals
+    )
+    assert Aggregate.of(spread).essential.question_intervals is None
+    # One question with forty essential documents: forty documents and one question. The questions
+    # are what is drawn again, so there is no interval, however many documents there are.
+    one = Aggregate.of([scored("q", [f"d{n}" for n in range(40)], 20)], interval="x").essential
+    assert (one.documents, one.questions) == (40, 1)
+    assert (one.question_intervals, one.few_questions) == (None, True)
+    assert one.intervals is not None  # the interval of before, over the documents, is still computed
+    few = Aggregate.of(spread[:19], interval="x").essential
+    assert (few.question_intervals, few.few_questions) == (None, True)
+    assert Aggregate.of(spread[:19], interval="x", min_questions=19).essential.question_intervals is not None
+    # A question with many requirements weighs more in the pooled share than in the mean over questions.
+    uneven = [scored(f"q{n}", [f"d{n}"], 1) for n in range(30)]
+    uneven.append(scored("long", [f"l{n}" for n in range(30)], 0))
+    essential = Aggregate.of(uneven, interval="x").essential
+    assert essential.essential_recall_at_k == pytest.approx(30 / 31)
+    assert essential.pooled_essential_recall_at_k == 0.5
+    low, high = essential.question_intervals["pooled_essential_recall_at_k"]
+    assert low <= 0.5 <= high and (low, high) != essential.question_intervals["essential_recall_at_k"]
+    report = EvalReport(
+        parameters=PARAMETERS,
+        results=tuple(scored(f"q{n}", [f"d{n}"], n % 2, kind="one") for n in range(40)),
+    )
+    text = format_report(report)
+    assert "95% intervals, from 1000 resamples of the questions (seed 1):" in text
+    low, high = report.by_kind["one"].essential.question_intervals["all_essential_at_k"]
+    assert f"[{low:.2f}, {high:.2f}]" in text
+
+
+# ---------------------------------------------------------------------------
+# Abstention: every question that abstains
+# ---------------------------------------------------------------------------
+def test_an_abstention_that_names_documents_is_not_scored(monkeypatch):
+    answers = {
+        ("found", False): {"a": 0.9, "b": 0.5},
+        ("bait", False): {"b": 0.95, "a": 0.85, "c": 0.6, "d": 0.4},
+        ("bait", True): {"c": 0.6},
+    }
+    store, _calls = answering(monkeypatch, answers)
+    answerable = [Question(id="q1", question="found", expected_doc_ids=("a",), kind="k", tags=("t",))]
+    abstaining = [
+        Question(
+            id="a1",
+            question="bait",
+            acceptable_ids=("a", "c", "ghost"),
+            expected_behavior="abstain",
+            kind="k",
+            tags=("t", "apart"),
+        ),
+        Question(
+            id="a2",
+            question="bait",
+            expected_doc_ids=("d",),
+            expected_behavior="abstain",
+            filters=FILTER,
+            run_unfiltered=True,
+        ),
+    ]
+    alone = ask(store, answerable, k=2, score_levels=(0.5, 0.9))
+    mixed = ask(store, [*abstaining, *answerable], k=2, score_levels=(0.5, 0.9))
+    # The context documents returned first are no hit: the question is in no result and no mean.
+    assert mixed.results == alone.results
+    for name in ("overall", "headline", "by_kind", "by_tag", "by_behavior", "filtered_kinds", "top_scores"):
+        assert getattr(mixed, name) == getattr(alone, name), name
+    assert list(mixed.by_behavior) == ["answer"] and "apart" not in mixed.by_tag
+    assert mixed.misses == () and mixed.not_in_collection == () and mixed.unfiltered_reruns == ()
+    first, second, third = mixed.abstentions
+    assert [entry.id for entry in mixed.abstentions] == ["a1", "a2", "a2#unfiltered"]
+    assert first.context_doc_ids == ("a", "c", "ghost") and first.absent_context_doc_ids == ("ghost",)
+    # "a" is second, "c" third: one of the two context documents of the collection among the first two.
+    assert (first.context_at_k, first.top_document.doc_id, first.top_score) == (1, "b", 0.95)
+    assert first.documents_at_or_above == ((0.5, 3), (0.9, 1))
+    assert (second.context_doc_ids, second.context_at_k, second.top_document.doc_id) == (("d",), 0, "c")
+    assert (third.context_at_k, third.rerun_of) == (0, "a2")
+    plain = Question(id="a3", question="bait", expected_doc_ids=(), expected_behavior="abstain")
+    assert ask(store, [plain]).abstentions[0].context_at_k is None
+    data = mixed.to_dict()
+    assert data["summary"]["questions"] == 3 and data["summary"]["scored"] == 1
+    assert data["summary"]["abstentions"] == 2
+    entry = data["abstentions"]["questions"][0]
+    assert entry["context_doc_ids"] == ["a", "c", "ghost"]
+    assert entry["absent_context_doc_ids"] == ["ghost"]
+    assert entry["context_documents_at_k"] == 1
+    assert "abstain" not in data["metrics"]["by_expected_behavior"]
+    text = format_report(mixed)
+    lines = text.splitlines()
+    assert "1 questions scored (3 read, 0 not in the collection)" in lines[0]
+    assert lines[1] == "and 2 questions that abstain (searched, not scored)"
+    assert "Abstention (2 questions whose expected behaviour is to abstain" in text
+    rows = rows_of(text, "Abstention (")
+    assert rows["a1"][:4] == ["0.950", "3", "1", "1/2"]
+    assert rows["a2"][:4] == ["0.600", "1", "0", "0/1"]
+    assert "context@2: the context documents of the question" in text
+    behaviors = [line for line in lines if line.startswith("expected_behavior: abstain")]
+    assert [" ".join(line.split()) for line in behaviors] == [
+        "expected_behavior: abstain 2 see the Abstention section"
+    ]
+
+
+def test_an_essential_document_on_a_question_that_abstains_is_refused(tmp_path):
+    bad = q(
+        id="q2", expected_doc_ids=..., essential_ids=["d1"], acceptable_ids=[], expected_behavior="abstain"
+    )
+    with pytest.raises(EvalError, match="questions.jsonl, line 2: 'essential_ids' names.*'abstain'"):
+        load_questions(write(tmp_path, q(), bad))
+    with pytest.raises(EvalError, match="'essential_ids' names 'a' on a question"):
+        Question(id="q", question="alpha", essential_ids=("a",), expected_behavior="abstain")
+    # The documents such a question lists are its context documents.
+    kept = q(
+        id="q2", expected_doc_ids=..., essential_ids=[], acceptable_ids=["d1"], expected_behavior="abstain"
+    )
+    old = q(id="q3", expected_behavior="abstain")
+    two, three = load_questions(write(tmp_path, kept, old))
+    assert (two.essential_ids, two.acceptable_ids, two.expected_doc_ids) == ((), ("d1",), ("d1",))
+    assert (three.essential_ids, three.expected_doc_ids) == (None, ("d1",))
+
+
+# ---------------------------------------------------------------------------
+# Per question, and long lists of expected documents
+# ---------------------------------------------------------------------------
+def test_the_report_gives_the_means_per_question_next_to_those_per_document(monkeypatch):
+    ranking = {name: 1.0 - place / 100 for place, name in enumerate("abcdefgh")}
+    store, _calls = answering(
+        monkeypatch, {("long", False): ranking, ("short", False): {"z": 0.9}}, documents="abcdefghz"
+    )
+    questions = [
+        # Six expected documents, the first of them first: found, and it weighs six times per document.
+        Question(id="long", question="long", essential_ids=("a",), acceptable_ids=tuple("defgh"), kind="k"),
+        Question(id="s1", question="short", essential_ids=("a",), kind="k"),
+        Question(id="s2", question="short", essential_ids=("b",), kind="k"),
+    ]
+    report = ask(store, questions, k=3)
+    kind = report.by_kind["k"]
+    assert (kind.hit_at_1, kind.per_document.hit_at_1) == (pytest.approx(1 / 3), pytest.approx(5.5 / 7))
+    by_id = {result.id: result for result in report.results}
+    # Six expected documents and three places: recall@3 is 1/6 here and could not be above 1/2.
+    assert (by_id["long"].expected_beyond_k, by_id["long"].recall_at_k) == (True, pytest.approx(1 / 6))
+    assert by_id["s1"].expected_beyond_k is False
+    assert report.expected_beyond_k == 1
+    data = report.to_dict()
+    assert data["summary"]["expected_beyond_k"] == 1 and data["results"][0]["expected_beyond_k"] is True
+    text = format_report(report)
+    assert rows_of(text, "k=3, chunk_limit")["kind: k"][:3] == ["3", "7", "0.79"]
+    per_question = rows_of(text, "Per question")
+    assert per_question["kind: k"] == ["3", "0.33", "0.33", "0.33", "0.06"]
+    assert per_question["headline"] == per_question["kind: k"]
+    assert "More expected documents than k=3 (1 question: recall@3 cannot reach 1 for it): long" in text
+
+
+def test_a_wide_table_puts_its_intervals_on_a_line_of_their_own():
+    name = "analytical+filters#unfiltered"
+    results = [scored(f"q{n}", [f"d{n}"], 1, kind=name) for n in range(25)]
+    report = EvalReport(parameters=PARAMETERS, results=tuple(results))
+    lines = format_report(report).splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith(f"kind: {name}"))
+    assert lines[start].split()[2:] == ["25", "25", "1.00", "1.00", "1.00", "1.00"]
+    assert lines[start + 1].split() == [
+        "95%",
+        "interval",
+        "[1.00,",
+        "1.00]",
+        "[1.00,",
+        "1.00]",
+        "[1.00,",
+        "1.00]",
+    ]
+    assert all(len(line) <= 110 for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# What the filter brings: the essential mean
+# ---------------------------------------------------------------------------
+def test_the_essential_mean_of_the_filter_effect_is_over_the_pairs_that_state_requirements():
+    def pair(id_, essential, with_filters, without):
+        if essential:
+            written = scored(id_, ["a"], with_filters)
+            rerun = scored(id_ + "#unfiltered", ["a"], without)
+        else:
+            written = dataclasses.replace(
+                scored(id_, [], 0), essential_ids=None, acceptable_ids=None, essential_present=None
+            )
+            rerun = dataclasses.replace(written, id=id_ + "#unfiltered")
+        return (written, dataclasses.replace(rerun, rerun_of=id_))
+
+    effect = FilterEffect((pair("q1", True, 1, 0), pair("q2", False, 0, 0), pair("q3", False, 0, 0)))
+    # One pair of three states requirements: the mean is its value, not a third of it.
+    assert (effect.questions, effect.essential_questions) == (3, 1)
+    assert effect.filtered["essential_recall_at_k"] == 1.0
+    assert effect.unfiltered["essential_recall_at_k"] == 0.0
+    assert effect.filtered["hit_at_1"] == 1.0  # the three pairs
+    both = FilterEffect((pair("q1", True, 1, 0), pair("q2", True, 1, 1), pair("q3", False, 0, 0)))
+    assert (both.filtered["essential_recall_at_k"], both.unfiltered["essential_recall_at_k"]) == (1.0, 0.5)
+
+
+# ---------------------------------------------------------------------------
+# The loader: what is refused besides
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("line", "match"),
+    [
+        (
+            '{"id": "q2", "question": "x", "expected_doc_ids": ["d1"], "id": "q3"}',
+            "the key 'id' is given twice",
+        ),
+        (
+            '{"id": "q2", "question": "x", "expected_doc_ids": ["d1"], "filters": {"corpus": "a", "corpus": "a"}}',  # noqa: E501
+            "the key 'corpus' is given twice",
+        ),
+        (
+            q(id="q2", expected_doc_ids=["d1 "]),
+            "'expected_doc_ids' holds a document id with leading or trailing",
+        ),
+        (
+            graded(id="q2", essential_ids=[" d1"]),
+            "'essential_ids' holds a document id with leading or trailing",
+        ),
+        (
+            graded(id="q2", acceptable_ids=["d2\t"]),
+            "'acceptable_ids' holds a document id with leading or trailing",
+        ),
+        (
+            q(id="q2", must_include=["5-4", "Shirai"], must_not_include=["unanimous", "5-4"]),
+            "'must_include' and 'must_not_include' both hold '5-4'",
+        ),
+        (q(id="q2", kind="analytical#unfiltered"), "'kind' may not end with '#unfiltered'"),
+    ],
+)
+def test_what_the_loader_refuses_besides(tmp_path, line, match):
+    with pytest.raises(EvalError, match=match) as info:
+        load_questions(write(tmp_path, q(), line))
+    assert "questions.jsonl, line 2:" in str(info.value)
+
+
+def test_a_kind_may_hold_the_suffix_elsewhere(tmp_path):
+    (one,) = load_questions(write(tmp_path, q(kind="#unfiltered-first")))
+    assert one.kind == "#unfiltered-first"
+    with pytest.raises(EvalError, match="may not end with"):
+        Question(id="q", question="alpha", expected_doc_ids=("a",), kind="k#unfiltered")
+
+
+# ---------------------------------------------------------------------------
+# The widths, on long names and long lists
+# ---------------------------------------------------------------------------
+def test_long_lists_are_wrapped_to_the_width(monkeypatch):
+    names = [f"document-{n:02d}" for n in range(12)]
+    store, _calls = answering(
+        monkeypatch, {("x", False): {name: 1.0 - n / 100 for n, name in enumerate(names)}}, documents=names
+    )
+    questions = [
+        Question(
+            id=f"a-question-with-a-long-identifier-{n:02d}",
+            question="x",
+            essential_ids=names[:1],
+            acceptable_ids=names[1:],
+            kind="analytical+filters",
+        )
+        for n in range(8)
+    ]
+    questions.append(
+        Question(
+            id="abstains",
+            question="x",
+            acceptable_ids=names,
+            expected_behavior="abstain",
+            kind="analytical+filters",
+        )
+    )
+    lines = format_report(ask(store, questions, k=3)).splitlines()
+    assert all(len(line) <= 110 for line in lines)
+    start = next(index for index, line in enumerate(lines) if line.startswith("More expected documents"))
+    listed = " ".join(lines[start : start + 6])
+    assert all(question.id in listed for question in questions[:8])  # none is cut away
+    (row,) = [line for line in lines if line.startswith("abstains")]
+    assert row.split()[1:3] == ["1.000", "12"] and row.split()[7] == "3/12"

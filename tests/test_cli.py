@@ -271,16 +271,17 @@ def test_eval_runs_the_second_fixture(built, capsys, fixture_store, tmp_path):
     for section in (
         "Per expected behaviour",
         "Essential documents",
-        "More essential documents than k=10 (1)",
+        "Per question",
+        "More requirements than k=10 (1)",
         "What the filter brings (2 questions",
-        "Abstention (2 questions",
+        "Abstention (3 questions",
         ">=0.7  >=0.75  >=0.8  >=0.85  >=0.9",
     ):
         assert section in captured.out
     data = json.loads(output.read_text(encoding="utf-8"))
     assert data == json.loads(expected.to_json())
     assert data["parameters"]["score_levels"] == [0.7, 0.75, 0.8, 0.85, 0.9]
-    assert data["summary"]["abstentions"] == 2 and data["summary"]["unfiltered_reruns"] == 2
+    assert data["summary"]["abstentions"] == 3 and data["summary"]["unfiltered_reruns"] == 2
     assert data["results"][0]["must_include"] == ["80 billion euro", "April"]
     assert data["metrics"]["headline"]["essential"]["unreachable"] == 1
 
@@ -351,7 +352,13 @@ def test_a_file_of_questions_that_expect_no_document_runs(built, capsys, tmp_pat
     captured = capsys.readouterr()
     assert captured.err == ""
     assert "0 questions scored (1 read, 0 not in the collection)" in captured.out
-    assert "Abstention (1 question that expect no document" in captured.out
+    assert "Abstention (1 question whose expected behaviour is to abstain" in captured.out
+    # Nor is a context document that the collection does not hold: the question is searched all the same.
+    line.update(id="q2", expected_doc_ids=["not-in-the-collection"])
+    questions.write_text(json.dumps(line) + "\n")
+    assert cli.main(arguments) == 0
+    captured = capsys.readouterr()
+    assert captured.err == "" and "0/0" in captured.out
     assert cli.main([*arguments, "--fail-under-hit-at-k", "0.5"]) == 1
     assert "no question asked without filters could be scored" in capsys.readouterr().err
 

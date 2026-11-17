@@ -4,7 +4,8 @@
 :func:`check_questions` then counts what a file that loads is made of (kinds, tags, expected
 behaviours, languages, filters, how many documents the questions expect) and points at what
 is allowed and probably not meant: a question text used twice, a kind that mixes questions
-with and without filters, more essential documents than ``k``. Given the catalogue of a
+with and without filters, more requirements or more expected documents than ``k``. Given the
+catalogue of a
 corpus (:func:`load_catalogue`: the JSON Lines manifest files), it also looks every document
 a question names up in it.
 
@@ -18,11 +19,11 @@ import glob
 import json
 import os
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .eval import BEHAVIORS, DEFAULT_K, EvalError, Question, _filters_dict
+from .eval import BEHAVIORS, DEFAULT_K, EvalError, Question, _cut_start, _filters_dict, _wrapped
 
 __all__ = [
     "CatalogueEntry",
@@ -36,6 +37,7 @@ __all__ = [
 _NONE = "(none)"
 _NOT_STATED = "not stated"
 _LINE_WIDTH = 110
+_DUPLICATES_SHOWN = 10
 
 
 @dataclass(frozen=True)
@@ -97,8 +99,9 @@ class DocumentReference:
     """A document some questions name, that the catalogue does not hold or holds outside the scope.
 
     ``questions`` gives, for each question that names it, its id, its line in the file
-    (``None`` for a question built in code) and how it names it: ``essential``, ``acceptable``
-    or ``expected`` (a question that does not say which documents are essential).
+    (``None`` for a question built in code) and how it names it: ``essential``, ``either-of``
+    (a member of a group of ``essential_any_of``), ``acceptable``, ``expected`` (a question
+    that does not say which documents are essential) or ``context`` (a question that abstains).
     ``mime_type`` and ``doc_type`` are those of the catalogue, ``None`` for a document that is
     not in it.
     """
@@ -129,16 +132,23 @@ class QuestionCheck:
     ``with_filters``, ``run_unfiltered``
         Number of questions that carry filters, and of those that ask to be scored again
         without them.
-    ``essential_counts``, ``expected_counts``
-        How many questions name how many essential documents, and how many expected
-        documents (essential and acceptable together): the number of documents, then the
-        number of questions, in increasing order. ``essential_not_stated`` counts the
-        questions that do not say which documents are essential.
-    ``without_documents``
-        Number of questions that expect no document (they abstain): searched, never scored.
-    ``more_essential_than_k``
-        The ids of the questions with more essential documents than ``k``: at that ``k`` they
-        can never have all of them among the first ``k`` documents.
+    ``abstentions``, ``abstentions_with_context``, ``without_documents``
+        Number of questions that abstain (searched and reported apart, never scored), of those
+        among them that list context documents, and of those that list none. The four fields
+        below describe the other questions, those that are scored.
+    ``requirement_counts``, ``expected_counts``
+        How many questions have how many requirements (one per essential document and one per
+        either-of group), and how many expected documents (essential, either-of and
+        acceptable together): the number, then the number of questions, in increasing order.
+        ``essential_not_stated`` counts the questions that do not say which documents are
+        essential.
+    ``either_of_questions``, ``either_of_groups``
+        Number of questions with at least one either-of group, and of groups in all.
+    ``more_requirements_than_k``
+        The ids of the questions with more requirements than ``k``: at that ``k`` they can
+        never have all of them satisfied among the first ``k`` documents.
+    ``more_expected_than_k``
+        The ids of those with more expected documents than ``k``: their recall@k cannot reach 1.
     ``duplicate_texts``
         The groups of questions with the same text (compared without regard to case and to
         spacing): each group is the ids of its questions, in the order of the file.
@@ -169,11 +179,11 @@ class QuestionCheck:
     by_language: Mapping[str, int]
     with_filters: int
     run_unfiltered: int
-    essential_counts: Mapping[int, int]
+    requirement_counts: Mapping[int, int]
     essential_not_stated: int
     expected_counts: Mapping[int, int]
     without_documents: int
-    more_essential_than_k: tuple[str, ...]
+    more_requirements_than_k: tuple[str, ...]
     duplicate_texts: tuple[tuple[str, ...], ...]
     mixed_kinds: tuple[str, ...]
     documents: int
@@ -184,6 +194,11 @@ class QuestionCheck:
     by_mime_type: Mapping[str, int] | None = None
     scope_doc_types: tuple[str, ...] | None = None
     scope_mime_types: tuple[str, ...] | None = None
+    abstentions: int = 0
+    abstentions_with_context: int = 0
+    either_of_questions: int = 0
+    either_of_groups: int = 0
+    more_expected_than_k: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -223,8 +238,8 @@ def check_questions(
     narrow it to the scope of a collection (the doc types and the MIME types that were
     ingested): a document named by a question and found in the catalogue outside that scope
     is reported as out of scope. Both need a catalogue. ``k`` is the number of documents the
-    evaluation will look at (default 10): the questions with more essential documents are
-    listed.
+    evaluation will look at (default 10): the questions with more requirements, and those
+    with more expected documents, are listed.
 
     :class:`rag_engine.eval.EvalError` for a ``k`` that is not an integer >= 1, a scope
     without a catalogue, a scope that is not a list of strings.
@@ -240,40 +255,56 @@ def check_questions(
     tags: Counter[str] = Counter()
     behaviors: Counter[str] = Counter()
     languages: Counter[str] = Counter()
-    essential: Counter[int] = Counter()
+    requirements: Counter[int] = Counter()
     expected: Counter[int] = Counter()
     texts: dict[str, list[str]] = {}
     filtered_kinds: set[str] = set()
     unfiltered_kinds: set[str] = set()
     references: dict[str, list[tuple[str, int | None, str]]] = {}
-    with_filters = reruns = not_stated = 0
+    with_filters = reruns = not_stated = abstentions = with_context = groups = with_groups = 0
     beyond: list[str] = []
+    long: list[str] = []
     for question in asked:
         kind = question.kind if question.kind is not None else _NONE
+        abstains = question.expected_behavior == "abstain"
+        documents = question.expected_doc_ids or ()
         kinds[kind] += 1
         tags.update(question.tags)
         behaviors[question.expected_behavior] += 1
         languages[question.language if question.language is not None else _NONE] += 1
-        if _filters_dict(question.filters) is not None:
-            with_filters += 1
-            filtered_kinds.add(kind)
-        elif question.expected_doc_ids:  # a question without documents is not scored: in no kind
-            unfiltered_kinds.add(kind)
+        filtered = _filters_dict(question.filters) is not None
+        with_filters += filtered
         reruns += question.run_unfiltered
-        expected[len(question.expected_doc_ids or ())] += 1
-        if question.essential_ids is None:
-            not_stated += 1
-        else:
-            essential[len(question.essential_ids)] += 1
-            if len(question.essential_ids) > k:
-                beyond.append(question.id)
         texts.setdefault(" ".join(question.question.split()).casefold(), []).append(question.id)
-        for doc_id in question.expected_doc_ids or ():
-            if question.essential_ids is None:
+        members = {doc_id for group in question.essential_any_of for doc_id in group}
+        for doc_id in documents:
+            if abstains:
+                role = "context"
+            elif question.essential_ids is None:
                 role = "expected"
+            elif doc_id in members:
+                role = "either-of"
             else:
                 role = "essential" if doc_id in question.essential_ids else "acceptable"
             references.setdefault(doc_id, []).append((question.id, question.line, role))
+        if abstains:  # searched and reported apart: in no kind of the report, and never scored
+            abstentions += 1
+            with_context += bool(documents)
+            continue
+        (filtered_kinds if filtered else unfiltered_kinds).add(kind)
+        expected[len(documents)] += 1
+        if len(documents) > k:
+            long.append(question.id)
+        needed = question.requirements
+        if needed is None:
+            not_stated += 1
+        else:
+            requirements[len(needed)] += 1
+            if len(needed) > k:
+                beyond.append(question.id)
+        if question.essential_any_of:
+            with_groups += 1
+            groups += len(question.essential_any_of)
 
     missing: list[DocumentReference] = []
     outside: list[DocumentReference] = []
@@ -302,11 +333,11 @@ def check_questions(
         by_language=_frequency(languages),
         with_filters=with_filters,
         run_unfiltered=reruns,
-        essential_counts=dict(sorted(essential.items())),
+        requirement_counts=dict(sorted(requirements.items())),
         essential_not_stated=not_stated,
         expected_counts=dict(sorted(expected.items())),
-        without_documents=expected[0],
-        more_essential_than_k=tuple(beyond),
+        without_documents=abstentions - with_context,
+        more_requirements_than_k=tuple(beyond),
         duplicate_texts=tuple(tuple(ids) for ids in texts.values() if len(ids) > 1),
         mixed_kinds=tuple(sorted(filtered_kinds & unfiltered_kinds)),
         documents=len(references),
@@ -317,22 +348,12 @@ def check_questions(
         by_mime_type=None if by_mime_type is None else _frequency(by_mime_type),
         scope_doc_types=types,
         scope_mime_types=mimes,
+        abstentions=abstentions,
+        abstentions_with_context=with_context,
+        either_of_questions=with_groups,
+        either_of_groups=groups,
+        more_expected_than_k=tuple(long),
     )
-
-
-def _wrapped(label: str, parts: Sequence[str]) -> list[str]:
-    """``label`` followed by ``parts`` separated by commas, on as many lines of the width as it takes."""
-    lines: list[str] = []
-    current = label
-    for place, part in enumerate(parts):
-        piece = part + ("," if place < len(parts) - 1 else "")
-        if len(current) + 1 + len(piece) > _LINE_WIDTH and current.strip():
-            lines.append(current)
-            current = " " * 4 + piece
-        else:
-            current = f"{current} {piece}"
-    lines.append(current)
-    return lines
 
 
 def _counts(label: str, counts: Mapping[Any, int]) -> list[str]:
@@ -352,17 +373,20 @@ def _reference_lines(reference: DocumentReference) -> list[str]:
 def format_check(check: QuestionCheck, *, name: str | None = None, sha256: str | None = None) -> str:
     """``check`` as a short text for a terminal; ``name`` and ``sha256`` identify the question file.
 
-    The counts first, then what deserves a look (texts used twice, kinds that mix questions
-    with and without filters, more essential documents than ``k``), then, when a catalogue was
-    given, the documents that are not in it or not in the scope. The last line says whether
-    the file passed. The text has no trailing line break.
+    The counts first, then what deserves a look (texts used twice: their number and the
+    first ten; kinds that mix questions with and without filters; more requirements or more
+    expected documents than ``k``), then, when a catalogue was given, the documents that are
+    not in it or not in the scope. The last line says whether the file passed. The first line
+    is cut to 110 characters whatever the length of ``name``, the end of the path being kept.
+    The text has no trailing line break.
     """
     plural = "" if check.questions == 1 else "s"
     title = f"{check.questions} question{plural}"
-    if name:
-        title = f"{name}: {title}"
     if sha256:
         title += f" (sha256 {sha256[:12]})"
+    if name:
+        # The whole line fits the width, wherever the file lives; the end of a path names the file.
+        title = f"{_cut_start(name, _LINE_WIDTH - len(title) - 2)}: {title}"
     lines = [title]
     lines += _counts("kind:", check.by_kind)
     lines += _counts("tag:", check.by_tag)
@@ -372,40 +396,53 @@ def format_check(check: QuestionCheck, *, name: str | None = None, sha256: str |
         f"filters: {check.with_filters} with filters, {check.run_unfiltered} of them scored again without "
         "(run_unfiltered)"
     )
-    essential: dict[Any, int] = {}
+    if check.abstentions:
+        lines.append(
+            f"abstain: {check.abstentions} (searched and reported apart, never scored); "
+            f"{check.abstentions_with_context} with context documents, {check.without_documents} without"
+        )
+        lines.append("the scored questions:")
+    needed: dict[Any, int] = {}
     if check.essential_not_stated:
-        essential[_NOT_STATED] = check.essential_not_stated
-    essential.update(check.essential_counts)
+        needed[_NOT_STATED] = check.essential_not_stated
+    needed.update(check.requirement_counts)
     lines += _wrapped(
-        "essential documents per question (documents: questions):",
-        [f"{number}: {count}" for number, count in essential.items()],
+        "requirements per question (requirements: questions):",
+        [f"{number}: {count}" for number, count in needed.items()] or ["none"],
     )
+    if check.either_of_groups:
+        lines.append(
+            f"  a requirement is one essential document or one either-of group: {check.either_of_groups} "
+            f"groups in {check.either_of_questions} questions"
+        )
     lines += _wrapped(
         "expected documents per question (documents: questions):",
-        [f"{number}: {count}" for number, count in check.expected_counts.items()],
+        [f"{number}: {count}" for number, count in check.expected_counts.items()] or ["none"],
     )
     lines.append(f"distinct documents named: {check.documents}")
-    if check.without_documents:
-        lines.append(
-            f"without any document: {check.without_documents} (they abstain: searched and reported apart, "
-            "never scored)"
-        )
 
     lines.append("")
     lines.append(f"duplicate question texts: {len(check.duplicate_texts)}")
-    for ids in check.duplicate_texts:
+    for ids in check.duplicate_texts[:_DUPLICATES_SHOWN]:
         lines += _wrapped("  the same text:", list(ids))
+    if len(check.duplicate_texts) > _DUPLICATES_SHOWN:
+        lines.append(f"  and {len(check.duplicate_texts) - _DUPLICATES_SHOWN} more (the first 10 are shown)")
     if check.mixed_kinds:
         lines += _wrapped("kinds with and without filters:", list(check.mixed_kinds))
         lines += [
             "  One question with filters makes its kind a filtered kind: the whole kind is kept out of the",
             "  headline. Give the questions with filters a kind of their own to keep the others in it.",
         ]
-    if check.more_essential_than_k:
-        lines += _wrapped(f"more essential documents than k={check.k}:", list(check.more_essential_than_k))
+    if check.more_requirements_than_k:
+        lines += _wrapped(f"more requirements than k={check.k}:", list(check.more_requirements_than_k))
         lines.append(
-            f"  At k={check.k} they can never have all their essential documents among the first {check.k}: "
-            "run with a larger --k."
+            f"  At k={check.k} they can never have all their requirements satisfied among the first "
+            f"{check.k}: run with a larger --k."
+        )
+    if check.more_expected_than_k:
+        lines += _wrapped(f"more expected documents than k={check.k}:", list(check.more_expected_than_k))
+        lines.append(
+            f"  Their recall@{check.k} cannot reach 1; hit@{check.k} and the requirements are not concerned."
         )
 
     if check.catalogue_documents is not None:
