@@ -1,11 +1,13 @@
 # rag-engine
 
-**Status: ingestion, both embedding backends (PyTorch, ONNX) and filtered search are delivered.**
+**Status: ingestion, both embedding backends (PyTorch, ONNX), filtered search and the search evaluation harness are delivered.**
 
 rag-engine does two things:
 
 1. **Ingestion** of one document into [Qdrant](https://qdrant.tech): chunk, embed, write.
 2. **Search** over what was ingested: one dense search, narrowed by filters on the source, the type, the language, the document, the corpus and the publication date.
+
+It also measures that search: `rag-engine eval` runs a file of questions with known answers and reports how often the right documents come first (see [Evaluating search quality](#evaluating-search-quality)).
 
 It is used by two MyOpenFund components: the data-orchestrator (ingestion) and the MCP server (search).
 
@@ -15,7 +17,7 @@ Python 3.10 or later. The base install is light; each consumer adds only the ext
 
 | Install | Adds | For |
 |---|---|---|
-| `rag-engine` | `qdrant-client` (1.10 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, indexes, writes), search |
+| `rag-engine` | `qdrant-client` (1.10 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, indexes, writes), search, the evaluation harness and the `rag-engine` command |
 | `rag-engine[torch]` | `sentence-transformers` | PyTorch embedding backend |
 | `rag-engine[onnx]` | `fastembed` 0.9.x (ONNX runtime, `huggingface_hub`) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
 | `rag-engine[ingest]` | `chunknorris`, `markitdown[pptx]`, `psutil` | document parsing and chunking |
@@ -36,9 +38,11 @@ The package root exposes only `__version__`. Everything else is imported from it
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
 | `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `QUERY_NORMALIZATION` |
+| `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `EvalError` |
+| `rag_engine.cli` | `main` (the `rag-engine` command) |
 | `rag_engine.errors` | `RagEngineError` |
 
-Errors. Every exception class the engine defines derives from `rag_engine.errors.RagEngineError`: `ConfigError` (also a `ValueError`), `StoreError` with its subclasses `QdrantAuthError` and `CollectionMismatchError`, `UnsupportedFormatError` (also a `ValueError`), and `SearchError` (also a `ValueError`). `except RagEngineError` does not catch what the engine lets through unchanged (an error of a parser, of the embedding backend or of the Qdrant client), nor the plain `ValueError` / `TypeError` of a bad argument.
+Errors. Every exception class the engine defines derives from `rag_engine.errors.RagEngineError`: `ConfigError` (also a `ValueError`), `StoreError` with its subclasses `QdrantAuthError` and `CollectionMismatchError`, `UnsupportedFormatError` (also a `ValueError`), `SearchError` (also a `ValueError`) and `EvalError` (also a `ValueError`). `except RagEngineError` does not catch what the engine lets through unchanged (an error of a parser, of the embedding backend or of the Qdrant client), nor the plain `ValueError` / `TypeError` of a bad argument.
 
 ## Configuration
 
@@ -278,6 +282,63 @@ With an API key that only reads (a search service), leave out the two `ensure_` 
 
 **Versions.** Search uses Qdrant's query API: qdrant-client 1.10 or later, and a Qdrant server 1.10 or later.
 
+## Evaluating search quality
+
+`rag-engine eval` runs the search on a file of questions whose answers are known, and reports how well the expected documents are ranked.
+
+```bash
+export QDRANT_HOST=localhost QDRANT_PORT=6333   # the connection and the model come from the environment
+export RAG_ENGINE_BACKEND=onnx                  # the model must be the one the collection was embedded with
+rag-engine eval --questions eval/known_item_v1.jsonl --collection documents
+rag-engine eval --questions eval/known_item_v1.jsonl --collection documents \
+    --k 10 --chunk-limit 50 --backend torch --output report.json --fail-under-hit-at-k 0.9
+```
+
+| Option | Meaning |
+|---|---|
+| `--questions FILE` | The question file (JSON Lines). Required. |
+| `--collection NAME` | The Qdrant collection to search. Required; it must exist, with vectors of the dimension of the model. |
+| `--k N` | Number of documents the metrics look at. Default 10. |
+| `--chunk-limit N` | Number of chunks asked to the search per question. Default 50; at most `RAG_ENGINE_SEARCH_MAX_LIMIT`. |
+| `--backend torch\|onnx` | Embedding backend. Default: `RAG_ENGINE_BACKEND`. |
+| `--output FILE` | Also write the full report as JSON: parameters, metrics, every question with its first documents. |
+| `--fail-under-hit-at-k X` | Exit with code 1 when the overall hit@k is below `X` (between 0 and 1). |
+
+The command is the one place of the engine that reads the settings by itself (`Settings.from_env()`; a `.env` file is not read). It prints the report on the standard output. Exit codes: **0** when the evaluation ran, **1** when `--fail-under-hit-at-k` is given and not met, **2** when the evaluation could not run to its end (bad arguments or settings, an unusable question file, an unreachable server or a refused key, a missing collection, a missing embedding backend, a failure midway). `rag-engine --version` prints the version.
+
+**The question file** is JSON Lines, one question per line: `id` (unique), `question`, `expected_doc_ids` (the `doc_id` of every document that answers it, at least one), and optionally `filters` (an object with the field names and the rules of `SearchFilters`), `kind` and `tags` (labels the report groups by), `language` and `rationale` (kept, not used). It is checked strictly when read: a duplicate id, an empty `expected_doc_ids`, an unknown field or filter, a bad date raise an `EvalError` naming the line. Two files are kept under [`eval/`](eval/README.md):
+
+- `eval/known_item_v1.jsonl`: 833 automatic questions that ask for a document by its title, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`, which never states a date more precisely than the manifest knows it.
+- `eval/analytical_v1.jsonl`: questions on the content of the documents, written by hand; the file is added once its questions are validated.
+
+**Scoring is done on documents.** The search returns chunks, and several may come from one document, while an expected answer is a document. For each question the search is asked for `chunk_limit` chunks, which are collapsed into documents: a document takes the place and the score of its best chunk. The metrics look at the first `k` documents of that ranking:
+
+| Metric | Meaning |
+|---|---|
+| hit@1 | Share of questions whose first document is an expected one. |
+| hit@k | Share of questions with an expected document among the first `k`. |
+| MRR | Mean of `1 / rank` of the best-placed expected document; a rank beyond `k` counts for 0. |
+| recall@k | Mean share of the expected documents found among the first `k`. |
+
+They are given overall, per `kind` and per tag. The questions without any expected document among the first `k` are listed as **misses**, with the three best documents returned and their titles.
+
+`chunk_limit` chunks may hold fewer than `k` documents, when the best chunks come from a few long documents. The report does not hide it: it counts the questions for which fewer than `k` documents were ranked and, among them, those whose search returned the whole chunk budget, for which a larger `--chunk-limit` could have ranked more. The budget is bounded by the search maximum (`RAG_ENGINE_SEARCH_MAX_LIMIT`, default 50), so that the evaluation measures the search a caller gets; raise both to look deeper.
+
+**Documents that are not in the collection.** Before any search, the expected documents of all the questions are looked up in the collection (`QdrantStore.existing_doc_ids`, a filter on `doc_id`). A question none of whose expected documents is there is reported under `not_in_collection` and left out of every metric: counting it as a miss would blame the search for a document that was never ingested. A question with only some of its documents absent is scored; the absent ones are listed, and its recall is the share of the documents that are there.
+
+From Python, with a store and an embedder the caller already has:
+
+```python
+from rag_engine.eval import evaluate, format_report, load_questions
+
+questions = load_questions("eval/known_item_v1.jsonl")
+report = evaluate(questions, collection="documents", store=store, embedder=embedder, k=10, chunk_limit=50)
+print(format_report(report))
+report.overall.hit_at_k  # also .hit_at_1, .mrr, .recall_at_k; report.by_kind, report.by_tag
+report.misses  # the questions without an expected document among the first k
+report.to_json()  # everything, as JSON
+```
+
 ## Supported formats and OCR
 
 `chunk_file(path, *, ocr="auto", ocr_languages="eng", options=None)` (in `rag_engine.chunking`, extra `ingest`) reads one file and returns its chunks in document order, each with its `text` and its `page`. The format is chosen by the file extension, whatever its case; `SUPPORTED_EXTENSIONS` lists them.
@@ -341,6 +402,8 @@ pytest -q
 The tests that parse real documents need the `ingest` extra (`pip install -e ".[dev,ingest]"`) and skip without it; the OCR test also needs Tesseract with the `eng` language data (`apt-get install tesseract-ocr`). CI installs both on the Python 3.12 and 3.13 jobs (3.13 is the version production runs on and the golden fixture was captured with); the 3.10 job keeps the light install.
 
 Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+The default suite also runs the evaluation harness end to end, in qdrant-client's local mode, on the fixture of `eval/fixtures/` (12 documents, 10 questions with known answers), and checks the committed question file `eval/known_item_v1.jsonl`.
 
 Two test markers are deselected by default:
 
