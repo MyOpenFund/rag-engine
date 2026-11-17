@@ -148,7 +148,11 @@ class BaseEmbedder:
         return self._vectors([self._spec.query_prefix + text])[0]
 
     def _vectors(self, prefixed: list[str]) -> np.ndarray:
-        vectors = np.asarray(self._embed(prefixed), dtype=np.float32)
+        raw = self._embed(prefixed)
+        if not hasattr(raw, "__array__"):
+            # A generator or another iterable of rows: numpy reads a list, not an iterator.
+            raw = list(raw)
+        vectors = np.asarray(raw, dtype=np.float32)
         expected = (len(prefixed), self.dim)
         if vectors.shape != expected:
             raise ValueError(
@@ -161,8 +165,8 @@ class BaseEmbedder:
     def _embed(self, prefixed: list[str]) -> Any:
         """Embed a non-empty list of texts that already carry their prefix, as they are.
 
-        Returns one vector per text, in order: anything numpy reads as an array of shape
-        ``(len(prefixed), dim)``.
+        Returns one vector per text, in order: an array of shape ``(len(prefixed), dim)``, or
+        any iterable of rows (a list, a generator) that numpy reads as one.
         """
         raise NotImplementedError
 
@@ -290,9 +294,9 @@ class FakeEmbedder(BaseEmbedder):
 
     The vector of a text is derived from a SHA-256 hash of ``seed`` and of the text with its
     prefix, then scaled to unit length. So: the same prefixed text always gives the same
-    vector, in any process and on any machine; the same text gives one vector as a passage and
-    another as a query, unless the two prefixes are equal. The vectors carry no meaning: two
-    similar texts are not close.
+    vector, in any process on the same platform; the same text gives one vector as a passage
+    and another as a query, unless the two prefixes are equal. The vectors carry no meaning:
+    two similar texts are not close.
 
     ``calls`` lists every prefixed text received, in order.
     """

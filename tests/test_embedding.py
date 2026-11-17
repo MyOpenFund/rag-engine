@@ -223,6 +223,27 @@ def test_a_backend_returning_the_wrong_shape_is_caught_in_the_shared_code():
         Broken(SPEC).encode_passage(["a", "b"])
 
 
+def test_a_backend_yielding_its_rows_is_read_like_a_list():
+    class Lazy(embedding_mod.BaseEmbedder):
+        def _embed(self, prefixed):
+            for index, _ in enumerate(prefixed):
+                yield [float(index)] * 8
+
+    vectors = Lazy(SPEC).encode_passage(["a", "b"])
+    assert vectors.shape == (2, 8)
+    assert vectors.dtype == np.float32
+    assert vectors[:, 0].tolist() == [0.0, 1.0]
+
+
+def test_a_backend_yielding_rows_of_the_wrong_size_gets_the_shape_message():
+    class LazyBroken(embedding_mod.BaseEmbedder):
+        def _embed(self, prefixed):
+            return ([0.0] * 5 for _ in prefixed)
+
+    with pytest.raises(ValueError, match=r"\(2, 5\).*\(2, 8\)"):
+        LazyBroken(SPEC).encode_passage(["a", "b"])
+
+
 def test_a_backend_only_implements_the_raw_encoding():
     seen = []
 
@@ -508,18 +529,48 @@ def test_the_stub_does_detect_concurrent_calls():
 
 
 def test_release_waits_for_a_running_inference(stubs):
-    StubModel.hold = 0.1
+    stubs.cuda = True
     embedder = TorchEmbedder(SPEC)
-    results = []
-    thread = threading.Thread(target=lambda: results.append(embedder.encode_query("a")))
-    thread.start()
-    model = StubModel.instances[0]
-    deadline = time.monotonic() + 5
-    while model.active == 0 and time.monotonic() < deadline:
-        time.sleep(0.001)
-    embedder.release()
-    thread.join(timeout=10)
+    (model,) = StubModel.instances
+    entered = threading.Event()  # set when encode has started
+    gate = threading.Event()  # encode stays blocked until it is set
+    released = threading.Event()  # set when release() has returned
+    events: list[str] = []
+    results: list[np.ndarray] = []
+
+    def blocking_encode(sentences):
+        entered.set()
+        if not gate.wait(timeout=10):
+            events.append("encode gave up waiting")
+        events.append("encode ended")
+        return np.zeros((len(sentences), 8), dtype=np.float32)
+
+    def do_release() -> None:
+        embedder.release()
+        released.set()
+
+    model.encode = blocking_encode
+    sys.modules["torch"].cuda.empty_cache = lambda: events.append("cache cleared")
+    encoder = threading.Thread(target=lambda: results.append(embedder.encode_query("a")), daemon=True)
+    releaser = threading.Thread(target=do_release, daemon=True)
+    try:
+        encoder.start()
+        assert entered.wait(timeout=5)
+        releaser.start()
+        # release() must still be waiting: it has not returned and has cleared nothing.
+        assert not released.wait(timeout=0.2)
+        assert events == []
+    finally:
+        gate.set()
+    encoder.join(timeout=5)
+    releaser.join(timeout=5)
+    assert not encoder.is_alive()
+    assert not releaser.is_alive()
+    assert released.is_set()
     assert len(results) == 1  # the running call finished with its vector
+    assert events == ["encode ended", "cache cleared"]
+    with pytest.raises(RuntimeError, match="released"):
+        embedder.encode_query("a")
 
 
 @pytest.mark.parametrize("missing", ["torch", "sentence_transformers"])
@@ -591,13 +642,30 @@ def test_factory_refuses_an_unknown_backend():
 # The real model (needs the ``torch`` extra and the model files)
 # ---------------------------------------------------------------------------
 @pytest.mark.models
-def test_real_model_dimension_and_prefixes():
-    pytest.importorskip("sentence_transformers")
-    with make_embedder(Settings()) as embedder:
+def test_real_model_gives_the_vectors_of_sentence_transformers_with_the_e5_prefixes():
+    sentence_transformers = pytest.importorskip("sentence_transformers")
+    settings = Settings()
+    long_text = " ".join(f"word{index}" for index in range(600))  # beyond the 512 tokens of the model
+    texts = ["", "Le chat dort sur le canapé près de la fenêtre.", "A short English sentence.", long_text]
+    with make_embedder(settings) as embedder:
         assert embedder.dim == 768
-        passages = embedder.encode_passage(["x"])
-        query = embedder.encode_query("x")
-        assert passages.shape == (1, 768)
-        assert passages.dtype == np.float32
+        passages = embedder.encode_passage(texts)
+        queries = [embedder.encode_query(text) for text in texts]
+        device = embedder.device
+    options = {"device": device}
+    if settings.model_cache is not None:
+        options["cache_folder"] = settings.model_cache
+    reference = sentence_transformers.SentenceTransformer(settings.model_name, **options)
+
+    assert passages.shape == (len(texts), 768)
+    assert passages.dtype == np.float32
+    assert np.array_equal(passages, reference.encode(["passage: " + text for text in texts]))
+    assert np.abs(np.linalg.norm(passages, axis=1) - 1.0).max() < 1e-4
+    for text, query in zip(texts, queries, strict=True):
         assert query.shape == (768,)
-        assert not np.allclose(passages[0], query, atol=1e-4)
+        assert query.dtype == np.float32
+        assert np.array_equal(query, reference.encode("query: " + text))
+        assert abs(float(np.linalg.norm(query)) - 1.0) < 1e-4
+    # The two prefixes give different vectors, and the truncated text is not a degenerate row.
+    assert not np.allclose(passages, np.stack(queries), atol=1e-4)
+    assert not np.allclose(passages[3], passages[2], atol=1e-4)
