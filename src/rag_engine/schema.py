@@ -40,6 +40,11 @@ Any other metadata key is copied as is.
 The point id depends on ``(doc_id, page, chunk_index)`` only, where
 ``chunk_index`` is the value stored as ``chunk_number`` and ``page`` is 0 when
 the chunk has no page (see ``page_for_id``).
+
+Payload indexes (``PAYLOAD_INDEXES``) are what the search filters rely on. An
+index never changes a point: it can be added to a collection that already
+holds points, and a payload value an index cannot read is not an error, the
+point is only left out of that index.
 """
 
 from __future__ import annotations
@@ -48,9 +53,29 @@ import hashlib
 from collections.abc import Mapping
 from typing import Any
 
-__all__ = ["RESERVED_KEYS", "build_payload", "page_for_id", "point_id"]
+__all__ = ["PAYLOAD_INDEXES", "RESERVED_KEYS", "build_payload", "page_for_id", "point_id"]
 
 RESERVED_KEYS: tuple[str, ...] = ("doc_id", "filename", "chunk_number", "ingestion_date", "text", "page")
+
+#: The payload fields the engine indexes, as ``(field, kind)``; a kind is the name of a
+#: Qdrant payload index type. ``QdrantStore.ensure_payload_indexes`` creates them.
+#:
+#: - keyword (exact match): ``doc_id``, ``source_code``, ``doc_type``, ``language``, ``corpus``.
+#: - integer (match and range): ``year``.
+#: - datetime (range): ``date``, the publication date as the vault gives it. Qdrant reads a
+#:   full date (``2016-03-10``, taken as midnight UTC) or a full date and time. A value it
+#:   cannot read (``2016-03``, ``2016``, an empty string), a null and a missing key are not
+#:   errors, neither when the index is built nor when the point is written: the point is
+#:   stored as it is, and it never matches a date range.
+PAYLOAD_INDEXES: tuple[tuple[str, str], ...] = (
+    ("doc_id", "keyword"),
+    ("source_code", "keyword"),
+    ("doc_type", "keyword"),
+    ("language", "keyword"),
+    ("corpus", "keyword"),
+    ("year", "integer"),
+    ("date", "datetime"),
+)
 
 
 def point_id(doc_id: str, page: int, chunk_index: int) -> int:

@@ -23,6 +23,7 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 
 import rag_engine.store as store_mod
 from rag_engine.config import Settings
+from rag_engine.schema import PAYLOAD_INDEXES
 from rag_engine.store import CollectionMismatchError, QdrantAuthError, QdrantStore, StoreError
 
 # Expected here: the tests send a key over plain HTTP on purpose, and talk to servers that are
@@ -988,3 +989,264 @@ def test_real_client_connection_refused_is_raised_and_not_read_as_absent():
     with pytest.raises(ResponseHandlingException):
         store.ensure_collection("c", 8)
     assert store.is_reachable() is False
+
+
+# ---------------------------------------------------------------------------
+# Payload indexes.
+# ---------------------------------------------------------------------------
+INDEXED_FIELDS = ["doc_id", "source_code", "doc_type", "language", "corpus", "year", "date"]
+
+
+def index_info(kind: str) -> SimpleNamespace:
+    """The part of ``PayloadIndexInfo`` the store reads, with the enum the client gives."""
+    return SimpleNamespace(data_type=models.PayloadSchemaType(kind))
+
+
+class IndexClient:
+    """Scripted client that keeps payload indexes the way the server does.
+
+    Like the server, it replaces an index of another kind without a word: only the store
+    stands between a wrong call and a rebuilt index.
+    """
+
+    def __init__(self, existing=None, *, get=None, create=None, fail_on=None):
+        self.schema = {field: index_info(kind) for field, kind in (existing or {}).items()}
+        self._get = get
+        self._create = create
+        self._fail_on = fail_on
+        self.calls: list[tuple] = []
+
+    def created(self) -> list[tuple]:
+        return [call[1:] for call in self.calls if call[0] == "create_payload_index"]
+
+    def get_collection(self, collection_name):
+        self.calls.append(("get_collection", collection_name))
+        if self._get is not None:
+            raise self._get
+        return SimpleNamespace(payload_schema=dict(self.schema))
+
+    def create_payload_index(self, collection_name, field_name, field_schema=None, wait=None):
+        self.calls.append(("create_payload_index", collection_name, field_name, field_schema, wait))
+        if self._create is not None and self._fail_on in (None, field_name):
+            raise self._create
+        self.schema[field_name] = index_info(getattr(field_schema, "value", field_schema))
+
+
+def index_store(*args, **script) -> tuple[QdrantStore, IndexClient]:
+    client = IndexClient(*args, **script)
+    return QdrantStore(client=client, settings=Settings()), client
+
+
+def test_the_documented_index_list():
+    assert PAYLOAD_INDEXES == (
+        ("doc_id", "keyword"),
+        ("source_code", "keyword"),
+        ("doc_type", "keyword"),
+        ("language", "keyword"),
+        ("corpus", "keyword"),
+        ("year", "integer"),
+        ("date", "datetime"),
+    )
+    for _field, kind in PAYLOAD_INDEXES:
+        models.PayloadSchemaType(kind)  # every kind is one Qdrant knows
+
+
+def test_indexes_missing_are_all_created_and_waited_for():
+    store, client = index_store()
+    assert store.ensure_payload_indexes("c") == INDEXED_FIELDS
+    assert client.created() == [
+        ("c", field, models.PayloadSchemaType(kind), True) for field, kind in PAYLOAD_INDEXES
+    ]
+
+
+def test_indexes_second_call_creates_nothing():
+    store, client = index_store()
+    store.ensure_payload_indexes("c")
+    before = len(client.created())
+    assert store.ensure_payload_indexes("c") == []
+    assert len(client.created()) == before
+
+
+def test_indexes_only_the_missing_ones_are_created():
+    store, client = index_store({"doc_id": "keyword", "year": "integer", "title": "text"})
+    assert store.ensure_payload_indexes("c") == ["source_code", "doc_type", "language", "corpus", "date"]
+    assert [call[1] for call in client.created()] == ["source_code", "doc_type", "language", "corpus", "date"]
+    assert client.schema["title"].data_type == models.PayloadSchemaType.TEXT  # not ours: left alone
+
+
+def test_indexes_existing_kind_is_read_as_an_enum_or_as_a_plain_string():
+    store, client = index_store(dict(PAYLOAD_INDEXES))
+    client.schema["year"] = SimpleNamespace(data_type="integer")
+    assert store.ensure_payload_indexes("c") == []
+    assert client.created() == []
+
+
+@pytest.mark.parametrize(
+    ("field", "found", "expected"),
+    [("date", "keyword", "datetime"), ("year", "keyword", "integer"), ("doc_id", "text", "keyword")],
+)
+def test_an_index_of_another_kind_is_refused_and_nothing_is_created(field, found, expected):
+    store, client = index_store({field: found})
+    with pytest.raises(CollectionMismatchError) as info:
+        store.ensure_payload_indexes("c")
+    message = str(info.value)
+    assert repr(field) in message
+    assert f"expected a {expected} index" in message
+    assert f"found a {found} index" in message
+    assert "'c'" in message
+    assert client.created() == []  # not replaced, and no other index created either
+    assert client.schema[field].data_type == models.PayloadSchemaType(found)
+
+
+def test_every_index_of_another_kind_is_named():
+    store, _ = index_store({"date": "keyword", "year": "float"})
+    with pytest.raises(CollectionMismatchError) as info:
+        store.ensure_payload_indexes("c")
+    assert "'date'" in str(info.value)
+    assert "'year'" in str(info.value)
+
+
+def test_indexes_custom_list():
+    store, client = index_store({"doc_id": "keyword"})
+    wanted = [("title", "text"), ("page", models.PayloadSchemaType.INTEGER), ("doc_id", "keyword")]
+    assert store.ensure_payload_indexes("c", wanted) == ["title", "page"]
+    assert client.created() == [
+        ("c", "title", models.PayloadSchemaType.TEXT, True),
+        ("c", "page", models.PayloadSchemaType.INTEGER, True),
+    ]
+
+
+def test_indexes_empty_list_creates_nothing_but_still_needs_the_collection():
+    store, client = index_store()
+    assert store.ensure_payload_indexes("c", []) == []
+    assert client.created() == []
+    store, _ = index_store(get=http_error(404))
+    with pytest.raises(UnexpectedResponse):
+        store.ensure_payload_indexes("c", [])
+
+
+@pytest.mark.parametrize(
+    ("indexes", "match"),
+    [
+        ([("year", "number")], "number"),
+        ([("year", None)], "None"),
+        ([("", "keyword")], "field"),
+        ([(3, "keyword")], "field"),
+        ([("year", "integer"), ("year", "keyword")], "more than once"),
+        ([("year", "integer"), ("year", "integer")], "more than once"),
+        (["year"], "pair"),
+        ([("year", "integer", "extra")], "pair"),
+    ],
+)
+def test_a_bad_index_list_is_refused_before_any_call(indexes, match):
+    store, client = index_store()
+    with pytest.raises(ValueError, match=match):
+        store.ensure_payload_indexes("c", indexes)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("where", ["get", "create"])
+def test_indexes_refused_api_key_is_a_clear_error(status, where):
+    store, _ = index_store(**{where: http_error(status, SECRET.encode())})
+    with pytest.raises(QdrantAuthError) as info:
+        store.ensure_payload_indexes("c")
+    assert str(status) in str(info.value)
+    assert SECRET not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "error", [http_error(404), http_error(500), ConnectionError("refused"), TimeoutError("slow")]
+)
+def test_indexes_a_failed_read_of_the_collection_is_raised_and_nothing_is_created(error):
+    store, client = index_store(get=error)
+    with pytest.raises(type(error)) as info:
+        store.ensure_payload_indexes("c")
+    assert info.value is error
+    assert client.created() == []
+
+
+def test_indexes_a_failed_creation_is_raised_and_a_rerun_finishes_the_work():
+    error = http_error(500)
+    store, client = index_store(create=error, fail_on="language")
+    with pytest.raises(UnexpectedResponse) as info:
+        store.ensure_payload_indexes("c")
+    assert info.value is error
+    assert sorted(client.schema) == ["doc_id", "doc_type", "source_code"]  # created before it: kept
+    client._create = None
+    assert store.ensure_payload_indexes("c") == ["language", "corpus", "year", "date"]
+
+
+# --- local mode ---------------------------------------------------------------
+# Local mode accepts create_payload_index, warns that it has no effect, and reports no index
+# in the collection info: a second call cannot see the first one. What is checked here is that
+# nothing fails and nothing is lost; idempotence on a real engine is an integration test.
+LOCAL_INDEX_WARNING = "ignore:Payload indexes have no effect in the local Qdrant"
+
+ODD_DATES = {
+    1: {"date": "2016-03-10", "year": 2016, "source_code": "fr"},
+    2: {"date": "2016-03", "year": 2016, "source_code": "fr"},
+    3: {"date": "2016", "year": 2016, "source_code": "de"},
+    4: {"date": None, "year": None, "source_code": "de"},
+    5: {"source_code": "de"},
+    6: {"date": "2017-01-01", "year": 2017, "source_code": "fr"},
+}
+
+
+def odd_points() -> list[models.PointStruct]:
+    return [
+        models.PointStruct(id=i, vector=[1.0, 0.1 * i, 0.0, 0.0], payload=payload)
+        for i, payload in ODD_DATES.items()
+    ]
+
+
+def ids_matching(client, condition) -> list[int]:
+    found, _ = client.scroll("c", scroll_filter=models.Filter(must=[condition]), limit=100)
+    return sorted(point.id for point in found)
+
+
+@pytest.mark.filterwarnings(LOCAL_INDEX_WARNING)
+def test_local_mode_indexes_on_an_empty_collection(memory_store):
+    memory_store.ensure_collection("c", 4)
+    assert memory_store.ensure_payload_indexes("c") == INDEXED_FIELDS
+
+
+@pytest.mark.filterwarnings(LOCAL_INDEX_WARNING)
+def test_local_mode_indexes_on_a_collection_with_points_and_odd_dates(memory_store):
+    memory_store.ensure_collection("c", 4)
+    memory_store.upsert("c", odd_points())
+    assert memory_store.ensure_payload_indexes("c") == INDEXED_FIELDS
+    assert memory_store.count("c") == len(ODD_DATES)
+    client = memory_store.client
+    stored = {point.id: point.payload for point in client.retrieve("c", ids=list(ODD_DATES))}
+    assert stored == ODD_DATES  # no payload rewritten
+    # Odd dates are still accepted once the indexes are asked for.
+    assert memory_store.upsert("c", odd_points()) == len(ODD_DATES)
+
+
+@pytest.mark.filterwarnings(LOCAL_INDEX_WARNING)
+def test_local_mode_filters_on_the_indexed_fields(memory_store):
+    memory_store.ensure_collection("c", 4)
+    memory_store.upsert("c", odd_points())
+    memory_store.ensure_payload_indexes("c")
+    client = memory_store.client
+
+    def date_range(**bounds):
+        return models.FieldCondition(key="date", range=models.DatetimeRange(**bounds))
+
+    source = models.FieldCondition(key="source_code", match=models.MatchValue(value="fr"))
+    assert ids_matching(client, source) == [1, 2, 6]
+    year = models.FieldCondition(key="year", range=models.Range(gte=2016, lte=2016))
+    assert ids_matching(client, year) == [1, 2, 3]
+    # A date that is not a full date, a null date and a missing date never match a date range.
+    assert ids_matching(client, date_range(gte="2016-01-01", lte="2016-12-31")) == [1]
+    assert ids_matching(client, date_range(gte="2016-03-10", lte="2016-03-10")) == [1]  # bounds included
+    assert ids_matching(client, date_range(gt="2016-03-10")) == [6]
+    assert ids_matching(client, date_range(gte="1900-01-01")) == [1, 6]
+
+
+@pytest.mark.filterwarnings(LOCAL_INDEX_WARNING)
+def test_local_mode_indexes_on_a_missing_collection_raise_and_create_nothing(memory_store):
+    with pytest.raises(ValueError, match="not found"):
+        memory_store.ensure_payload_indexes("absent")
+    assert not memory_store.client.collection_exists("absent")

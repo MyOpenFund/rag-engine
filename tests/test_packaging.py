@@ -44,7 +44,7 @@ PUBLIC_NAMES = {
     "rag_engine": {"__version__"},
     "rag_engine.errors": {"RagEngineError"},
     "rag_engine.config": {"BACKENDS", "NO_PREFIX", "ConfigError", "Settings", "valid_ocr_languages"},
-    "rag_engine.schema": {"RESERVED_KEYS", "build_payload", "page_for_id", "point_id"},
+    "rag_engine.schema": {"PAYLOAD_INDEXES", "RESERVED_KEYS", "build_payload", "page_for_id", "point_id"},
     "rag_engine.store": {
         "AUTH_STATUSES",
         "DEFAULT_TIMEOUT",

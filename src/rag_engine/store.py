@@ -17,6 +17,7 @@ from qdrant_client import QdrantClient, models
 
 from rag_engine.config import Settings
 from rag_engine.errors import RagEngineError
+from rag_engine.schema import PAYLOAD_INDEXES
 
 __all__ = [
     "AUTH_STATUSES",
@@ -46,7 +47,11 @@ class QdrantAuthError(StoreError):
 
 
 class CollectionMismatchError(StoreError):
-    """An existing collection does not have the vector configuration the caller needs."""
+    """An existing collection is not what the caller needs.
+
+    Its vector configuration differs, or one of its payload fields is indexed with another
+    kind of index.
+    """
 
 
 def _raise_auth(exc: BaseException) -> None:
@@ -64,6 +69,29 @@ def _positive_int(name: str, value: object) -> int:
     if type(value) is not int or value < 1:  # a bool is an int subclass, and is not a count
         raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
     return value
+
+
+def _index_kinds(indexes: Iterable[Any]) -> list[tuple[str, models.PayloadSchemaType]]:
+    """``indexes`` as ``(field, kind)`` pairs with the kind as Qdrant's enum; ``ValueError`` otherwise."""
+    kinds = ", ".join(kind.value for kind in models.PayloadSchemaType)
+    wanted: list[tuple[str, models.PayloadSchemaType]] = []
+    seen: set[str] = set()
+    for entry in indexes:
+        if isinstance(entry, str) or not isinstance(entry, Iterable) or len(pair := tuple(entry)) != 2:
+            raise ValueError(f"a payload index must be a (field, kind) pair, got {entry!r}")
+        field, kind = pair
+        if not isinstance(field, str) or not field:
+            raise ValueError(f"the field of a payload index must be a non-empty string, got {field!r}")
+        if field in seen:
+            raise ValueError(f"payload field {field!r} is listed more than once")
+        seen.add(field)
+        try:
+            wanted.append((field, models.PayloadSchemaType(kind)))
+        except ValueError:
+            raise ValueError(
+                f"unknown kind of payload index for field {field!r}: {kind!r} (one of: {kinds})"
+            ) from None
+    return wanted
 
 
 def _port(value: object) -> int:
@@ -321,6 +349,77 @@ class QdrantStore:
             _raise_auth(exc)
             raise
         return len(batch)
+
+    def ensure_payload_indexes(self, collection: str, indexes: Iterable[Any] | None = None) -> list[str]:
+        """Create the payload indexes ``collection`` does not have yet; returns the fields indexed now.
+
+        ``indexes`` is a list of ``(field, kind)`` pairs, ``kind`` being the name of a Qdrant
+        payload index type (``"keyword"``, ``"integer"``, ``"datetime"``, ...) or the matching
+        ``models.PayloadSchemaType``; it defaults to :data:`rag_engine.schema.PAYLOAD_INDEXES`.
+        A list that is not made of such pairs, or that names a field twice, is a
+        ``ValueError`` raised before anything is sent.
+
+        * A field without an index: the index is created, and the call waits until Qdrant
+          has built it (``wait=True``), so it is usable when the method returns. The field is
+          in the returned list, in the order of ``indexes``.
+        * A field already indexed with the same kind: nothing is done, whatever the options
+          that index was created with. When every index exists the list is empty, so the
+          call can be repeated at will.
+        * A field indexed with another kind: :class:`CollectionMismatchError` naming the
+          field, the expected kind and the one found, raised before any index is created.
+          The existing index is never replaced nor deleted: asked to create it, Qdrant would
+          drop it and build the other kind without a word. Removing it is the operator's
+          decision.
+        * HTTP 401 or 403: :class:`QdrantAuthError`.
+        * A collection that does not exist, and any other error, is raised as the client
+          raised it; the collection is never created here. Indexes created before a failure
+          stay, and a second call creates the remaining ones.
+
+        Creating an index never rewrites a point, and works on a collection that already
+        holds points. A payload value the index cannot read (a ``date`` that is not a full
+        date, a null, a missing key) is not an error: the point is left out of that index.
+
+        The existing indexes are read once, before creating: two processes that call this
+        with different kinds for the same field at the same moment are not told apart.
+
+        qdrant-client's local mode keeps no payload index: it accepts the creation, warns
+        that it has no effect, and reports none afterwards, so there every call returns the
+        whole list.
+        """
+        wanted = _index_kinds(PAYLOAD_INDEXES if indexes is None else indexes)
+        try:
+            existing = self._client.get_collection(collection_name=collection).payload_schema or {}
+        except Exception as exc:
+            _raise_auth(exc)
+            raise
+        missing: list[tuple[str, models.PayloadSchemaType]] = []
+        mismatches: list[str] = []
+        for field, kind in wanted:
+            if field not in existing:
+                missing.append((field, kind))
+                continue
+            data_type = getattr(existing[field], "data_type", None)
+            found = getattr(data_type, "value", data_type)
+            if found != kind.value:
+                mismatches.append(f"field {field!r}: expected a {kind.value} index, found a {found} index")
+        if mismatches:
+            raise CollectionMismatchError(
+                f"collection {collection!r}: {'; '.join(mismatches)} (an existing index is never replaced)"
+            )
+        created: list[str] = []
+        for field, kind in missing:
+            logger.info(
+                "Creating %s payload index on %r in Qdrant collection %r", kind.value, field, collection
+            )
+            try:
+                self._client.create_payload_index(
+                    collection_name=collection, field_name=field, field_schema=kind, wait=True
+                )
+            except Exception as exc:
+                _raise_auth(exc)
+                raise
+            created.append(field)
+        return created
 
     def count(self, collection: str) -> int:
         """Exact number of points in ``collection``."""

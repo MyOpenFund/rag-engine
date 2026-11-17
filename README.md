@@ -30,7 +30,7 @@ The package root exposes only `__version__`. Everything else is imported from it
 | Module | Main names |
 |---|---|
 | `rag_engine.config` | `Settings`, `ConfigError`, `valid_ocr_languages` |
-| `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `RESERVED_KEYS` |
+| `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `RESERVED_KEYS`, `PAYLOAD_INDEXES` |
 | `rag_engine.store` | `QdrantStore`, `StoreError`, `QdrantAuthError`, `CollectionMismatchError` |
 | `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE` |
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
@@ -145,6 +145,33 @@ What it guarantees:
 `IngestResult.pages` counts the distinct pages chunks start on (0 for a format without pages). The other arguments are `ocr`, `ocr_languages` and `chunking_options` (see below), and `batch_size` (points per write; left out, the batch size of the store, which is `RAG_ENGINE_BATCH_SIZE` when the store was built from the settings). The batch size does not bound memory or the embedding call: all the chunk texts of a document are embedded in one `encode_passage` call.
 
 The points are the ones the previous pipeline wrote: `tests/fixtures/golden/` holds points captured from it for two documents, and the tests require the same ids, payloads and vectors.
+
+## Payload indexes
+
+Search filters need payload indexes: Qdrant answers a filter on an indexed field without reading every point. The engine indexes the fields listed in `rag_engine.schema.PAYLOAD_INDEXES`:
+
+| Field | Index | Filter it serves |
+|---|---|---|
+| `doc_id`, `source_code`, `doc_type`, `language`, `corpus` | keyword | exact match, one value or several |
+| `year` | integer | exact match and range |
+| `date` | datetime | range |
+
+`QdrantStore.ensure_payload_indexes` creates the ones a collection does not have yet and returns the fields it indexed:
+
+```python
+store = QdrantStore(settings=Settings.from_env())
+store.ensure_payload_indexes("central-bank-e5b-v1")
+# ['doc_id', 'source_code', 'doc_type', 'language', 'corpus', 'year', 'date'] the first time, [] afterwards
+```
+
+- **On an existing collection.** An index is built from the points already there; no point is rewritten, no document has to be ingested again. The call returns once every index is built and usable. Run it once per collection, before or after ingesting; running it again does nothing and returns `[]`.
+- **Never replaces an index.** If a field is already indexed with another kind (a keyword index on `date`, say), the call raises `CollectionMismatchError` naming the field, the expected kind and the one found, and creates nothing. Qdrant itself would drop the existing index and build the other one; removing an index stays a decision of the operator (`store.client.delete_payload_index`).
+- **Errors.** A refused API key is a `QdrantAuthError`. A collection that does not exist is not created: the error of the client is raised, like any other failure. Indexes created before a failure stay, and a second call creates the rest.
+- **Another list.** `ensure_payload_indexes(collection, [("page", "integer")])` takes any list of `(field, kind)`, a kind being the name of a Qdrant payload index type.
+
+**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. Qdrant reads a full date (`2016-03-10`, taken as midnight UTC) or a full date and time (`2016-03-10T12:00:00Z`). Every other value is stored untouched and is never an error, neither when the index is built nor when a point is written, but **it matches no date range**: an imprecise date (`2016-03`, `2016`), an empty string, a null, a missing `date`. A document without a precise date is therefore left out as soon as a date bound is set, with or without the index; it can still be reached through `year`, which is filtered on its own. The bounds of a range are full dates too: Qdrant refuses `2016` or `2016-03` as a bound.
+
+qdrant-client's local mode (`QdrantClient(":memory:")`) keeps no payload index: it accepts the creation with a warning and filters by reading every point, with the same answers.
 
 ## Supported formats and OCR
 
