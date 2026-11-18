@@ -21,6 +21,8 @@ from rag_engine.store import QdrantStore
 
 BATCH = Path(__file__).resolve().parent.parent / "eval" / "analytical_v2.jsonl"
 SPEC = ModelSpec(name="tiny", dim=8, passage_prefix="", query_prefix="")
+# The questions the corpus cannot answer: three of the first batch, then an-71 to an-82.
+ABSTAINING = ["an-25", "an-53", "an-64b", *(f"an-{number}" for number in range(71, 83))]
 
 
 @pytest.fixture(scope="module")
@@ -55,22 +57,29 @@ def report(questions):
 
 
 def test_what_the_batch_holds(questions):
-    assert len(questions) == 79
+    assert len(questions) == 91
     behaviors = Counter(question.expected_behavior for question in questions)
-    assert behaviors == {"answer": 72, "correct_premise": 4, "abstain": 3}
-    assert Counter(question.language for question in questions) == {"en": 71, "fr": 8}
-    assert Counter(question.kind for question in questions) == {"analytical": 74, "analytical+filters": 5}
+    assert behaviors == {"answer": 72, "correct_premise": 4, "abstain": 15}
+    assert Counter(question.language for question in questions) == {"en": 81, "fr": 10}
+    assert Counter(question.kind for question in questions) == {"analytical": 86, "analytical+filters": 5}
     assert all(question.essential_ids is not None for question in questions)
-    assert len({doc_id for question in questions for doc_id in question.expected_doc_ids}) == 412
+    assert len({doc_id for question in questions for doc_id in question.expected_doc_ids}) == 424
 
 
 def test_the_questions_that_abstain_list_context_documents_only(questions):
     abstaining = [question for question in questions if question.expected_behavior == "abstain"]
-    assert [question.id for question in abstaining] == ["an-25", "an-53", "an-64b"]
+    assert [question.id for question in abstaining] == ABSTAINING
     for question in abstaining:
         assert question.essential_ids == () and question.essential_any_of == ()
         assert question.acceptable_ids and question.must_include
         assert "out-of-corpus" in question.tags
+    # The twelve added later say where the true answer is, and which of the two absences they test.
+    added = [question for question in abstaining if question.id >= "an-71"]
+    assert len(added) == 12
+    for question in added:
+        assert "https://" in question.rationale and "True answer" in question.rationale, question.id
+        assert len({"absent-bank", "coverage-gap"} & set(question.tags)) == 1, question.id
+    assert sum(question.language == "fr" for question in added) == 2
     # A fact about a bank that is not in the corpus, reported by another bank's document, is an answer.
     indirect = [question for question in questions if "indirect-source" in question.tags]
     assert [question.id for question in indirect] == ["an-55", "an-57"]
@@ -123,7 +132,7 @@ def test_either_of_groups_of_the_batch(questions):
 
 def test_the_report_of_the_batch(report):
     assert len(report.results) == 76 and len(report.unfiltered_reruns) == 5
-    assert [entry.id for entry in report.abstentions] == ["an-25", "an-53", "an-64b"]
+    assert [entry.id for entry in report.abstentions] == ABSTAINING
     assert list(report.by_behavior) == ["answer", "correct_premise"]
     assert all(result.expected_behavior != "abstain" for result in report.searches)
     assert report.expected_beyond_k == 18 and report.essential_unreachable == 1
@@ -134,9 +143,9 @@ def test_the_report_of_the_batch(report):
     # Everything above the misses fits the width: the tables, their legends, the lists of ids.
     above = lines[: next(index for index, line in enumerate(lines) if line.startswith("Misses ("))]
     assert [line for line in above if len(line) > 110] == []
-    assert "and 3 questions that abstain (searched, not scored), 5 second runs without filters" in lines
+    assert "and 15 questions that abstain (searched, not scored), 5 second runs without filters" in lines
     assert any(line.startswith("  95% interval") for line in lines)  # the wide first table, laid out
-    assert "Abstention (3 questions whose expected behaviour is to abstain" in text
+    assert "Abstention (15 questions whose expected behaviour is to abstain" in text
     assert any(line.split()[:1] == ["an-64b"] and "/2" in line for line in lines)
     assert "More requirements than k=10 (1):\n  an-23: 12 requirements" in text
     (count,) = [line for line in lines if line.startswith("kind: analytical  ") and "(" in line]
