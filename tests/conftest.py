@@ -6,11 +6,20 @@
   the whole run, and put back when it ends; a test that needs one sets it itself. The few
   variables that are meant for the tests are named in ``KEPT_BY_MARKER`` and reach the tests
   of that marker only.
+* The test run sends no telemetry. The first statement of this file sets
+  ``ORT_DISABLE_TELEMETRY=1`` unless the variable is set already: the ONNX runtime reads it when
+  it is imported, and the test modules import ``qdrant_client`` (which loads the runtime when
+  ``fastembed`` is installed) before the engine has set its own default. The variable is not one
+  of the engine's settings, so the isolation above leaves it alone; the tests of
+  ``test_telemetry.py`` choose its value themselves, in processes of their own.
 """
 
 from __future__ import annotations
 
 import os
+
+# Before every other import: pytest and the helper modules below may load the runtime.
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
 
 import pytest
 from search_corpus import SEARCH_CASES

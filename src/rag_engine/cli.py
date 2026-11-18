@@ -6,6 +6,17 @@ collection on a question file (:mod:`rag_engine.eval`) and prints the report::
     rag-engine eval --questions eval/known_item_v1.jsonl --collection documents \\
         --k 10 --chunk-limit 50 --backend onnx --output report.json --fail-under-hit-at-k 0.9
 
+``rag-engine eval-check`` reads a question file and nothing else (:mod:`rag_engine.eval_check`):
+no setting, no server, no model. It prints what the file holds and, given the manifests of
+the corpus, the documents it names that are not in them::
+
+    rag-engine eval-check --questions eval/known_item_v1.jsonl \\
+        --manifests '/path/to/manifest/*.jsonl' --doc-types A1 A2 A3 B1 E1 F1 --mime application/pdf
+
+Exit codes of ``eval-check``: 0 when the file is valid and every document it names is in the
+manifests given (and in the scope given); 2 otherwise: a file that breaks a rule of the
+format, a document that is not found, a manifest that cannot be read.
+
 This module is the one place of the engine that reads the settings by itself: the Qdrant
 connection, the model and the search maximum come from the environment
 (:meth:`rag_engine.config.Settings.from_env`). A ``.env`` file is not read.
@@ -50,11 +61,13 @@ from .eval import (
     DEFAULT_BOOTSTRAP_RESAMPLES,
     DEFAULT_CHUNK_LIMIT,
     DEFAULT_K,
+    DEFAULT_SCORE_LEVELS,
     QuestionSet,
     evaluate,
     format_report,
     load_questions,
 )
+from .eval_check import check_questions, format_check, load_catalogue
 from .store import CollectionMismatchError, CollectionNotFoundError, QdrantStore
 
 __all__ = ["main"]
@@ -73,6 +86,16 @@ def _share(text: str) -> float:
         raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
     if math.isnan(value) or not 0.0 <= value <= 1.0:
         raise argparse.ArgumentTypeError(f"{text!r} is not between 0 and 1")
+    return value
+
+
+def _score(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite number")
     return value
 
 
@@ -102,7 +125,14 @@ def _parser() -> argparse.ArgumentParser:
         "--collection", required=True, metavar="NAME", help="the Qdrant collection to search"
     )
     evaluation.add_argument(
-        "--k", type=int, default=DEFAULT_K, help=f"documents the metrics look at (default {DEFAULT_K})"
+        "--k",
+        type=int,
+        default=DEFAULT_K,
+        help=(
+            f"documents the metrics look at (default {DEFAULT_K}; at most --chunk-limit). A question with "
+            "more requirements (essential documents and either-of groups) than this can never have them "
+            "all: raise it for such questions"
+        ),
     )
     evaluation.add_argument(
         "--chunk-limit",
@@ -138,11 +168,67 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     evaluation.add_argument(
+        "--score-levels",
+        type=_score,
+        nargs="+",
+        default=list(DEFAULT_SCORE_LEVELS),
+        metavar="X",
+        help=(
+            "scores the documents returned for a question that abstains are counted "
+            f"against (default {' '.join(f'{level:g}' for level in DEFAULT_SCORE_LEVELS)}); they are "
+            "reported, never used as a threshold"
+        ),
+    )
+    evaluation.add_argument(
         "--allow-empty",
         action="store_true",
         help=(
             "run even when the collection holds none of the expected documents (nothing is scored); "
             "without it this is an error, exit code 2"
+        ),
+    )
+    check = commands.add_parser(
+        "eval-check",
+        help="check a question file, without any collection",
+        description=(
+            "Read a JSON Lines question file, check it against the rules of the format and print what "
+            "it holds: the questions per kind, tag, expected behaviour and language, how many carry "
+            "filters, how many documents they expect, the texts used twice. With --manifests, every "
+            "document a question names is looked up in the catalogue. Nothing is searched: no Qdrant, "
+            "no model, no setting. Exit code: 0, or 2 when the file is not valid or names a document "
+            "that is not in the catalogue (or not in the scope given)."
+        ),
+    )
+    check.add_argument("--questions", required=True, metavar="FILE", help="the question file (JSON Lines)")
+    check.add_argument(
+        "--manifests",
+        nargs="+",
+        metavar="GLOB",
+        help=(
+            "catalogue of the corpus: JSON Lines files (paths or glob patterns) with one document per "
+            "line, its doc_id, mime_type and doc_type"
+        ),
+    )
+    check.add_argument(
+        "--doc-types",
+        nargs="+",
+        metavar="TYPE",
+        help="with --manifests: the doc types that were ingested; a document of another type is reported",
+    )
+    check.add_argument(
+        "--mime",
+        nargs="+",
+        metavar="TYPE",
+        help="with --manifests: the MIME types that were ingested; a document of another one is reported",
+    )
+    check.add_argument(
+        "--k",
+        type=int,
+        default=DEFAULT_K,
+        help=(
+            "documents the evaluation will look at "
+            f"(default {DEFAULT_K}): the questions with more requirements, or more expected documents, "
+            "are listed"
         ),
     )
     return parser
@@ -204,7 +290,16 @@ def _dimensions(collection: str, size: int, model: str) -> str:
 
 def _check_documents(store: Any, collection: str, questions: QuestionSet, allow_empty: bool) -> None:
     """Refuse a collection that holds none of the expected documents, unless ``allow_empty``."""
-    wanted = sorted({doc_id for question in questions for doc_id in question.expected_doc_ids})
+    wanted = sorted(
+        {
+            doc_id
+            for question in questions
+            if question.expected_behavior != "abstain"  # its documents are context: nothing to score
+            for doc_id in question.expected_doc_ids
+        }
+    )
+    if not wanted:  # every question abstains: there is no document to find, and nothing to score
+        return
     if store.existing_doc_ids(collection, wanted):
         return
     message = (
@@ -255,6 +350,7 @@ def _evaluate(arguments: argparse.Namespace) -> int:
                 chunk_limit=arguments.chunk_limit,
                 max_limit=settings.search_max_limit,
                 bootstrap_resamples=arguments.bootstrap_resamples,
+                score_levels=arguments.score_levels,
             )
         except RagEngineError:
             raise
@@ -287,6 +383,30 @@ def _evaluate(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _check(arguments: argparse.Namespace) -> int:
+    if arguments.k < 1:
+        raise _Refused(f"--k must be at least 1, got {arguments.k}")
+    if arguments.manifests is None and (arguments.doc_types is not None or arguments.mime is not None):
+        raise _Refused("--doc-types and --mime narrow the catalogue: they need --manifests")
+    questions = load_questions(arguments.questions)
+    catalogue = None if arguments.manifests is None else load_catalogue(arguments.manifests)
+    check = check_questions(
+        questions,
+        catalogue=catalogue,
+        doc_types=arguments.doc_types,
+        mime_types=arguments.mime,
+        k=arguments.k,
+    )
+    print(format_check(check, name=questions.path, sha256=questions.sha256))
+    if check.ok:
+        return 0
+    found = len(check.missing) + len(check.out_of_scope)
+    raise _Refused(
+        f"{found} document{'' if found == 1 else 's'} named by {arguments.questions} "
+        f"{'is' if found == 1 else 'are'} not in the catalogue or not in the scope (listed above)"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command with ``argv`` (default: the arguments of the process); returns the exit code.
 
@@ -300,9 +420,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return exit_.code if isinstance(exit_.code, int) else 2
     if arguments.command is None:
         parser.print_usage(sys.stderr)
-        print(f"{PROGRAM}: error: a command is required (eval)", file=sys.stderr)
+        print(f"{PROGRAM}: error: a command is required (eval, eval-check)", file=sys.stderr)
         return 2
     try:
+        if arguments.command == "eval-check":
+            return _check(arguments)
         return _evaluate(arguments)
     except (_Refused, RagEngineError, OSError, ImportError) as exc:
         print(f"{PROGRAM}: error: {exc}", file=sys.stderr)

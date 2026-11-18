@@ -557,6 +557,22 @@ def _pinned_model(name: str) -> OnnxModel | None:
     return None
 
 
+def _keep_the_runtime_quiet() -> None:
+    """Set ``ORT_DISABLE_TELEMETRY=1`` unless the variable is set already.
+
+    The ONNX runtime sends telemetry to its publisher by default (official builds, version
+    1.32 measured): importing it creates a device identifier and an event store under
+    ``~/.cache/Microsoft/DeveloperTools/.onnxruntime`` and starts an uploader that connects
+    to ``mobile.events.data.microsoft.com``. It reads the variable **when it is imported**,
+    not when a session is created, so the default is set by ``rag_engine/__init__.py``, before
+    any module of the engine can import the runtime; it is set again here, right before the
+    backend imports fastembed, for a process that removed it in between. ``setdefault``: a
+    value the user gave, ``0`` included, is kept. A process that imported ``onnxruntime``,
+    ``fastembed`` or ``qdrant_client`` before ``rag_engine`` decided for itself.
+    """
+    os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+
+
 def _onnx_cache_dir(cache_dir: str | os.PathLike[str] | None) -> str:
     """The model directory: ``cache_dir``, else the default of fastembed."""
     if cache_dir is not None:
@@ -769,6 +785,7 @@ class OnnxEmbedder(BaseEmbedder):
             raise ValueError(
                 f"OnnxEmbedder: threads must be None or an integer of at least 1, got {threads!r}"
             )
+        _keep_the_runtime_quiet()  # before fastembed, which imports the ONNX runtime
         try:
             from fastembed import TextEmbedding
         except ImportError as exc:

@@ -11,10 +11,13 @@ import datetime
 from dataclasses import dataclass, field
 from typing import Any
 
-from qdrant_client import models
-
+# The engine first: importing it sets the default that keeps the ONNX runtime quiet, and
+# qdrant-client loads that runtime when fastembed is installed.
 from rag_engine.embedding import FakeEmbedder, ModelSpec
 from rag_engine.schema import build_payload, page_for_id, point_id
+
+# isort: split
+from qdrant_client import models
 
 SEARCH_SPEC = ModelSpec(name="fake", dim=8, passage_prefix="passage: ", query_prefix="query: ")
 SEARCH_WHEN = "2026-11-17T10:00:00"
