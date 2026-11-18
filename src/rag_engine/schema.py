@@ -252,8 +252,10 @@ def date_interval_fields(date: object, date_precision: object = None) -> dict[st
     """:func:`date_interval` as the two payload keys, for ``QdrantStore.set_payload``.
 
     Always both keys of :data:`DERIVED_KEYS`. Without a readable date their values are
-    ``None``: written to a point, a null is to every date filter what a missing key is, so a
-    document whose date was withdrawn loses its interval in the same write.
+    ``None``: given to ``set_payload``, a null removes the key from the points (and a stored
+    null would be, to every date filter, what a missing key is), so a document whose date
+    was withdrawn loses its interval in the same write, and a document that never had a date
+    is left as it is.
     """
     start, end = date_interval(date, date_precision) or (None, None)
     return {"date_start": start, "date_end": end}

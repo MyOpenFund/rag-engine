@@ -1711,12 +1711,12 @@ def test_set_payload_keeps_the_keys_it_is_not_given_and_adds_new_ones(payload_st
     }
 
 
-def test_set_payload_writes_a_null_as_a_null(payload_store):
+def test_set_payload_with_a_null_leaves_no_value_under_the_key(payload_store):
     fields = {"date": None, "year": None, **date_interval_fields(None)}
     assert fields == {"date": None, "year": None, "date_start": None, "date_end": None}
     assert payload_store.set_payload("c", "c", fields) == 1
     (record,) = [r for r in stored(payload_store).values() if r.payload["doc_id"] == "c"]
-    # A real server stores the nulls (an integration test pins it); local mode may drop the keys.
+    # Qdrant drops a key set to null (an integration test pins it on a real server).
     for key in fields:
         assert record.payload.get(key) is None
     assert record.payload["title"] == "Document c"

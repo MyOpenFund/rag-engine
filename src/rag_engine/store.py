@@ -697,9 +697,11 @@ class QdrantStore:
         point whose payload field ``doc_id`` is exactly ``doc_id`` gets each key of
         ``fields`` with its value, added or replaced. **Nothing else moves**: the other keys
         of the payload stay, the vectors are not sent, read or rewritten, the ids do not
-        change, and no point is created. A value of ``None`` is written as a null, which a
-        filter reads as it reads a missing key. The call waits until Qdrant has applied the
-        write (``wait=True``); repeating it changes nothing more.
+        change, and no point is created. **A value of** ``None`` **removes the key**: Qdrant
+        merges ``fields`` into the payload and drops a key set to null (checked on Qdrant
+        1.20; a null left in a payload would be read by every filter as a missing key
+        anyway). The call waits until Qdrant has applied the write (``wait=True``);
+        repeating it changes nothing more.
 
         It returns the number of points of the document, counted exactly just before the
         write. **A document without any point is not an error**: the answer is 0 and nothing
