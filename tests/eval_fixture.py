@@ -15,10 +15,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-from qdrant_client import models
-
+# The engine first: importing it sets the default that keeps the ONNX runtime quiet, and
+# qdrant-client loads that runtime when fastembed is installed.
 from rag_engine.embedding import FakeEmbedder, ModelSpec
 from rag_engine.schema import build_payload, page_for_id, point_id
+
+# isort: split
+from qdrant_client import models
 
 FIXTURES = Path(__file__).resolve().parent.parent / "eval" / "fixtures"
 CORPUS = FIXTURES / "corpus.json"

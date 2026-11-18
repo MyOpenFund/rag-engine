@@ -5,6 +5,10 @@ on:
   pull_request:
 permissions:
   contents: read
+# For every job: the ONNX runtime sends telemetry unless this is 1 when it is imported, and a
+# test module may import it (through qdrant-client and fastembed) before the engine sets its default.
+env:
+  ORT_DISABLE_TELEMETRY: "1"
 jobs:
   tests:
     runs-on: ubuntu-latest

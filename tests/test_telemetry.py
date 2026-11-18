@@ -9,6 +9,7 @@ before any of its modules can import the runtime (``rag_engine.store`` does, thr
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import subprocess
@@ -69,6 +70,64 @@ def test_the_default_is_set_without_importing_anything_heavy(tmp_path):
         tmp_path,
     )
     assert loaded == "[]"
+
+
+WARNED = (
+    "import sys, warnings\n"
+    "with warnings.catch_warnings(record=True) as caught:\n"
+    "    warnings.simplefilter('always')\n"
+    "    {imports}\n"
+    "ours = [w for w in caught if 'ORT_DISABLE_TELEMETRY' in str(w.message)]\n"
+    "print([(w.category.__name__, str(w.message)) for w in ours])\n"
+    "print(sorted(name for name in ('fastembed', 'qdrant_client', 'numpy', 'torch') if name in sys.modules))"
+)
+
+
+def stub_runtime(tmp_path: Path) -> dict[str, str]:
+    """A module named ``onnxruntime`` that does nothing, first on the path: no real runtime is needed."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "onnxruntime.py").write_text("", encoding="utf-8")
+    return {"PYTHONPATH": str(stub)}
+
+
+def test_the_package_warns_when_the_runtime_was_imported_first(tmp_path):
+    path = stub_runtime(tmp_path)
+    shown, loaded = run(
+        WARNED.format(imports="import onnxruntime, rag_engine"), tmp_path, **path
+    ).splitlines()
+    ((category, message),) = ast.literal_eval(shown)
+    assert category == "RuntimeWarning"
+    assert "onnxruntime was imported before rag_engine" in message and "telemetry is on" in message
+    assert "Export ORT_DISABLE_TELEMETRY=1 before starting the process" in message
+    assert "import rag_engine before" in message
+    assert loaded == "[]"  # found out from sys.modules: nothing heavy was imported to check
+    # Once: importing the package again, or one of its modules, says nothing more.
+    again = "import onnxruntime, rag_engine, rag_engine.config; import rag_engine"
+    assert len(ast.literal_eval(run(WARNED.format(imports=again), tmp_path, **path).splitlines()[0])) == 1
+    # The default is set all the same, for whatever reads the variable later.
+    assert (
+        run(
+            f"import warnings; warnings.simplefilter('ignore'); import onnxruntime, rag_engine; {SHOW}",
+            tmp_path,
+            **path,
+        )
+        == "1"
+    )
+
+
+def test_the_package_does_not_warn_in_the_normal_order(tmp_path):
+    path = stub_runtime(tmp_path)
+    shown = run(WARNED.format(imports="import rag_engine, onnxruntime"), tmp_path, **path)
+    assert shown.splitlines()[0] == "[]"
+    assert run(WARNED.format(imports="import rag_engine"), tmp_path).splitlines()[0] == "[]"
+
+
+@pytest.mark.parametrize("value", ["1", "0", ""])
+def test_the_package_does_not_warn_when_the_user_set_the_variable(tmp_path, value):
+    path = stub_runtime(tmp_path)
+    code = WARNED.format(imports="import onnxruntime, rag_engine")
+    assert run(code, tmp_path, **path, **{VARIABLE: value}).splitlines()[0] == "[]"
 
 
 def test_the_onnx_backend_sets_the_default_before_its_own_imports(monkeypatch):
