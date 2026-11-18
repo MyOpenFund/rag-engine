@@ -25,7 +25,7 @@ from qdrant_client import QdrantClient, models
 
 from rag_engine.config import Settings
 from rag_engine.errors import RagEngineError
-from rag_engine.schema import DERIVED_KEYS, PAYLOAD_INDEXES, RESERVED_KEYS
+from rag_engine.schema import DATE_KEYS, DERIVED_KEYS, PAYLOAD_INDEXES, RESERVED_KEYS, date_interval_fields
 
 __all__ = [
     "AUTH_STATUSES",
@@ -34,6 +34,7 @@ __all__ = [
     "DISTANCE",
     "CollectionMismatchError",
     "CollectionNotFoundError",
+    "DateFieldsError",
     "QdrantAuthError",
     "QdrantStore",
     "ReservedKeyError",
@@ -82,6 +83,43 @@ class ReservedKeyError(StoreError, ValueError):
     ingestion it comes from: they change by ingesting the document again, never by a payload
     update. A ``ValueError`` as well, like every other bad argument of the store.
     """
+
+
+class DateFieldsError(StoreError, ValueError):
+    """:meth:`QdrantStore.set_payload` was given date keys that do not come together or do not agree.
+
+    ``date``, ``date_precision``, ``date_start`` and ``date_end``
+    (:data:`rag_engine.schema.DATE_KEYS`) are all read by a search. Written apart, they leave
+    a document found under a date it no longer has: a new ``date`` with the old interval, a
+    new interval with the old ``date``, a withdrawn date whose interval stays. A call that
+    sets one of them must set the four, as :func:`rag_engine.schema.date_fields` builds
+    them. A ``ValueError`` as well, like every other bad argument of the store.
+    """
+
+
+def _check_date_fields(doc_id: str, fields: Mapping[str, Any]) -> None:
+    """Refuse date keys that are not the four of ``date_fields``, consistent with each other."""
+    given = [key for key in DATE_KEYS if key in fields]
+    if not given:
+        return
+    remedy = (
+        "build the four keys with rag_engine.schema.date_fields(date, date_precision) and pass "
+        "them together: a search reads all of them"
+    )
+    missing = [key for key in DATE_KEYS if key not in fields]
+    if missing:
+        raise DateFieldsError(
+            f"set_payload was asked to set {', '.join(given)} without {', '.join(missing)} "
+            f"(document {doc_id!r}): the points would keep values that no longer agree; {remedy}"
+        )
+    expected = date_interval_fields(fields["date"], fields["date_precision"])
+    wrong = [key for key in DERIVED_KEYS if fields[key] != expected[key]]
+    if wrong:
+        raise DateFieldsError(
+            f"set_payload was given {', '.join(wrong)} that are not the interval of the date "
+            f"{fields['date']!r} with the precision {fields['date_precision']!r} (document {doc_id!r}; "
+            f"expected {', '.join(f'{key}={expected[key]!r}' for key in wrong)}); {remedy}"
+        )
 
 
 def _raise_auth(exc: BaseException) -> None:
@@ -707,21 +745,29 @@ class QdrantStore:
         write. **A document without any point is not an error**: the answer is 0 and nothing
         is written.
 
-        A date is corrected together with its interval. The search reads ``date_start`` and
-        ``date_end`` (:mod:`rag_engine.search`), which the engine derived from ``date`` and
-        ``date_precision`` when the document was ingested; this method does not derive them
-        again, since it is given only the keys to change. The caller adds them, with the
-        function the ingestion uses::
+        **A date is changed with** :func:`rag_engine.schema.date_fields`, and in no other
+        way. A search reads four keys: ``date``, ``date_precision`` and the interval the
+        engine derived from them at ingestion, ``date_start`` and ``date_end``. This method
+        is given the keys to change, not the payload, so it cannot derive the interval
+        again; it checks instead that a call which sets one of the four sets them all, and
+        that the interval is the one of the date and the precision of the same call::
 
-            from rag_engine.schema import date_interval_fields
+            from rag_engine.schema import date_fields
 
             store.set_payload(collection, doc_id, {
-                "date": "2016-07-01", "date_precision": "month", "date_kind": "meeting",
-                **date_interval_fields("2016-07-01", "month"),
+                **date_fields("2016-07-01", "month", year=2016), "date_kind": "meeting",
             })
 
-        The same call gives their interval to the points written before payload schema v2,
-        whose ``date`` is already right.
+        ``date_fields(None)`` withdraws the date: the four keys are removed and the document
+        is undated. The same call, with the date and the precision the source already has,
+        gives their interval to the points written before payload schema v2. ``year`` is
+        not derived and not checked: left out, the points keep theirs.
+
+        **Not while the same document is being ingested.** The count and the write are two
+        requests, and an ingestion writes whole payloads: points of the document written
+        between the two are counted or not (the returned number may be too low), and a batch
+        of an ingestion that started earlier and lands after this write puts the old
+        metadata back on its points. Correct a document when no ingestion of it runs.
 
         Refused, before anything is sent:
 
@@ -729,6 +775,11 @@ class QdrantStore:
           ``chunk_number``, ``ingestion_date``, ``text``, ``page``), whatever its value:
           :class:`ReservedKeyError` naming every such key. They say which chunk a point is
           and where it comes from; only a new ingestion changes them;
+        * one of ``date``, ``date_precision``, ``date_start``, ``date_end`` without the three
+          others, or an interval that is not
+          ``date_interval_fields(fields["date"], fields["date_precision"])``:
+          :class:`DateFieldsError`, which names what is missing or wrong and
+          ``date_fields``;
         * a ``doc_id`` that is not a non-empty string, a ``fields`` that is not a mapping, an
           empty one, a key that is not a non-empty string: ``ValueError``.
 
@@ -756,6 +807,7 @@ class QdrantStore:
                 f"set_payload may not set reserved payload key(s): {', '.join(reserved)} "
                 f"(document {doc_id!r}): they change by ingesting the document again"
             )
+        _check_date_fields(doc_id, fields)
         selector = models.Filter(
             must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))]
         )

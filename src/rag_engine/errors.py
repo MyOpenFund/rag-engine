@@ -5,7 +5,8 @@
 subclasses (:class:`~rag_engine.store.QdrantAuthError`,
 :class:`~rag_engine.store.CollectionMismatchError`,
 :class:`~rag_engine.store.CollectionNotFoundError`,
-:class:`~rag_engine.store.ReservedKeyError`),
+:class:`~rag_engine.store.ReservedKeyError`,
+:class:`~rag_engine.store.DateFieldsError`),
 :class:`rag_engine.chunking.UnsupportedFormatError`,
 :class:`rag_engine.search.SearchError`, :class:`rag_engine.eval.EvalError`,
 :class:`rag_engine.embedding.ModelIntegrityError` and

@@ -25,10 +25,11 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 import rag_engine.store as store_mod
 from rag_engine.config import Settings
 from rag_engine.errors import RagEngineError
-from rag_engine.schema import PAYLOAD_INDEXES, RESERVED_KEYS, date_interval_fields
+from rag_engine.schema import PAYLOAD_INDEXES, RESERVED_KEYS, date_fields, date_interval_fields
 from rag_engine.store import (
     CollectionMismatchError,
     CollectionNotFoundError,
+    DateFieldsError,
     QdrantAuthError,
     QdrantStore,
     ReservedKeyError,
@@ -1672,7 +1673,7 @@ def payload_store(memory_store):
 
 def test_set_payload_sets_the_keys_on_every_point_of_the_document_and_on_no_other(payload_store):
     before = stored(payload_store)
-    fields = {"date": "2016-07-01", "date_precision": "month", **date_interval_fields("2016-07-01", "month")}
+    fields = date_fields("2016-07-01", "month")
 
     assert payload_store.set_payload("c", "a", fields) == 3
 
@@ -1712,8 +1713,14 @@ def test_set_payload_keeps_the_keys_it_is_not_given_and_adds_new_ones(payload_st
 
 
 def test_set_payload_with_a_null_leaves_no_value_under_the_key(payload_store):
-    fields = {"date": None, "year": None, **date_interval_fields(None)}
-    assert fields == {"date": None, "year": None, "date_start": None, "date_end": None}
+    fields = date_fields(None, year=None)
+    assert fields == {
+        "date": None,
+        "date_precision": None,
+        "date_start": None,
+        "date_end": None,
+        "year": None,
+    }
     assert payload_store.set_payload("c", "c", fields) == 1
     (record,) = [r for r in stored(payload_store).values() if r.payload["doc_id"] == "c"]
     # Qdrant drops a key set to null (an integration test pins it on a real server).
@@ -1759,7 +1766,7 @@ class PayloadClient:
 
 def test_set_payload_counts_exactly_then_writes_once_through_a_filter_on_doc_id_and_waits():
     client = PayloadClient(points=7)
-    fields = {"date": "2016-07-01", "date_precision": "month"}
+    fields = {"title": "A title", "date_kind": "meeting"}
     assert QdrantStore(client=client).set_payload("col", "doc-1", fields) == 7
     selector = models.Filter(
         must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value="doc-1"))]
@@ -1769,7 +1776,7 @@ def test_set_payload_counts_exactly_then_writes_once_through_a_filter_on_doc_id_
         ("set_payload", {"collection_name": "col", "payload": fields, "points": selector, "wait": True}),
     ]
     assert client.calls[1][1]["payload"] is not fields  # a copy: the caller's mapping is not handed over
-    assert fields == {"date": "2016-07-01", "date_precision": "month"}
+    assert fields == {"title": "A title", "date_kind": "meeting"}
 
 
 def test_set_payload_sends_no_write_for_a_document_without_points():
@@ -1799,8 +1806,8 @@ def test_set_payload_names_every_reserved_key_and_accepts_the_derived_and_date_k
     # Even the document's own doc_id: nothing to gain, and a typo would move the points.
     with pytest.raises(ReservedKeyError):
         store.set_payload("col", "doc-1", {"doc_id": "doc-1"})
-    fields = {"date": "2016-01-01", "year": 2016, "date_precision": "year", "date_kind": "period"}
-    assert store.set_payload("col", "doc-1", {**fields, **date_interval_fields("2016-01-01", "year")}) == 2
+    fields = {**date_fields("2016-01-01", "year", year=2016), "date_kind": "period"}
+    assert store.set_payload("col", "doc-1", fields) == 2
 
 
 @pytest.mark.parametrize(
@@ -1852,3 +1859,83 @@ def test_set_payload_on_a_missing_collection_raises_and_creates_nothing(memory_s
     with pytest.raises(ValueError, match="missing"):
         memory_store.set_payload("missing", "a", {"title": "x"})
     assert not memory_store.client.collection_exists("missing")
+
+
+# --- set_payload: the four date keys go together --------------------------------------
+JULY = date_fields("2016-07-01", "month")
+
+DATE_MISUSES = [
+    # A date or a precision without the interval: the stored interval would go stale.
+    ({"date": "2016-07-01"}, "without date_precision, date_start, date_end"),
+    ({"date": "2016-07-01", "date_precision": "month"}, "without date_start, date_end"),
+    ({"date_precision": "month"}, "without date, date_start, date_end"),
+    ({"date": None}, "without date_precision, date_start, date_end"),  # the old interval would stay
+    # The interval alone: the stored date would still pass by itself.
+    (date_interval_fields("2016-07-01", "month"), "without date, date_precision"),
+    ({"date_start": "2016-07-01T00:00:00Z"}, "without date, date_precision, date_end"),
+    ({"date_end": None}, "without date, date_precision, date_start"),
+    # A precision change without the date, and a date without its precision.
+    ({"date_precision": "year", **date_interval_fields("2016-01-01", "year")}, "without date"),
+    ({"date": "2016-07-01", **date_interval_fields("2016-07-01")}, "without date_precision"),
+    # The four keys, but an interval that is not the one of the date and the precision.
+    ({**JULY, "date_end": "2016-07-01T00:00:00Z"}, "date_end"),
+    ({**JULY, "date_start": "2016-01-01T00:00:00Z"}, "date_start"),
+    ({**JULY, "date_precision": "year"}, "date_start, date_end"),
+    ({**JULY, "date": "2016-08-01"}, "date_start, date_end"),
+    ({**JULY, "date_start": None, "date_end": None}, "date_start, date_end"),
+    ({**JULY, "date": None}, "date_start, date_end"),  # no date, and an interval all the same
+    ({**JULY, "date": "2016-07"}, "date_start, date_end"),  # an unreadable date has no interval
+    ({**JULY, "date_end": "2016-07-31"}, "date_end"),  # not the stored form
+]
+
+
+@pytest.mark.parametrize(
+    ("fields", "named"), DATE_MISUSES, ids=[repr(sorted(f)) + n for f, n in DATE_MISUSES]
+)
+def test_set_payload_refuses_date_keys_that_do_not_come_together_and_agree(fields, named):
+    client = PayloadClient()
+    with pytest.raises(DateFieldsError, match="date_fields") as raised:
+        QdrantStore(client=client).set_payload("col", "doc-1", {"title": "kept out of it", **fields})
+    assert named in str(raised.value) and "'doc-1'" in str(raised.value)
+    assert isinstance(raised.value, StoreError) and isinstance(raised.value, ValueError)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        date_fields("2016-07-01", "month"),
+        date_fields("2016-07-01", "month", year=2016),
+        date_fields("2016-07-01"),
+        date_fields("2016-01-01", "year"),
+        date_fields("2016-03-11T00:30:00+02:00", "day"),
+        date_fields("2016-07-01", "fortnight"),  # an unknown precision: a day, and kept as given
+        date_fields(None),  # the document becomes undated
+        date_fields(None, "month", year=None),
+        date_fields("2016-03", "month"),  # an unreadable date: no interval
+        {**date_fields("2016-07-01", "month"), "date_kind": "meeting", "title": "Minutes"},
+        {"date_kind": "meeting", "year": 2016, "title": "Minutes"},  # no date key: nothing to check
+    ],
+    ids=repr,
+)
+def test_set_payload_accepts_what_date_fields_builds(fields):
+    client = PayloadClient()
+    assert QdrantStore(client=client).set_payload("col", "doc-1", fields) == 2
+    assert client.calls[1][1]["payload"] == fields
+
+
+def test_clearing_a_date_removes_the_interval_and_leaves_the_rest(payload_store):
+    assert payload_store.set_payload("c", "a", date_fields("2016-07-01", "month", year=2016)) == 3
+    assert payload_store.set_payload("c", "a", date_fields(None, year=None)) == 3
+    for record in stored(payload_store).values():
+        if record.payload["doc_id"] == "a":
+            for key in ("date", "date_precision", "date_start", "date_end", "year"):
+                assert record.payload.get(key) is None
+            assert record.payload["title"] == "Document a"
+        else:
+            assert record.payload["date"] == "2016-01-01"
+
+
+def test_a_reserved_key_is_named_before_the_date_keys_are_looked_at():
+    with pytest.raises(ReservedKeyError):
+        QdrantStore(client=PayloadClient()).set_payload("col", "d", {"text": "t", "date": "2016-07-01"})

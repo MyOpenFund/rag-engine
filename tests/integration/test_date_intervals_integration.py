@@ -41,9 +41,9 @@ from date_corpus import (
 
 from rag_engine.config import Settings
 from rag_engine.embedding import FakeEmbedder
-from rag_engine.schema import DERIVED_KEYS, PAYLOAD_INDEXES, date_interval_fields
+from rag_engine.schema import DATE_KEYS, DERIVED_KEYS, PAYLOAD_INDEXES, date_fields, date_interval_fields
 from rag_engine.search import SearchFilters, search
-from rag_engine.store import QdrantStore, ReservedKeyError
+from rag_engine.store import DateFieldsError, QdrantStore, ReservedKeyError
 
 QDRANT_URL = os.environ.get("RAG_ENGINE_IT_QDRANT_URL", "").strip()
 
@@ -293,19 +293,14 @@ def upgrade(store, collection: str, documents) -> int:
     written = 0
     for document in documents:
         metadata = document.metadata
-        fields = date_interval_fields(metadata.get("date"), metadata.get("date_precision"))
+        fields = date_fields(metadata.get("date"), metadata.get("date_precision"))
         written += store.set_payload(collection, document.doc_id, fields)
     return written
 
 
 def test_set_payload_touches_the_payload_of_one_document_and_no_vector(store, production):
     before = snapshot(store, production)
-    fields = {
-        "date": "2016-07-01",
-        "date_precision": "month",
-        "date_kind": "period",
-        **date_interval_fields("2016-07-01", "month"),
-    }
+    fields = {**date_fields("2016-07-01", "month"), "date_kind": "period"}
 
     assert store.set_payload(production, "day-stated", fields) == 1
     assert store.set_payload(production, "no-such-document", fields) == 0
@@ -337,21 +332,94 @@ def test_set_payload_touches_the_payload_of_one_document_and_no_vector(store, pr
 
 def test_a_null_given_to_set_payload_removes_the_key(store, production):
     before = snapshot(store, production)
-    assert store.set_payload(production, "day-stated", date_interval_fields("2016-03-10", "day")) == 1
-    fields = {"date": None, **date_interval_fields(None)}
-    assert fields == {"date": None, "date_start": None, "date_end": None}
-    assert store.set_payload(production, "day-stated", fields) == 1
+    assert store.set_payload(production, "day-stated", date_fields("2016-03-10", "day")) == 1
+    assert store.set_payload(production, "day-stated", date_fields(None)) == 1
     after = snapshot(store, production)
     (point,) = [point for point, (payload, _vector) in after.items() if payload["doc_id"] == "day-stated"]
     # Qdrant 1.20 merges the payload and drops a key set to null: the document has no date any more.
-    assert after[point][0] == {key: value for key, value in before[point][0].items() if key != "date"}
+    assert after[point][0] == {key: value for key, value in before[point][0].items() if key not in DATE_KEYS}
     assert vector_bytes(after) == vector_bytes(before)
-    for mode in ("legacy", "interval"):
-        kwargs = {"date_filter_mode": mode}
-        assert "day-stated" not in found(store, production, "0001-01-01", "9999-12-31", **kwargs)
-        assert "day-stated" in found(
-            store, production, "2016-03-10", "2016-03-10", include_undated=True, **kwargs
-        )
+
+
+@pytest.fixture
+def upgraded(store):
+    """A collection of schema v2 with every index: the production collection after its upgrade."""
+    name = create(store, "v2", PAYLOAD_INDEXES)
+    yield name
+    store.client.delete_collection(collection_name=name)
+
+
+MODES = ("auto", "interval", "legacy")
+JANUARY = ("2016-01-01", "2016-01-31")
+JULY = ("2016-07-01", "2016-07-31")
+
+
+def finds(store, collection, doc_id, date_range, **kwargs) -> dict[str, bool]:
+    """Whether ``doc_id`` comes back for ``date_range``, per filter mode."""
+    return {
+        mode: doc_id in found(store, collection, *date_range, date_filter_mode=mode, **kwargs)
+        for mode in MODES
+    }
+
+
+def everywhere(answer: bool) -> dict[str, bool]:
+    return dict.fromkeys(MODES, answer)
+
+
+def test_a_placeholder_date_is_corrected_to_the_real_one_in_every_mode(store, upgraded):
+    doc = "day-stated"
+    # The document as a producer first dated it: 1 January, a placeholder for "2016".
+    assert store.set_payload(upgraded, doc, date_fields("2016-01-01", "day", year=2016)) == 1
+    assert finds(store, upgraded, doc, JANUARY) == everywhere(True)
+    assert finds(store, upgraded, doc, JULY) == everywhere(False)
+    vectors = vector_bytes(snapshot(store, upgraded))
+
+    # Its real date is 13 July.
+    assert store.set_payload(upgraded, doc, date_fields("2016-07-13", "day", year=2016)) == 1
+    assert finds(store, upgraded, doc, JANUARY) == everywhere(False)
+    assert finds(store, upgraded, doc, JULY) == everywhere(True)
+    assert finds(store, upgraded, doc, ("2016-07-13", "2016-07-13")) == everywhere(True)
+    assert finds(store, upgraded, doc, ("2016-07-14", "2016-07-14")) == everywhere(False)
+
+    # Or it is known to the month only: July, wherever in July the range falls.
+    assert store.set_payload(upgraded, doc, date_fields("2016-07-01", "month", year=2016)) == 1
+    assert finds(store, upgraded, doc, JANUARY) == everywhere(False)
+    assert finds(store, upgraded, doc, JULY) == everywhere(True)
+    one_day = finds(store, upgraded, doc, ("2016-07-20", "2016-07-20"))
+    assert one_day == {"auto": True, "interval": True, "legacy": False}  # legacy reads the first day
+    assert vector_bytes(snapshot(store, upgraded)) == vectors
+
+
+DATE_MISUSES = {
+    "the date without its interval": {"date": "2016-07-13", "date_precision": "day"},
+    "the interval without its date": date_interval_fields("2016-07-13", "day"),
+    "a withdrawn date whose interval would stay": {"date": None},
+    "a precision without its date": {"date_precision": "year"},
+    "an interval of another date": {**date_fields("2016-07-13", "day"), "date_end": "2016-07-31T00:00:00Z"},
+}
+
+
+@pytest.mark.parametrize("fields", list(DATE_MISUSES.values()), ids=list(DATE_MISUSES))
+def test_a_date_written_in_part_is_refused_and_the_document_stays_as_it_was(store, upgraded, fields):
+    before = snapshot(store, upgraded)
+    with pytest.raises(DateFieldsError, match="date_fields"):
+        store.set_payload(upgraded, "day-stated", fields)
+    assert snapshot(store, upgraded) == before
+    assert finds(store, upgraded, "day-stated", ("2016-03-10", "2016-03-10")) == everywhere(True)
+
+
+def test_a_document_whose_date_is_cleared_is_undated_from_then_on(store, upgraded):
+    doc = "month-july"
+    assert finds(store, upgraded, doc, JULY) == everywhere(True)
+    assert store.set_payload(upgraded, doc, date_fields(None, year=None)) == 1
+    (payload,) = [
+        payload for payload, _vector in snapshot(store, upgraded).values() if payload["doc_id"] == doc
+    ]
+    assert not {"date", "date_precision", "date_start", "date_end", "year"} & set(payload)
+    assert finds(store, upgraded, doc, JULY) == everywhere(False)
+    assert finds(store, upgraded, doc, ("0001-01-01", "9999-12-31")) == everywhere(False)
+    assert finds(store, upgraded, doc, JULY, include_undated=True) == everywhere(True)
+    assert finds(store, upgraded, doc, JANUARY, include_undated=True) == everywhere(True)
 
 
 def test_a_collection_upgraded_while_a_service_runs_switches_without_a_restart(store, production, caplog):
@@ -404,14 +472,18 @@ def test_a_collection_upgraded_while_a_service_runs_switches_without_a_restart(s
         # The upgrade wrote payload keys and nothing else: same points, same vectors, byte for byte.
         after = snapshot(store, production)
         assert vector_bytes(after) == vectors and store.count(production) == COUNT
-        originals = {point.id: point.payload for point in date_points("v1", DOCUMENTS)}
+
+        def without_null_dates(payload: dict) -> dict:
+            # A date or a precision the source gives as null is removed by the write, not stored.
+            return {key: value for key, value in payload.items() if not (key in DATE_KEYS and value is None)}
+
+        originals = {point.id: without_null_dates(point.payload) for point in date_points("v1", DOCUMENTS)}
         for point, (payload, _vector) in after.items():
             assert {key: value for key, value in payload.items() if key not in DERIVED_KEYS} == originals[
                 point
             ]
-        # And the upgraded collection holds exactly what an ingestion under schema v2 writes: an
-        # undated document was given nulls, which add no key.
-        ingested = {point.id: point.payload for point in date_points("v2", DOCUMENTS)}
+        # And the upgraded collection holds what an ingestion under schema v2 writes.
+        ingested = {point.id: without_null_dates(point.payload) for point in date_points("v2", DOCUMENTS)}
         assert {point: payload for point, (payload, _vector) in after.items()} == ingested
     finally:
         reader.client.close()

@@ -82,12 +82,14 @@ from collections.abc import Mapping
 from typing import Any
 
 __all__ = [
+    "DATE_KEYS",
     "DATE_PRECISIONS",
     "DERIVED_KEYS",
     "PAYLOAD_INDEXES",
     "PAYLOAD_SCHEMA_VERSION",
     "RESERVED_KEYS",
     "build_payload",
+    "date_fields",
     "date_interval",
     "date_interval_fields",
     "page_for_id",
@@ -103,6 +105,11 @@ RESERVED_KEYS: tuple[str, ...] = ("doc_id", "filename", "chunk_number", "ingesti
 #: Caller metadata may not set them at ingestion. They are not reserved for
 #: ``QdrantStore.set_payload``, which is how they are added to points written before version 2.
 DERIVED_KEYS: tuple[str, ...] = ("date_start", "date_end")
+
+#: The four payload keys that say when a document is dated: the two of the source and the two
+#: the engine derives from them. They are changed together or not at all
+#: (:func:`date_fields`; ``QdrantStore.set_payload`` refuses anything else).
+DATE_KEYS: tuple[str, ...] = ("date", "date_precision", *DERIVED_KEYS)
 
 #: The values of ``date_precision`` the engine reads. Anything else is read as ``day``.
 DATE_PRECISIONS: tuple[str, ...] = ("day", "month", "year")
@@ -249,7 +256,10 @@ def date_interval(date: object, date_precision: object = None) -> tuple[str, str
 
 
 def date_interval_fields(date: object, date_precision: object = None) -> dict[str, str | None]:
-    """:func:`date_interval` as the two payload keys, for ``QdrantStore.set_payload``.
+    """:func:`date_interval` as the two payload keys: half of what :func:`date_fields` returns.
+
+    To change a date, call :func:`date_fields`: ``set_payload`` refuses the interval without
+    the ``date`` and the ``date_precision`` it was computed from.
 
     Always both keys of :data:`DERIVED_KEYS`. Without a readable date their values are
     ``None``: given to ``set_payload``, a null removes the key from the points (and a stored
@@ -259,6 +269,52 @@ def date_interval_fields(date: object, date_precision: object = None) -> dict[st
     """
     start, end = date_interval(date, date_precision) or (None, None)
     return {"date_start": start, "date_end": end}
+
+
+_NOT_GIVEN: Any = object()
+
+
+def date_fields(date: object, date_precision: object = None, *, year: Any = _NOT_GIVEN) -> dict[str, Any]:
+    """Everything a change of date writes, for ``QdrantStore.set_payload``. **The way to change a date.**
+
+    ``date_fields("2016-07-01", "month")`` is::
+
+        {"date": "2016-07-01", "date_precision": "month",
+         "date_start": "2016-07-01T00:00:00Z", "date_end": "2016-07-31T00:00:00Z"}
+
+    Always the four keys of :data:`DATE_KEYS`, in that order: the date and its precision as
+    the source gives them, and the interval :func:`date_interval` derives from the two, the
+    one an ingestion writes. A search reads all of them (``date`` in legacy mode and for the
+    points without an interval, ``date_start`` and ``date_end`` in interval mode), so a
+    write that carried only some would leave a document found under its old date. This is
+    why ``set_payload`` accepts the four together and consistent, and nothing else.
+
+    - ``date``: as given; a ``datetime.date`` or ``datetime.datetime`` is written as its ISO
+      string. ``None`` withdraws the date.
+    - ``date_precision``: as given, whatever it is (an unknown word is kept, and read as a
+      day). ``None``, the default, means "not stated" and **removes** a precision the points
+      stored: ``set_payload`` drops a key set to ``None``.
+    - ``date_start``, ``date_end``: ``None`` without a readable date. ``date_fields(None)``
+      is the four keys at ``None``: written, it removes them all, and the document is
+      undated from then on.
+
+    ``year`` is the one key next to them that the engine does not derive: the source owns
+    it, ``build_payload`` copies it, and no filter of ``search`` reads it. Left out, it is
+    not in the result, and the points keep the ``year`` they have: **a caller that moves a
+    date to another year passes** ``year=`` **too**. Given, it is written as given
+    (``None`` removes it), without being compared with ``date``: for a date stored with a
+    time and an offset, which year is meant is the source's decision.
+    """
+    if isinstance(date, (datetime.date, datetime.datetime)):
+        date = date.isoformat()
+    fields: dict[str, Any] = {
+        "date": date,
+        "date_precision": date_precision,
+        **date_interval_fields(date, date_precision),
+    }
+    if year is not _NOT_GIVEN:
+        fields["year"] = year
+    return fields
 
 
 def point_id(doc_id: str, page: int, chunk_index: int) -> int:

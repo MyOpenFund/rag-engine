@@ -9,12 +9,14 @@ import pytest
 
 from rag_engine import schema
 from rag_engine.schema import (
+    DATE_KEYS,
     DATE_PRECISIONS,
     DERIVED_KEYS,
     PAYLOAD_INDEXES,
     PAYLOAD_SCHEMA_VERSION,
     RESERVED_KEYS,
     build_payload,
+    date_fields,
     date_interval,
     date_interval_fields,
     page_for_id,
@@ -419,6 +421,71 @@ def test_date_precision_and_date_kind_are_ordinary_metadata():
 def test_build_payload_refuses_a_derived_key_in_the_metadata(key, value):
     with pytest.raises(ValueError, match=rf"derived payload key\(s\): {key}\b"):
         build_payload("d1", {"date": "2016-03-01", key: value}, **ENGINE_FIELDS, page=None)
+
+
+# --- date_fields: everything a date change writes ---------------------------
+
+
+def test_the_date_keys_are_the_two_of_the_source_and_the_two_derived():
+    assert DATE_KEYS == ("date", "date_precision", "date_start", "date_end")
+    assert DATE_KEYS[2:] == DERIVED_KEYS
+
+
+@pytest.mark.parametrize(("date", "precision", "first", "last"), INTERVALS)
+def test_date_fields_is_the_date_its_precision_and_the_interval_of_both(date, precision, first, last):
+    fields = date_fields(date, precision)
+    assert fields == {"date": date, "date_precision": precision, **date_interval_fields(date, precision)}
+    assert list(fields) == list(DATE_KEYS)
+    assert (fields["date_start"], fields["date_end"]) == (f"{first}T00:00:00Z", f"{last}T00:00:00Z")
+
+
+def test_date_fields_without_a_precision_removes_the_stored_one():
+    assert date_fields("2016-07-01") == {
+        "date": "2016-07-01",
+        "date_precision": None,
+        "date_start": "2016-07-01T00:00:00Z",
+        "date_end": "2016-07-01T00:00:00Z",
+    }
+
+
+@pytest.mark.parametrize("precision", [None, "day", "month"])
+def test_date_fields_of_no_date_clears_the_four_keys_but_a_stated_precision(precision):
+    assert date_fields(None, precision) == {
+        "date": None,
+        "date_precision": precision,
+        "date_start": None,
+        "date_end": None,
+    }
+
+
+def test_date_fields_keeps_an_unreadable_date_as_given_without_an_interval():
+    assert date_fields("2016-03", "month") == {
+        "date": "2016-03",
+        "date_precision": "month",
+        "date_start": None,
+        "date_end": None,
+    }
+
+
+def test_date_fields_writes_a_date_object_as_its_iso_string():
+    assert date_fields(datetime.date(2016, 7, 1), "month")["date"] == "2016-07-01"
+    moment = datetime.datetime(2016, 7, 1, 15, 30, tzinfo=datetime.timezone.utc)
+    fields = date_fields(moment)
+    assert fields["date"] == "2016-07-01T15:30:00+00:00"
+    assert fields["date_start"] == "2016-07-01T00:00:00Z"
+    # What is written is read back to the same interval.
+    assert date_interval_fields(fields["date"]) == date_interval_fields(moment)
+
+
+def test_date_fields_adds_the_year_only_when_it_is_given():
+    assert "year" not in date_fields("2016-07-01", "month")
+    assert date_fields("2016-07-01", "month", year=2016)["year"] == 2016
+    assert list(date_fields("2016-07-01", "month", year=2016)) == [*DATE_KEYS, "year"]
+    # Given as None, it is removed like the date; it is never computed from the date.
+    assert date_fields(None, year=None)["year"] is None
+    assert date_fields("2016-07-01", year=1999)["year"] == 1999
+    with pytest.raises(TypeError):
+        date_fields("2016-07-01", "month", 2016)  # keyword only
 
 
 # --- documentation and dependencies ----------------------------------------
