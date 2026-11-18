@@ -534,6 +534,8 @@ def test_a_hit_carries_every_field_of_its_payload(store, embedder):
         "ingestion_date": SEARCH_WHEN,
         "text": search_chunk_text("ecb-a", 1),
         "page": 1,
+        "date_start": "2016-03-10T00:00:00Z",
+        "date_end": "2016-03-10T00:00:00Z",
     }
 
 

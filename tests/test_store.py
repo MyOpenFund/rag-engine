@@ -1232,7 +1232,17 @@ def test_real_client_connection_refused_is_raised_and_not_read_as_absent():
 # ---------------------------------------------------------------------------
 # Payload indexes.
 # ---------------------------------------------------------------------------
-INDEXED_FIELDS = ["doc_id", "source_code", "doc_type", "language", "corpus", "year", "date"]
+INDEXED_FIELDS = [
+    "doc_id",
+    "source_code",
+    "doc_type",
+    "language",
+    "corpus",
+    "year",
+    "date",
+    "date_start",
+    "date_end",
+]
 
 
 def index_info(kind: str) -> SimpleNamespace:
@@ -1284,6 +1294,8 @@ def test_the_documented_index_list():
         ("corpus", "keyword"),
         ("year", "integer"),
         ("date", "datetime"),
+        ("date_start", "datetime"),
+        ("date_end", "datetime"),
     )
     for _field, kind in PAYLOAD_INDEXES:
         models.PayloadSchemaType(kind)  # every kind is one Qdrant knows
@@ -1307,8 +1319,9 @@ def test_indexes_second_call_creates_nothing():
 
 def test_indexes_only_the_missing_ones_are_created():
     store, client = index_store({"doc_id": "keyword", "year": "integer", "title": "text"})
-    assert store.ensure_payload_indexes("c") == ["source_code", "doc_type", "language", "corpus", "date"]
-    assert [call[1] for call in client.created()] == ["source_code", "doc_type", "language", "corpus", "date"]
+    missing = ["source_code", "doc_type", "language", "corpus", "date", "date_start", "date_end"]
+    assert store.ensure_payload_indexes("c") == missing
+    assert [call[1] for call in client.created()] == missing
     assert client.schema["title"].data_type == models.PayloadSchemaType.TEXT  # not ours: left alone
 
 
@@ -1412,7 +1425,14 @@ def test_indexes_a_failed_creation_is_raised_and_a_rerun_finishes_the_work():
     assert info.value is error
     assert sorted(client.schema) == ["doc_id", "doc_type", "source_code"]  # created before it: kept
     client._create = None
-    assert store.ensure_payload_indexes("c") == ["language", "corpus", "year", "date"]
+    assert store.ensure_payload_indexes("c") == [
+        "language",
+        "corpus",
+        "year",
+        "date",
+        "date_start",
+        "date_end",
+    ]
 
 
 # --- local mode ---------------------------------------------------------------

@@ -142,7 +142,7 @@ def search_chunk_text(doc_id: str, index: int) -> str:
 
 
 def search_points(embedder: FakeEmbedder | None = None) -> list[models.PointStruct]:
-    """The corpus as schema v1 points, one per chunk, with the vectors of a ``FakeEmbedder``."""
+    """The corpus as schema v2 points, one per chunk, with the vectors of a ``FakeEmbedder``."""
     embedder = embedder if embedder is not None else FakeEmbedder(SEARCH_SPEC)
     points = []
     for doc_id, (metadata, pages) in SEARCH_DOCUMENTS.items():

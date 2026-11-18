@@ -69,9 +69,12 @@ def ingest_document(
     - id: ``point_id(doc_id, page, i)``, ``i`` being the 0-based position of the chunk and
       ``page`` the page it starts on (0 for a chunk without page). The ids depend on nothing
       else, so a second ingestion of the same document overwrites its points;
-    - payload: schema v1 (:mod:`rag_engine.schema`): ``doc_id``, the ``metadata`` as given,
+    - payload: schema v2 (:mod:`rag_engine.schema`): ``doc_id``, the ``metadata`` as given,
       then ``filename`` (base name of ``path``), ``chunk_number`` (``i``), ``ingestion_date``,
-      ``text``, and ``page`` when the chunk has one;
+      ``text``, ``page`` when the chunk has one, and, when the metadata holds a readable
+      ``date``, ``date_start`` and ``date_end``: the interval the document is dated to, which
+      the engine derives from ``date`` and ``date_precision``
+      (:func:`rag_engine.schema.date_interval`);
     - vector: the embedding of the chunk text as a passage.
 
     All the points of the document have been written when the function returns. A document
@@ -94,7 +97,10 @@ def ingest_document(
 
     - ``metadata`` is copied into every payload and is not changed. It may not contain a
       reserved key (``rag_engine.schema.RESERVED_KEYS``), except a ``doc_id`` equal to the
-      ``doc_id`` argument, which is accepted.
+      ``doc_id`` argument, which is accepted. Nor may it contain ``date_start`` or
+      ``date_end`` (``rag_engine.schema.DERIVED_KEYS``), which the engine computes.
+      ``date_precision`` (``day``, ``month``, ``year``) and ``date_kind`` are ordinary
+      metadata, copied like any other key.
     - ``collection`` must exist with the dimension of the embedder. **This function does not
       create or check it**: the caller calls ``store.ensure_collection(collection,
       embedder.dim)`` once per run, not once per document.
@@ -115,7 +121,7 @@ def ingest_document(
     or a ``collection`` that is not a non-blank string, a ``path`` without a file name, a
     ``batch_size`` that is not an integer >= 1, an ``ingestion_date`` that is not a non-blank
     string, an ``ocr_languages`` that is not a list of language codes joined by ``+``, a
-    reserved key in ``metadata``; ``TypeError`` for a ``metadata`` that is not a
+    reserved or derived key in ``metadata``; ``TypeError`` for a ``metadata`` that is not a
     mapping. Nothing else is caught: an error of the chunker (``UnsupportedFormatError``, a
     missing file, a parser error), of the embedder or of the store
     (:class:`rag_engine.store.QdrantAuthError` and others, with the number of points written
