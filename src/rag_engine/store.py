@@ -25,7 +25,7 @@ from qdrant_client import QdrantClient, models
 
 from rag_engine.config import Settings
 from rag_engine.errors import RagEngineError
-from rag_engine.schema import DERIVED_KEYS, PAYLOAD_INDEXES
+from rag_engine.schema import DERIVED_KEYS, PAYLOAD_INDEXES, RESERVED_KEYS
 
 __all__ = [
     "AUTH_STATUSES",
@@ -36,6 +36,7 @@ __all__ = [
     "CollectionNotFoundError",
     "QdrantAuthError",
     "QdrantStore",
+    "ReservedKeyError",
     "StoreError",
 ]
 
@@ -70,6 +71,16 @@ class CollectionNotFoundError(StoreError):
     Raised by :meth:`QdrantStore.check_collection`, the check that never creates. The other
     methods of the store do not ask first: on a missing collection they raise what the
     Qdrant client raises.
+    """
+
+
+class ReservedKeyError(StoreError, ValueError):
+    """:meth:`QdrantStore.set_payload` was asked to set a payload key the engine owns.
+
+    The keys of :data:`rag_engine.schema.RESERVED_KEYS` say which chunk a point is
+    (``doc_id``, ``chunk_number``, ``page``), hold its text and say which file and which
+    ingestion it comes from: they change by ingesting the document again, never by a payload
+    update. A ``ValueError`` as well, like every other bad argument of the store.
     """
 
 
@@ -678,6 +689,85 @@ class QdrantStore:
                 found |= seen
                 remaining -= seen
         return found
+
+    def set_payload(self, collection: str, doc_id: str, fields: Mapping[str, Any]) -> int:
+        """Set the payload keys ``fields`` on every point of document ``doc_id``; returns how many points.
+
+        For a correction that needs no new embedding: a date, its precision, a title. Every
+        point whose payload field ``doc_id`` is exactly ``doc_id`` gets each key of
+        ``fields`` with its value, added or replaced. **Nothing else moves**: the other keys
+        of the payload stay, the vectors are not sent, read or rewritten, the ids do not
+        change, and no point is created. A value of ``None`` is written as a null, which a
+        filter reads as it reads a missing key. The call waits until Qdrant has applied the
+        write (``wait=True``); repeating it changes nothing more.
+
+        It returns the number of points of the document, counted exactly just before the
+        write. **A document without any point is not an error**: the answer is 0 and nothing
+        is written.
+
+        A date is corrected together with its interval. The search reads ``date_start`` and
+        ``date_end`` (:mod:`rag_engine.search`), which the engine derived from ``date`` and
+        ``date_precision`` when the document was ingested; this method does not derive them
+        again, since it is given only the keys to change. The caller adds them, with the
+        function the ingestion uses::
+
+            from rag_engine.schema import date_interval_fields
+
+            store.set_payload(collection, doc_id, {
+                "date": "2016-07-01", "date_precision": "month", "date_kind": "meeting",
+                **date_interval_fields("2016-07-01", "month"),
+            })
+
+        The same call gives their interval to the points written before payload schema v2,
+        whose ``date`` is already right.
+
+        Refused, before anything is sent:
+
+        * a key of :data:`rag_engine.schema.RESERVED_KEYS` (``doc_id``, ``filename``,
+          ``chunk_number``, ``ingestion_date``, ``text``, ``page``), whatever its value:
+          :class:`ReservedKeyError` naming every such key. They say which chunk a point is
+          and where it comes from; only a new ingestion changes them;
+        * a ``doc_id`` that is not a non-empty string, a ``fields`` that is not a mapping, an
+          empty one, a key that is not a non-empty string: ``ValueError``.
+
+        Two requests: a count, then, when there is at least one point, the write. Both go
+        through a filter on ``doc_id``, which its payload index makes fast. HTTP 401 or 403
+        is a :class:`QdrantAuthError` (the write needs a key allowed to write); a collection
+        that does not exist, and any other error, is raised as the client raised it. A
+        document ingested between the two requests is written to as well, and counted or
+        not.
+        """
+        if not isinstance(doc_id, str) or not doc_id:
+            raise ValueError(f"doc_id must be a non-empty string, got {doc_id!r}")
+        if not isinstance(fields, Mapping):
+            raise ValueError(  # noqa: TRY004 - a ValueError, as for every other bad argument of the store
+                f"fields must be a mapping of payload keys to values, got {type(fields).__name__}"
+            )
+        if not fields:
+            raise ValueError("fields is empty: there is nothing to set")
+        for key in fields:
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"the keys of fields must be non-empty strings, got {key!r}")
+        reserved = [key for key in RESERVED_KEYS if key in fields]
+        if reserved:
+            raise ReservedKeyError(
+                f"set_payload may not set reserved payload key(s): {', '.join(reserved)} "
+                f"(document {doc_id!r}): they change by ingesting the document again"
+            )
+        selector = models.Filter(
+            must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))]
+        )
+        try:
+            found = self._client.count(collection_name=collection, count_filter=selector, exact=True)
+            points = int(found.count)
+            if points:
+                self._client.set_payload(
+                    collection_name=collection, payload=dict(fields), points=selector, wait=True
+                )
+        except Exception as exc:
+            _raise_auth(exc)
+            raise
+        return points
 
     def count(self, collection: str) -> int:
         """Exact number of points in ``collection``."""

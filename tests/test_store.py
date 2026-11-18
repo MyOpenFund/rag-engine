@@ -14,21 +14,24 @@ import json
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import httpx
+import numpy as np
 import pytest
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 import rag_engine.store as store_mod
 from rag_engine.config import Settings
-from rag_engine.schema import PAYLOAD_INDEXES
+from rag_engine.errors import RagEngineError
+from rag_engine.schema import PAYLOAD_INDEXES, RESERVED_KEYS, date_interval_fields
 from rag_engine.store import (
     CollectionMismatchError,
     CollectionNotFoundError,
     QdrantAuthError,
     QdrantStore,
+    ReservedKeyError,
     StoreError,
 )
 
@@ -1630,3 +1633,222 @@ def test_existing_doc_ids_other_errors_are_raised_unchanged():
 def test_existing_doc_ids_on_a_missing_collection_raises(memory_store):
     with pytest.raises(ValueError, match="missing"):
         memory_store.existing_doc_ids("missing", ["a"])
+
+
+# ---------------------------------------------------------------------------
+# set_payload
+# ---------------------------------------------------------------------------
+def payload_points() -> list[models.PointStruct]:
+    """Three documents; ``a`` has three chunks. Vectors with many digits, to see any rewrite."""
+    rows = [("a", 0), ("a", 1), ("a", 2), ("b", 0), ("c", 0)]
+    return [
+        models.PointStruct(
+            id=10 * (1 + "abc".index(doc_id)) + chunk,
+            vector=[0.123456789 * (index + 1), -0.987654321, 0.5, 1 / 3],
+            payload={
+                "doc_id": doc_id,
+                "chunk_number": chunk,
+                "text": f"chunk {chunk} of {doc_id}",
+                "date": "2016-01-01",
+                "year": 2016,
+                "title": f"Document {doc_id}",
+            },
+        )
+        for index, (doc_id, chunk) in enumerate(rows)
+    ]
+
+
+def stored(store, collection: str = "c") -> dict:
+    records, _ = store.client.scroll(collection, limit=100, with_payload=True, with_vectors=True)
+    return {record.id: record for record in records}
+
+
+@pytest.fixture
+def payload_store(memory_store):
+    memory_store.ensure_collection("c", 4)
+    memory_store.upsert("c", payload_points())
+    return memory_store
+
+
+def test_set_payload_sets_the_keys_on_every_point_of_the_document_and_on_no_other(payload_store):
+    before = stored(payload_store)
+    fields = {"date": "2016-07-01", "date_precision": "month", **date_interval_fields("2016-07-01", "month")}
+
+    assert payload_store.set_payload("c", "a", fields) == 3
+
+    after = stored(payload_store)
+    assert sorted(after) == sorted(before)
+    for point_id, record in after.items():
+        old = before[point_id]
+        if old.payload["doc_id"] == "a":
+            assert record.payload == {
+                **old.payload,
+                "date": "2016-07-01",
+                "date_precision": "month",
+                "date_start": "2016-07-01T00:00:00Z",
+                "date_end": "2016-07-31T00:00:00Z",
+            }
+        else:
+            assert record.payload == old.payload
+        # No vector touched: the very same floats.
+        assert np.asarray(record.vector, dtype=np.float32).tobytes() == (
+            np.asarray(old.vector, dtype=np.float32).tobytes()
+        )
+    assert payload_store.count("c") == 5
+
+
+def test_set_payload_keeps_the_keys_it_is_not_given_and_adds_new_ones(payload_store):
+    assert payload_store.set_payload("c", "b", {"date_kind": "meeting"}) == 1
+    (record,) = [r for r in stored(payload_store).values() if r.payload["doc_id"] == "b"]
+    assert record.payload == {
+        "doc_id": "b",
+        "chunk_number": 0,
+        "text": "chunk 0 of b",
+        "date": "2016-01-01",
+        "year": 2016,
+        "title": "Document b",
+        "date_kind": "meeting",
+    }
+
+
+def test_set_payload_writes_a_null_as_a_null(payload_store):
+    fields = {"date": None, "year": None, **date_interval_fields(None)}
+    assert fields == {"date": None, "year": None, "date_start": None, "date_end": None}
+    assert payload_store.set_payload("c", "c", fields) == 1
+    (record,) = [r for r in stored(payload_store).values() if r.payload["doc_id"] == "c"]
+    # A real server stores the nulls (an integration test pins it); local mode may drop the keys.
+    for key in fields:
+        assert record.payload.get(key) is None
+    assert record.payload["title"] == "Document c"
+
+
+def test_set_payload_twice_is_the_same_as_once(payload_store):
+    fields = {"title": "A better title"}
+    assert payload_store.set_payload("c", "a", fields) == 3
+    once = {point_id: record.payload for point_id, record in stored(payload_store).items()}
+    assert payload_store.set_payload("c", "a", fields) == 3
+    assert {point_id: record.payload for point_id, record in stored(payload_store).items()} == once
+
+
+def test_set_payload_on_an_unknown_document_returns_zero_and_writes_nothing(payload_store):
+    before = {point_id: record.payload for point_id, record in stored(payload_store).items()}
+    assert payload_store.set_payload("c", "no-such-document", {"title": "x"}) == 0
+    assert payload_store.set_payload("c", "A", {"title": "x"}) == 0  # doc_id is compared exactly
+    assert {point_id: record.payload for point_id, record in stored(payload_store).items()} == before
+
+
+class PayloadClient:
+    """Records ``count`` and ``set_payload``; ``points`` is the number of points of the document."""
+
+    def __init__(self, points: int = 2, count_error=None, set_error=None) -> None:
+        self.points = points
+        self.count_error, self.set_error = count_error, set_error
+        self.calls: list[tuple[str, dict]] = []
+
+    def count(self, **kwargs):
+        self.calls.append(("count", kwargs))
+        if self.count_error is not None:
+            raise self.count_error
+        return SimpleNamespace(count=self.points)
+
+    def set_payload(self, **kwargs):
+        self.calls.append(("set_payload", kwargs))
+        if self.set_error is not None:
+            raise self.set_error
+
+
+def test_set_payload_counts_exactly_then_writes_once_through_a_filter_on_doc_id_and_waits():
+    client = PayloadClient(points=7)
+    fields = {"date": "2016-07-01", "date_precision": "month"}
+    assert QdrantStore(client=client).set_payload("col", "doc-1", fields) == 7
+    selector = models.Filter(
+        must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value="doc-1"))]
+    )
+    assert client.calls == [
+        ("count", {"collection_name": "col", "count_filter": selector, "exact": True}),
+        ("set_payload", {"collection_name": "col", "payload": fields, "points": selector, "wait": True}),
+    ]
+    assert client.calls[1][1]["payload"] is not fields  # a copy: the caller's mapping is not handed over
+    assert fields == {"date": "2016-07-01", "date_precision": "month"}
+
+
+def test_set_payload_sends_no_write_for_a_document_without_points():
+    client = PayloadClient(points=0)
+    assert QdrantStore(client=client).set_payload("col", "doc-1", {"title": "x"}) == 0
+    assert [name for name, _ in client.calls] == ["count"]
+
+
+@pytest.mark.parametrize("key", RESERVED_KEYS)
+def test_set_payload_refuses_a_reserved_key(key):
+    client = PayloadClient()
+    with pytest.raises(ReservedKeyError, match=rf"reserved payload key\(s\): {key}\b") as raised:
+        QdrantStore(client=client).set_payload("col", "doc-1", {"title": "ok", key: "x"})
+    assert "title" not in str(raised.value).split(":", 1)[1].split("(")[0]
+    assert isinstance(raised.value, StoreError) and isinstance(raised.value, RagEngineError)
+    assert isinstance(raised.value, ValueError)  # a bad argument, like every other one of the store
+    assert client.calls == []
+
+
+def test_set_payload_names_every_reserved_key_and_accepts_the_derived_and_date_keys():
+    assert RESERVED_KEYS == ("doc_id", "filename", "chunk_number", "ingestion_date", "text", "page")
+    client = PayloadClient()
+    store = QdrantStore(client=client)
+    with pytest.raises(ReservedKeyError, match="doc_id, text, page") as raised:
+        store.set_payload("col", "doc-1", {"page": 1, "text": "t", "doc_id": "doc-1", "title": "x"})
+    assert "'doc-1'" in str(raised.value) and client.calls == []
+    # Even the document's own doc_id: nothing to gain, and a typo would move the points.
+    with pytest.raises(ReservedKeyError):
+        store.set_payload("col", "doc-1", {"doc_id": "doc-1"})
+    fields = {"date": "2016-01-01", "year": 2016, "date_precision": "year", "date_kind": "period"}
+    assert store.set_payload("col", "doc-1", {**fields, **date_interval_fields("2016-01-01", "year")}) == 2
+
+
+@pytest.mark.parametrize(
+    ("doc_id", "fields", "match"),
+    [
+        ("", {"a": 1}, "doc_id must be a non-empty string"),
+        (None, {"a": 1}, "doc_id must be a non-empty string"),
+        (3, {"a": 1}, "doc_id must be a non-empty string"),
+        (["d"], {"a": 1}, "doc_id must be a non-empty string"),
+        ("d", {}, "fields is empty"),
+        ("d", None, "fields must be a mapping"),
+        ("d", [("a", 1)], "fields must be a mapping"),
+        ("d", "a", "fields must be a mapping"),
+        ("d", {3: 1}, "keys of fields must be non-empty strings"),
+        ("d", {"": 1}, "keys of fields must be non-empty strings"),
+    ],
+)
+def test_set_payload_refuses_bad_arguments_before_anything_is_sent(doc_id, fields, match):
+    client = PayloadClient()
+    with pytest.raises(ValueError, match=match) as raised:
+        QdrantStore(client=client).set_payload("col", doc_id, fields)
+    assert not isinstance(raised.value, StoreError)
+    assert client.calls == []
+
+
+def test_set_payload_takes_any_mapping():
+    client = PayloadClient()
+    assert QdrantStore(client=client).set_payload("col", "d", MappingProxyType({"title": "x"})) == 2
+    assert client.calls[1][1]["payload"] == {"title": "x"}
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("step", ["count_error", "set_error"])
+def test_set_payload_refused_api_key_is_a_clear_error(status, step):
+    store = QdrantStore(client=PayloadClient(**{step: http_error(status)}))
+    with pytest.raises(QdrantAuthError, match=f"HTTP {status}"):
+        store.set_payload("col", "d", {"title": "x"})
+
+
+@pytest.mark.parametrize("step", ["count_error", "set_error"])
+def test_set_payload_other_errors_are_raised_unchanged(step):
+    error = http_error(500)
+    with pytest.raises(UnexpectedResponse) as info:
+        QdrantStore(client=PayloadClient(**{step: error})).set_payload("col", "d", {"title": "x"})
+    assert info.value is error
+
+
+def test_set_payload_on_a_missing_collection_raises_and_creates_nothing(memory_store):
+    with pytest.raises(ValueError, match="missing"):
+        memory_store.set_payload("missing", "a", {"title": "x"})
+    assert not memory_store.client.collection_exists("missing")

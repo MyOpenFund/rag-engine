@@ -210,6 +210,7 @@ PUBLIC_NAMES = {
         "CollectionNotFoundError",
         "QdrantAuthError",
         "QdrantStore",
+        "ReservedKeyError",
         "StoreError",
     },
     "rag_engine.embedding": {
