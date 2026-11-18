@@ -144,13 +144,13 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _max_age(value: object) -> float:
+def _seconds(name: str, value: object) -> float:
     try:
         usable = type(value) in (int, float) and math.isfinite(value) and value >= 0  # type: ignore[arg-type]
     except OverflowError:  # an integer too large to be a float
         usable = False
     if not usable:
-        raise ValueError(f"max_age must be zero or a positive number of seconds, got {value!r}")
+        raise ValueError(f"{name} must be zero or a positive number of seconds, got {value!r}")
     return float(value)  # type: ignore[arg-type]
 
 
@@ -246,6 +246,9 @@ class QdrantStore:
             _port(port)
         # What has_date_intervals last read, per collection: (answer, when on the clock of _now).
         self._date_intervals: dict[str, tuple[bool, float]] = {}
+        # When uses_date_intervals last failed to read a collection (clock of _now); absent
+        # while the last read worked.
+        self._date_intervals_failed: dict[str, float] = {}
         self._date_intervals_lock = threading.Lock()
         if client is not None:
             # Nothing to connect to: the environment is not read, so a variable that has
@@ -600,7 +603,7 @@ class QdrantStore:
         remembered. qdrant-client's local mode keeps no payload index: there the answer is
         always ``False``.
         """
-        age = Settings.date_filter_refresh if max_age is None else _max_age(max_age)
+        age = Settings.date_filter_refresh if max_age is None else _seconds("max_age", max_age)
         with self._date_intervals_lock:
             known = self._date_intervals.get(collection)
         if known is not None and 0 <= _now() - known[1] < age:
@@ -627,6 +630,68 @@ class QdrantStore:
                     "date filters in auto mode use the date field (legacy)",
                     collection,
                 )
+        return answer
+
+    def uses_date_intervals(
+        self, collection: str, *, max_age: float | None = None, retry_after: float | None = None
+    ) -> bool:
+        """:meth:`has_date_intervals` for a search: the same answer, and never a failure of its own.
+
+        This is what a search in ``date_filter_mode="auto"`` calls. While the collection can
+        be read it is :meth:`has_date_intervals`, with the same ``max_age``. **When the read
+        fails or times out, it does not raise**: a search that could be answered must not
+        fail because a question asked on its behalf did. It answers instead
+
+        * the last answer this store had for the collection, however old, when it has one;
+        * ``False``, the filter on ``date``, when it never read the collection: the filter
+          every collection answers, and the one that was sent before the intervals existed.
+
+        It then leaves the collection alone for ``retry_after`` seconds: within that time
+        every call gives the same answer **without a request**, and the first call after it
+        tries the read again. ``retry_after`` defaults to ``Settings.date_filter_retry`` as
+        the class defines it (30); ``0`` tries at every call. Both durations must be zero or
+        a positive, finite number, else ``ValueError``.
+
+        One line is logged at WARNING level when the collection stops being readable, with
+        the error and the answer given meanwhile, and one at INFO level when it can be read
+        again: once per change, not once per search nor per retry.
+
+        Every error of the read is treated this way, a refused API key (HTTP 401 or 403)
+        included: the search that follows is sent with the same key and raises the
+        :class:`QdrantAuthError` itself. A caller that wants the error calls
+        :meth:`has_date_intervals`.
+        """
+        retry = Settings.date_filter_retry if retry_after is None else _seconds("retry_after", retry_after)
+        if max_age is not None:
+            _seconds("max_age", max_age)
+        with self._date_intervals_lock:
+            known = self._date_intervals.get(collection)
+            failed_at = self._date_intervals_failed.get(collection)
+        fallback = known[0] if known is not None else False
+        if failed_at is not None and 0 <= _now() - failed_at < retry:
+            return fallback
+        try:
+            answer = self.has_date_intervals(collection, max_age=max_age)
+        except Exception as exc:  # noqa: BLE001 - the search that follows reports what is really wrong
+            with self._date_intervals_lock:
+                self._date_intervals_failed[collection] = _now()
+            if failed_at is None:
+                logger.warning(
+                    "The payload schema of Qdrant collection %r could not be read (%s: %s): date filters "
+                    "in auto mode use %s until it can; next try in %g seconds at the earliest",
+                    collection,
+                    type(exc).__name__,
+                    exc,
+                    f"the last known answer ({'the intervals' if fallback else 'the date field, legacy'})"
+                    if known is not None
+                    else "the date field (legacy), no answer being known",
+                    retry,
+                )
+            return fallback
+        if failed_at is not None:
+            with self._date_intervals_lock:
+                self._date_intervals_failed.pop(collection, None)
+            logger.info("The payload schema of Qdrant collection %r can be read again", collection)
         return answer
 
     def query(

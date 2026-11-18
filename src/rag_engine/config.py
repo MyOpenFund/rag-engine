@@ -152,10 +152,10 @@ class Settings:
     * Direct construction takes values as they are and converts nothing: an integer must be an
       ``int`` (not a ``bool``, a ``float`` or a numeric string), ``qdrant_https`` must be a
       ``bool`` (the string ``"false"`` is refused, it would be truthy), ``parity_min`` must be
-      a ``float`` (not an ``int``, a ``bool`` or a numeric string), ``qdrant_timeout`` and
-      ``date_filter_refresh`` must be an ``int`` or a ``float`` (not a ``bool`` or a numeric
-      string), ``onnx_threads`` must be an ``int`` or ``None``, every other field must be a
-      ``str``, ``backend`` must be exactly ``"torch"`` or ``"onnx"``, and
+      a ``float`` (not an ``int``, a ``bool`` or a numeric string), ``qdrant_timeout``,
+      ``date_filter_refresh`` and ``date_filter_retry`` must be an ``int`` or a ``float``
+      (not a ``bool`` or a numeric string), ``onnx_threads`` must be an ``int`` or ``None``,
+      every other field must be a ``str``, ``backend`` must be exactly ``"torch"`` or ``"onnx"``, and
       ``date_filter_mode`` exactly ``"auto"``, ``"interval"`` or ``"legacy"``. Strings are
       not stripped. An empty or whitespace-only ``qdrant_host`` or ``model_name`` is
       refused; an empty or whitespace-only
@@ -264,6 +264,16 @@ class Settings:
         indexes were created while it runs. ``0`` asks before every search with a date
         bound. The caller passes it on, as
         ``search(..., date_filter_refresh=settings.date_filter_refresh)``.
+    ``date_filter_retry`` — ``RAG_ENGINE_DATE_FILTER_RETRY``, default ``30``
+        Seconds a store waits before it tries again to read a collection it could not read
+        (``auto`` only): zero or a positive, finite number. While the collection cannot be
+        read, a search with a date bound is still served, with the last answer the store had
+        for that collection, or with the ``legacy`` filter when it never had one; no search
+        in between sends the read again. ``0`` tries before every search with a date bound.
+        A read that times out costs one search the timeout of the store
+        (``qdrant_timeout``) each time it is tried: on a search service keep that timeout
+        short. The caller passes it on, as
+        ``search(..., date_filter_retry=settings.date_filter_retry)``.
 
     In the environment, an unset or blank variable gives the default (a blank placeholder
     copied from a template is not an error). The two prefixes follow their own rule above:
@@ -289,6 +299,7 @@ class Settings:
     qdrant_timeout: float = 60.0
     date_filter_mode: str = "auto"
     date_filter_refresh: float = 300.0
+    date_filter_retry: float = 30.0
 
     def __post_init__(self) -> None:
         self._check_types()
@@ -329,15 +340,16 @@ class Settings:
                 f"RAG_ENGINE_DATE_FILTER_MODE={_show(self.date_filter_mode)} is not one of "
                 f"{', '.join(DATE_FILTER_MODES)}"
             )
-        try:
-            usable = math.isfinite(self.date_filter_refresh) and self.date_filter_refresh >= 0
-        except OverflowError:  # an integer too large to be a float
-            usable = False
-        if not usable:
-            raise ConfigError(
-                f"RAG_ENGINE_DATE_FILTER_REFRESH={_show(self.date_filter_refresh)} must be zero or a "
-                "positive number of seconds"
-            )
+        for name, value in (
+            ("RAG_ENGINE_DATE_FILTER_REFRESH", self.date_filter_refresh),
+            ("RAG_ENGINE_DATE_FILTER_RETRY", self.date_filter_retry),
+        ):
+            try:
+                usable = math.isfinite(value) and value >= 0
+            except OverflowError:  # an integer too large to be a float
+                usable = False
+            if not usable:
+                raise ConfigError(f"{name}={_show(value)} must be zero or a positive number of seconds")
         if self.search_limit > self.search_max_limit:
             raise ConfigError(
                 f"RAG_ENGINE_SEARCH_LIMIT={_show(self.search_limit)} is above "
@@ -386,11 +398,15 @@ class Settings:
                 f"RAG_ENGINE_QDRANT_TIMEOUT={_show(self.qdrant_timeout)} must be a number of seconds "
                 f"(an int or a float), not {type(self.qdrant_timeout).__name__}"
             )
-        if type(self.date_filter_refresh) not in (int, float):  # a bool is not a duration
-            raise ConfigError(
-                f"RAG_ENGINE_DATE_FILTER_REFRESH={_show(self.date_filter_refresh)} must be a number of "
-                f"seconds (an int or a float), not {type(self.date_filter_refresh).__name__}"
-            )
+        for name, value in (
+            ("RAG_ENGINE_DATE_FILTER_REFRESH", self.date_filter_refresh),
+            ("RAG_ENGINE_DATE_FILTER_RETRY", self.date_filter_retry),
+        ):
+            if type(value) not in (int, float):  # a bool is not a duration
+                raise ConfigError(
+                    f"{name}={_show(value)} must be a number of seconds (an int or a float), "
+                    f"not {type(value).__name__}"
+                )
         if self.qdrant_api_key is not None:
             if not isinstance(self.qdrant_api_key, str):
                 # The value is deliberately left out: it may be the key in another form.
@@ -447,4 +463,5 @@ class Settings:
             qdrant_timeout=_float(env, "RAG_ENGINE_QDRANT_TIMEOUT", cls.qdrant_timeout),
             date_filter_mode=_date_filter_mode(env, "RAG_ENGINE_DATE_FILTER_MODE", cls.date_filter_mode),
             date_filter_refresh=_float(env, "RAG_ENGINE_DATE_FILTER_REFRESH", cls.date_filter_refresh),
+            date_filter_retry=_float(env, "RAG_ENGINE_DATE_FILTER_RETRY", cls.date_filter_retry),
         )

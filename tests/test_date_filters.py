@@ -631,10 +631,139 @@ def test_a_date_filter_refresh_that_is_not_zero_or_positive_is_refused(bad):
     assert client.asked == [] and client.requests == []
 
 
-def test_a_failed_detection_is_raised_before_the_query_is_embedded():
+# --------------------------------------------------------------------------------------
+# auto when the collection cannot be read: never a new way for a search to fail
+# --------------------------------------------------------------------------------------
+
+UNREADABLE = "could not be read"
+
+
+def warnings_of(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        StatusError(500),
+        StatusError(503),
+        TimeoutError("timed out"),
+        ConnectionError("refused"),
+        StatusError(403),
+    ],
+    ids=["500", "503", "timeout", "connection", "403"],
+)
+def test_a_cold_store_that_cannot_read_the_collection_serves_the_legacy_filter(clock, caplog, error):
     store, client = schema_store(V2_SCHEMA)
-    client.error = StatusError(403)
-    embedder = FakeEmbedder(DATE_SPEC)
-    with pytest.raises(QdrantAuthError):
-        search(DATE_QUERY, collection="c", store=store, embedder=embedder, filters=BOTH)
-    assert embedder.calls == [] and client.requests == []
+    client.error = error
+    with caplog.at_level(logging.INFO, logger="rag_engine.store"):
+        assert run(store, BOTH) == []
+    assert [request["query_filter"] for request in client.requests] == [_qdrant_filter(BOTH)]
+    (warning,) = warnings_of(caplog)
+    assert "'c'" in warning and UNREADABLE in warning and "legacy" in warning
+    # A refused key is named as the engine names it; the search that follows raises it itself.
+    assert ("QdrantAuthError" if error.args == StatusError(403).args else type(error).__name__) in warning
+
+
+def test_a_warm_store_keeps_its_last_answer_when_the_collection_cannot_be_read(clock, caplog):
+    store, client = schema_store(V2_SCHEMA)
+    run(store, BOTH, date_filter_refresh=60)  # known: intervals
+    client.error = StatusError(503)
+    clock.now += 61  # the answer has expired, and the collection cannot be read
+    with caplog.at_level(logging.WARNING, logger="rag_engine.store"):
+        run(store, BOTH, date_filter_refresh=60)
+    assert client.requests[-1]["query_filter"] == _qdrant_filter(BOTH, intervals=True)
+    (warning,) = warnings_of(caplog)
+    assert "last known answer (the intervals)" in warning
+
+
+def test_no_request_and_no_warning_per_search_while_the_collection_cannot_be_read(clock, caplog):
+    store, client = schema_store(V2_SCHEMA)
+    client.error = StatusError(500)
+    with caplog.at_level(logging.INFO, logger="rag_engine.store"):
+        for _ in range(5):
+            run(store, BOTH, date_filter_refresh=0, date_filter_retry=30)
+            clock.now += 5  # 25 seconds in all: inside the retry delay
+        assert len(client.asked) == 1 and len(client.requests) == 5
+        clock.now += 5  # 30 seconds after the failure: asked again, fails again
+        run(store, BOTH, date_filter_refresh=0, date_filter_retry=30)
+        assert len(client.asked) == 2
+        clock.now += 29
+        run(store, BOTH, date_filter_refresh=0, date_filter_retry=30)
+        assert len(client.asked) == 2
+        assert len(warnings_of(caplog)) == 1  # said once, not once per search nor per retry
+    assert all(request["query_filter"] == _qdrant_filter(BOTH) for request in client.requests)
+
+
+def test_the_detection_recovers_after_the_retry_delay_and_says_so_once(clock, caplog):
+    store, client = schema_store(V2_SCHEMA)
+    client.error = StatusError(500)
+    with caplog.at_level(logging.INFO, logger="rag_engine.store"):
+        run(store, BOTH, date_filter_retry=10)
+        client.error = None  # the server is back
+        clock.now += 9
+        run(store, BOTH, date_filter_retry=10)  # not asked yet
+        assert client.requests[-1]["query_filter"] == _qdrant_filter(BOTH)
+        clock.now += 1
+        run(store, BOTH, date_filter_retry=10)
+        run(store, BOTH, date_filter_retry=10)
+        assert client.requests[-1]["query_filter"] == _qdrant_filter(BOTH, intervals=True)
+        assert len(client.asked) == 2
+        messages = [record.getMessage() for record in caplog.records]
+        assert len(warnings_of(caplog)) == 1
+        assert sum("can be read again" in message for message in messages) == 1
+        # A second outage is a new change of state: said again, once.
+        client.error = StatusError(500)
+        clock.now += 1000
+        run(store, BOTH, date_filter_retry=10)
+        run(store, BOTH, date_filter_retry=10)
+        assert len(warnings_of(caplog)) == 2
+    assert client.requests[-1]["query_filter"] == _qdrant_filter(BOTH, intervals=True)  # the last answer
+
+
+def test_retry_zero_asks_before_every_search_while_failing(clock):
+    store, client = schema_store(V1_SCHEMA)
+    client.error = StatusError(500)
+    for _ in range(3):
+        run(store, BOTH, date_filter_retry=0)
+    assert len(client.asked) == 3
+
+
+def test_the_failure_of_one_collection_does_not_touch_another(clock):
+    client = SchemaClient({"c": V2_SCHEMA, "other": V2_SCHEMA})
+    client.by_name = True
+    store = QdrantStore(client=client)
+    assert store.uses_date_intervals("other") is True
+    client.error = StatusError(500)
+    assert store.uses_date_intervals("c") is False  # never read: legacy
+    assert store.uses_date_intervals("other") is True  # still fresh: not even asked
+    assert client.asked == ["other", "c"]
+
+
+def test_has_date_intervals_itself_still_raises(clock):
+    store, client = schema_store(V2_SCHEMA)
+    client.error = StatusError(500)
+    assert store.uses_date_intervals("c") is False
+    with pytest.raises(StatusError):
+        store.has_date_intervals("c")
+
+
+def test_a_refused_key_is_reported_by_the_search_itself_not_by_the_detection():
+    class Refusing(SchemaClient):
+        def query_points(self, **kwargs):
+            raise StatusError(401)
+
+    client = Refusing(V2_SCHEMA)
+    client.error = StatusError(401)
+    with pytest.raises(QdrantAuthError, match="HTTP 401"):
+        run(QdrantStore(client=client), BOTH)
+
+
+@pytest.mark.parametrize("bad", [-1, float("nan"), float("inf"), True, "30", [1], 10**400], ids=repr)
+def test_a_date_filter_retry_that_is_not_zero_or_positive_is_refused(bad):
+    store, client = schema_store(V2_SCHEMA)
+    with pytest.raises(SearchError, match="date_filter_retry must be zero or a positive number of seconds"):
+        run(store, BOTH, date_filter_retry=bad)
+    with pytest.raises(ValueError, match="retry_after must be zero or a positive number of seconds"):
+        store.uses_date_intervals("c", retry_after=bad)
+    assert client.asked == [] and client.requests == []

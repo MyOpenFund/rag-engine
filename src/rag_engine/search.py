@@ -355,11 +355,21 @@ def _qdrant_filter(filters: SearchFilters | None, *, intervals: bool = False) ->
     return models.Filter(must=must) if must else None
 
 
-def _uses_intervals(store: QdrantStore, collection: str, mode: str, refresh: float) -> bool:
+def _uses_intervals(store: QdrantStore, collection: str, mode: str, refresh: float, retry: float) -> bool:
     """Whether a date bound is applied to the intervals, for ``mode`` on ``collection``."""
     if mode == "auto":
-        return store.has_date_intervals(collection, max_age=refresh)
+        return store.uses_date_intervals(collection, max_age=refresh, retry_after=retry)
     return mode == "interval"
+
+
+def _seconds(name: str, value: object) -> float:
+    try:
+        usable = type(value) in (int, float) and math.isfinite(value) and value >= 0  # type: ignore[arg-type]
+    except OverflowError:  # an integer too large to be a float
+        usable = False
+    if not usable:
+        raise SearchError(f"{name} must be zero or a positive number of seconds, got {value!r}")
+    return value  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -459,6 +469,7 @@ def search(
     normalize_query: bool = True,
     date_filter_mode: str | None = None,
     date_filter_refresh: float | None = None,
+    date_filter_retry: float | None = None,
 ) -> list[Hit]:
     """Return the chunks of ``collection`` closest to ``query``, best first.
 
@@ -477,9 +488,10 @@ def search(
                limit=settings.search_limit, max_limit=settings.search_max_limit)
 
     ``RAG_ENGINE_SEARCH_LIMIT`` and ``RAG_ENGINE_SEARCH_MAX_LIMIT`` have no effect otherwise,
-    and neither have ``RAG_ENGINE_DATE_FILTER_MODE`` and ``RAG_ENGINE_DATE_FILTER_REFRESH``
-    (``date_filter_mode=settings.date_filter_mode``,
-    ``date_filter_refresh=settings.date_filter_refresh``).
+    and neither have ``RAG_ENGINE_DATE_FILTER_MODE``, ``RAG_ENGINE_DATE_FILTER_REFRESH`` and
+    ``RAG_ENGINE_DATE_FILTER_RETRY`` (``date_filter_mode=settings.date_filter_mode``,
+    ``date_filter_refresh=settings.date_filter_refresh``,
+    ``date_filter_retry=settings.date_filter_retry``).
 
     Arguments:
 
@@ -521,6 +533,9 @@ def search(
     - ``date_filter_refresh``: in ``auto`` mode, the number of seconds the store keeps what
       it read of the collection before it asks again: zero or a positive, finite number;
       ``None`` means the default, 300.
+    - ``date_filter_retry``: in ``auto`` mode, the number of seconds the store waits before
+      it tries again to read a collection it could not read: zero or a positive, finite
+      number; ``None`` means the default, 30.
 
     Date bounds. ``first`` and ``last`` are ``date_from`` and ``date_to`` at 00:00 UTC;
     with one bound only, the conditions on the other are left out.
@@ -542,7 +557,13 @@ def search(
       schema of the collection, one read request, and keeps the answer for
       ``date_filter_refresh`` seconds: a collection upgraded while a search service runs is
       followed after that time at most, without a restart, and a search without a date
-      bound never asks. The store logs the mode each time it changes.
+      bound never asks. The store logs the mode each time it changes. **Reading the
+      collection is never a reason for a search to fail**: when the read fails or times
+      out, the search is sent with the last answer the store had for the collection, or
+      with the ``legacy`` filter when it had none, a warning is logged once, and the read is
+      tried again ``date_filter_retry`` seconds later at the earliest
+      (:meth:`rag_engine.store.QdrantStore.uses_date_intervals`). If the server is really
+      unreachable or the key refused, the search itself says so.
 
     With ``include_undated=True`` a chunk also passes when it has no readable date: no
     readable ``date`` in ``legacy`` mode; neither a readable ``date_start`` nor a readable
@@ -554,8 +575,8 @@ def search(
     without any searchable character, a ``filters`` that is not a ``SearchFilters``, a ``limit`` or a
     ``max_limit`` that is not an integer >= 1, a ``limit`` above ``max_limit``, a
     ``normalize_query`` that is not a boolean, a ``date_filter_mode`` that is not one of the
-    three, a ``date_filter_refresh`` that is not zero or a positive number. Nothing else is
-    caught: an error of the
+    three, a ``date_filter_refresh`` or a ``date_filter_retry`` that is not zero or a
+    positive number. Nothing else is caught: an error of the
     embedder is raised unchanged, a refused API key is a
     :class:`rag_engine.store.QdrantAuthError`, and a collection that does not exist, a
     collection of another dimension or an unreachable server is raised as the Qdrant client
@@ -581,15 +602,12 @@ def search(
     mode = Settings.date_filter_mode if date_filter_mode is None else date_filter_mode
     if not isinstance(mode, str) or mode not in DATE_FILTER_MODES:
         raise SearchError(f"date_filter_mode must be one of {', '.join(DATE_FILTER_MODES)}, got {mode!r}")
-    refresh = Settings.date_filter_refresh if date_filter_refresh is None else date_filter_refresh
-    try:
-        usable = type(refresh) in (int, float) and math.isfinite(refresh) and refresh >= 0
-    except OverflowError:  # an integer too large to be a float
-        usable = False
-    if not usable:
-        raise SearchError(
-            f"date_filter_refresh must be zero or a positive number of seconds, got {date_filter_refresh!r}"
-        )
+    refresh = Settings.date_filter_refresh
+    if date_filter_refresh is not None:
+        refresh = _seconds("date_filter_refresh", date_filter_refresh)
+    retry = Settings.date_filter_retry
+    if date_filter_retry is not None:
+        retry = _seconds("date_filter_retry", date_filter_retry)
     wanted = Settings.search_limit if limit is None else _limit("limit", limit)
     maximum = Settings.search_max_limit if max_limit is None else _limit("max_limit", max_limit)
     if wanted > maximum:
@@ -605,7 +623,7 @@ def search(
         )
     # Asked before the query is embedded, and only for a search that has a date bound.
     bounded = filters is not None and (filters.date_from is not None or filters.date_to is not None)
-    intervals = bounded and _uses_intervals(store, collection, mode, refresh)
+    intervals = bounded and _uses_intervals(store, collection, mode, refresh, retry)
     vector = embedder.encode_query(text)
     points = store.query(
         collection,

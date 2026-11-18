@@ -1073,18 +1073,17 @@ def test_a_date_bound_in_a_named_mode_is_one_request_too(embedder, mode):
     assert request["query_filter"] == _qdrant_filter(filters, intervals=mode == "interval")
 
 
-def test_a_date_bound_in_auto_mode_reads_the_collection_first(embedder):
-    client = RecordingClient()
+def test_a_date_bound_in_auto_mode_is_served_with_the_legacy_filter_when_the_collection_cannot_be_read(
+    embedder, caplog
+):
+    client = RecordingClient()  # it has no get_collection: the read of the collection fails
     store = QdrantStore(client=client)
-    with pytest.raises(AttributeError, match="get_collection"):
-        search(
-            QUERY,
-            collection=COLLECTION,
-            store=store,
-            embedder=embedder,
-            filters=SearchFilters(date_to="2016-03-10"),
-        )
-    assert client.requests == []
+    filters = SearchFilters(date_to="2016-03-10")
+    with caplog.at_level("WARNING", logger="rag_engine.store"):
+        assert search(QUERY, collection=COLLECTION, store=store, embedder=embedder, filters=filters) == []
+    (request,) = client.requests
+    assert request["query_filter"] == _qdrant_filter(filters)
+    assert len(caplog.records) == 1 and "could not be read" in caplog.records[0].getMessage()
 
 
 def test_a_string_point_id_and_an_empty_payload_make_a_hit(embedder):

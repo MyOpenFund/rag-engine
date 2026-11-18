@@ -32,6 +32,7 @@ DEFAULTS = {
     "qdrant_timeout": 60.0,
     "date_filter_mode": "auto",
     "date_filter_refresh": 300.0,
+    "date_filter_retry": 30.0,
 }
 
 # Every variable where a blank value means "use the default".
@@ -53,6 +54,7 @@ BLANK_FALLS_BACK = [
     "RAG_ENGINE_QDRANT_TIMEOUT",
     "RAG_ENGINE_DATE_FILTER_MODE",
     "RAG_ENGINE_DATE_FILTER_REFRESH",
+    "RAG_ENGINE_DATE_FILTER_RETRY",
 ]
 
 
@@ -95,6 +97,7 @@ def test_all_values_read_from_the_mapping():
         "RAG_ENGINE_QDRANT_TIMEOUT": " 15 ",
         "RAG_ENGINE_DATE_FILTER_MODE": " Interval ",
         "RAG_ENGINE_DATE_FILTER_REFRESH": " 30 ",
+        "RAG_ENGINE_DATE_FILTER_RETRY": "5",
     }
     assert dataclasses.asdict(Settings.from_env(env)) == {
         "qdrant_host": "qdrant.internal",
@@ -116,6 +119,7 @@ def test_all_values_read_from_the_mapping():
         "qdrant_timeout": 15.0,
         "date_filter_mode": "interval",
         "date_filter_refresh": 30.0,
+        "date_filter_retry": 5.0,
     }
 
 
@@ -467,6 +471,8 @@ INVALID_KWARGS = [
     {"date_filter_mode": None},
     {"date_filter_refresh": -1},
     {"date_filter_refresh": "300"},
+    {"date_filter_retry": -1},
+    {"date_filter_retry": True},
 ]
 
 
@@ -831,3 +837,17 @@ def test_direct_date_filter_refresh_that_is_negative_or_not_finite_is_refused(va
 def test_direct_date_filter_refresh_must_be_a_number(value):
     with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_REFRESH=.*must be a number"):
         Settings(date_filter_refresh=value)
+
+
+def test_date_filter_retry_defaults_to_thirty_seconds_and_follows_the_rules_of_the_refresh():
+    assert Settings.date_filter_retry == 30.0 and Settings().date_filter_retry == 30.0
+    assert Settings.from_env({"RAG_ENGINE_DATE_FILTER_RETRY": " 0 "}).date_filter_retry == 0.0
+    assert Settings(date_filter_retry=2).date_filter_retry == 2
+    with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_RETRY=.*not a number"):
+        Settings.from_env({"RAG_ENGINE_DATE_FILTER_RETRY": "soon"})
+    for raw in ("-1", "nan", "inf"):
+        with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_RETRY=.*zero or a positive number"):
+            Settings.from_env({"RAG_ENGINE_DATE_FILTER_RETRY": raw})
+    for value in ("30", None, [30]):
+        with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_RETRY=.*must be a number"):
+            Settings(date_filter_retry=value)
