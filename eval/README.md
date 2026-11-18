@@ -25,7 +25,7 @@ JSON Lines, UTF-8, one question per line:
 | `id` | yes | A string, unique in the file. |
 | `question` | yes | The text given to the search. |
 | `expected_doc_ids` | yes | The `doc_id` of every document that answers the question: a non-empty list. |
-| `filters` | no | Filters applied to the search: an object with the field names of `rag_engine.search.SearchFilters` (`source_codes`, `doc_types`, `languages`, `doc_ids`, `date_from`, `date_to`, `corpus`) and its rules (lists, never a bare string; dates written `YYYY-MM-DD`). |
+| `filters` | no | Filters applied to the search: an object with the field names of `rag_engine.search.SearchFilters` (`source_codes`, `doc_types`, `languages`, `doc_ids`, `date_from`, `date_to`, `corpus`, `include_undated`) and its rules (lists, never a bare string; dates written `YYYY-MM-DD`). |
 | `kind` | no | A label; the report gives the metrics per kind. A kind with at least one question that carries filters is a *filtered* kind (see the report). |
 | `tags` | no | A list of labels; the report gives the metrics per tag, and a question counts for each of its tags. |
 | `language`, `rationale` | no | Free text, kept and not used. |

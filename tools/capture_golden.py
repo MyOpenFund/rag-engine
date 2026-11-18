@@ -4,7 +4,10 @@ Purpose: provenance. ``tests/fixtures/golden/expected.json`` holds the points (i
 vector) that the data-orchestrator's ``core.ingest_item`` produced for the two documents of
 ``tests/fixtures/golden/``, before that code moved into this package. The golden test asserts
 that ``rag_engine.ingest.ingest_document`` produces the same points, so the points already in
-Qdrant stay valid. This script is how the file was made; ``tests/fixtures/golden/README.md``
+Qdrant stay valid. (Since payload schema v2 the engine adds ``date_start`` and ``date_end``
+after the captured keys; those two are pinned by hand in ``expected_v2_keys.json``, and this
+capture, which is of the previous pipeline, does not hold them.) This script is how the file
+was made; ``tests/fixtures/golden/README.md``
 records the command, the versions and the commits.
 
 It is not part of the package and is not run in CI. It needs a checkout of the

@@ -381,7 +381,10 @@ class Hit:
         Id of the point in Qdrant.
     ``payload``
         The whole payload of the point, for the keys that have no field here (``year``,
-        ``filename``, ``ingestion_date``, ``sha256``, ...). It is a plain dict owned by the
+        ``filename``, ``ingestion_date``, ``sha256``, ``date_precision``, ``date_kind``,
+        ``date_start``, ``date_end``, ...). ``date`` alone does not say how precise it is: a
+        document of the year 2016 is stored as ``2016-01-01`` with a ``date_precision`` of
+        ``year``. It is a plain dict owned by the
         hit; because of it a hit is not hashable.
     """
 
