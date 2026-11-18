@@ -74,7 +74,11 @@ def test_the_questions_that_abstain_list_context_documents_only(questions):
         assert question.acceptable_ids and question.must_include
         assert "out-of-corpus" in question.tags
     # The twelve added later say where the true answer is, and which of the two absences they test.
-    added = [question for question in abstaining if question.id >= "an-71"]
+    added = [
+        question
+        for question in abstaining
+        if question.id[:3] == "an-" and question.id[3:].isdigit() and int(question.id[3:]) >= 71
+    ]
     assert len(added) == 12
     for question in added:
         assert "https://" in question.rationale and "True answer" in question.rationale, question.id
