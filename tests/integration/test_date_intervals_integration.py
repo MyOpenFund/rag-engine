@@ -514,7 +514,10 @@ def strict(store):
 def test_a_strict_collection_without_indexes_is_refused_in_the_words_of_the_engine(store, strict):
     with pytest.raises(MissingIndexError, match="'doc_id'.*keyword.*ensure_payload_indexes"):
         store.set_payload(strict, "day-stated", {"date_kind": "meeting"})
-    with pytest.raises(MissingIndexError, match="'date_start'.*datetime.*ensure_payload_indexes") as raised:
+    # The server names one of the fields that lack an index, not always the same one.
+    with pytest.raises(
+        MissingIndexError, match="'date(_start|_end)?'.*datetime.*ensure_payload_indexes"
+    ) as raised:
         found(store, strict, "2016-03-10", "2016-03-10", date_filter_mode="interval")
     assert strict in str(raised.value) and raised.value.__cause__.status_code == 400
     # auto reads that the two indexes are missing and sends the legacy filter, on date: refused too.

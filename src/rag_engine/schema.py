@@ -230,13 +230,25 @@ def date_interval(date: object, date_precision: object = None) -> tuple[str, str
     ``date_end >= first at 00:00Z``, two comparisons a Qdrant datetime range makes as they
     are; nothing depends on how many days a month has or on a time of day.
 
-    ``date`` is read the way the datetime index of Qdrant reads the payload field: a full
-    date (``"2016-03-10"``, or the lenient ``"2016-3-10"``), alone or followed, after ``T``
-    or a space, by a time (``"2016-03-10T15:30:00Z"``, ``"2016-03-10 15:30"``, with or
+    **The supported form of** ``date`` **is a full date written** ``YYYY-MM-DD``: what the
+    producers of the corpus write, and what the engine and the datetime index of Qdrant read
+    alike. The engine also reads the lenient ``"2016-3-10"`` and a date followed, after
+    ``T`` or a space, by a time (``"2016-03-10T15:30:00Z"``, ``"2016-03-10 15:30"``, with or
     without seconds and a fraction, with ``Z``, an offset such as ``+02:00``, or no zone,
-    which means UTC). A date with a time counts for the **UTC day** of that instant:
-    ``"2016-03-11T00:30:00+02:00"`` is 10 March. A ``datetime.date`` and a
-    ``datetime.datetime`` (UTC when it has no time zone) are read as well.
+    which means UTC). **A date with a time counts for the UTC day of that instant**:
+    ``"2016-03-11T00:30:00+02:00"`` is 10 March, and with ``"month"`` or ``"year"`` the
+    period is the one of that UTC day. A ``datetime.date`` and a ``datetime.datetime`` (UTC
+    when it has no time zone) are read as well.
+
+    This reader is the engine's own. It is close to the one of Qdrant, not the same one;
+    checked on Qdrant 1.20, they differ on these forms:
+
+    - read here and not by the datetime index: a time without seconds followed by ``Z`` or
+      an offset (``"2016-03-10T12:00Z"``). Such a document is found by its interval only;
+    - read by the datetime index and not here (no interval; the document is found by its
+      ``date``, as a day, whatever its precision): a leading space or a leading ``+``
+      (``" 2016-03-10"``, ``"+2016-03-10"``), a 60th second (``"2016-03-10T12:00:60Z"``), a
+      list holding a date (``["2016-03-10"]``).
 
     ``None`` is returned for no date and for a date that cannot be read: ``None``, an empty
     string, a partial date (``"2016-03"``, ``"2016"``), a day that does not exist, a number,
