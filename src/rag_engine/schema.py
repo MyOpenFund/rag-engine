@@ -317,6 +317,12 @@ def date_fields(date: object, date_precision: object = None, *, year: Any = _NOT
     (``None`` removes it), without being compared with ``date``: for a date stored with a
     time and an offset, which year is meant is the source's decision.
     """
+    if isinstance(date, datetime.datetime) and date.utcoffset() is not None:
+        offset = date.utcoffset()
+        if offset.seconds % 60 or offset.microseconds:
+            # An offset with seconds (a local mean time) has no ISO form the stored date is read
+            # from: written in UTC, the string says the same instant and the same UTC day.
+            date = date.astimezone(datetime.timezone.utc)
     if isinstance(date, (datetime.date, datetime.datetime)):
         date = date.isoformat()
     fields: dict[str, Any] = {

@@ -288,6 +288,9 @@ class QdrantStore:
         # while the last read worked.
         self._date_intervals_failed: dict[str, float] = {}
         self._date_intervals_lock = threading.Lock()
+        # One read of a collection's schema at a time: the searches that arrive meanwhile wait
+        # for it when nothing is known yet, and use the last answer otherwise.
+        self._date_intervals_reading: dict[str, threading.Lock] = {}
         if client is not None:
             # Nothing to connect to: the environment is not read, so a variable that has
             # nothing to do with this store (a bad QDRANT_PORT, say) cannot make it fail.
@@ -705,32 +708,46 @@ class QdrantStore:
         with self._date_intervals_lock:
             known = self._date_intervals.get(collection)
             failed_at = self._date_intervals_failed.get(collection)
+            reading = self._date_intervals_reading.setdefault(collection, threading.Lock())
         fallback = known[0] if known is not None else False
         if failed_at is not None and 0 <= _now() - failed_at < retry:
             return fallback
-        try:
-            answer = self.has_date_intervals(collection, max_age=max_age)
-        except Exception as exc:  # noqa: BLE001 - the search that follows reports what is really wrong
-            with self._date_intervals_lock:
-                self._date_intervals_failed[collection] = _now()
-            if failed_at is None:
-                logger.warning(
-                    "The payload schema of Qdrant collection %r could not be read (%s: %s): date filters "
-                    "in auto mode use %s until it can; next try in %g seconds at the earliest",
-                    collection,
-                    type(exc).__name__,
-                    exc,
-                    f"the last known answer ({'the intervals' if fallback else 'the date field, legacy'})"
-                    if known is not None
-                    else "the date field (legacy), no answer being known",
-                    retry,
-                )
+        # One thread reads; with an answer or a failure already on record the others do not wait
+        # behind a read that may hang for a whole request timeout.
+        if not reading.acquire(blocking=known is None and failed_at is None):
             return fallback
-        if failed_at is not None:
-            with self._date_intervals_lock:
-                self._date_intervals_failed.pop(collection, None)
-            logger.info("The payload schema of Qdrant collection %r can be read again", collection)
-        return answer
+        try:
+            with self._date_intervals_lock:  # what the read before this one left
+                known = self._date_intervals.get(collection)
+                failed_at = self._date_intervals_failed.get(collection)
+            fallback = known[0] if known is not None else False
+            if failed_at is not None and 0 <= _now() - failed_at < retry:
+                return fallback
+            try:
+                answer = self.has_date_intervals(collection, max_age=max_age)
+            except Exception as exc:  # noqa: BLE001 - the search that follows reports what is really wrong
+                with self._date_intervals_lock:
+                    self._date_intervals_failed[collection] = _now()
+                if failed_at is None:
+                    logger.warning(
+                        "The payload schema of Qdrant collection %r could not be read (%s: %s): date filters "
+                        "in auto mode use %s until it can; next try in %g seconds at the earliest",
+                        collection,
+                        type(exc).__name__,
+                        exc,
+                        f"the last known answer ({'the intervals' if fallback else 'the date field, legacy'})"
+                        if known is not None
+                        else "the date field (legacy), no answer being known",
+                        retry,
+                    )
+                return fallback
+            if failed_at is not None:
+                with self._date_intervals_lock:
+                    self._date_intervals_failed.pop(collection, None)
+                logger.info("The payload schema of Qdrant collection %r can be read again", collection)
+            return answer
+        finally:
+            reading.release()
 
     def query(
         self,

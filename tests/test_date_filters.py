@@ -721,6 +721,62 @@ def test_the_detection_recovers_after_the_retry_delay_and_says_so_once(clock, ca
     assert client.requests[-1]["query_filter"] == _qdrant_filter(BOTH, intervals=True)  # the last answer
 
 
+def test_one_read_at_a_time_and_one_warning_when_many_threads_search_at_once(clock, caplog):
+    """Cold, 16 threads: one read of the schema, the others wait for it, one warning. Then, the
+    retry delay over and a read hanging, the others answer at once with the legacy filter."""
+    import threading
+
+    store, _client = schema_store(V2_SCHEMA)
+    reads, entered, release = [], threading.Event(), threading.Event()
+
+    def hanging(collection, *, max_age=None):
+        reads.append(collection)
+        entered.set()
+        assert release.wait(10)
+        raise TimeoutError("timed out")
+
+    store.has_date_intervals = hanging
+    answers: list[bool] = []
+    with caplog.at_level(logging.INFO, logger="rag_engine.store"):
+        threads = [
+            threading.Thread(target=lambda: answers.append(store.uses_date_intervals("c"))) for _ in range(16)
+        ]
+        for thread in threads:
+            thread.start()
+        assert entered.wait(10)
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        assert answers == [False] * 16 and reads == ["c"]
+        assert len(warnings_of(caplog)) == 1
+        # After the delay one thread reads again and hangs: nobody else waits behind it.
+        clock.now += 31
+        entered.clear()
+        release.clear()
+        reader = threading.Thread(target=lambda: store.uses_date_intervals("c"))
+        reader.start()
+        assert entered.wait(10)
+        assert [store.uses_date_intervals("c") for _ in range(8)] == [False] * 8  # at once, no read
+        release.set()
+        reader.join(10)
+        assert reads == ["c", "c"] and len(warnings_of(caplog)) == 1
+
+
+def test_date_fields_of_a_datetime_whose_offset_has_seconds_agrees_with_the_ingestion():
+    import datetime
+    from zoneinfo import ZoneInfo
+
+    from rag_engine.schema import build_payload, date_fields
+
+    moment = datetime.datetime(1890, 3, 10, 12, 0, tzinfo=ZoneInfo("Europe/Paris"))  # +00:09:21
+    fields = date_fields(moment, "day")
+    ingested = build_payload(
+        "d", {"date": moment}, filename="f", chunk_number=0, ingestion_date="2026-01-01", text="t", page=None
+    )
+    assert fields["date_start"] == ingested["date_start"] == "1890-03-10T00:00:00Z"
+    assert fields["date_end"] == ingested["date_end"]
+
+
 def test_retry_zero_asks_before_every_search_while_failing(clock):
     store, client = schema_store(V1_SCHEMA)
     client.error = StatusError(500)
