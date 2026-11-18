@@ -61,7 +61,7 @@ def test_what_the_batch_holds(questions):
     assert Counter(question.language for question in questions) == {"en": 71, "fr": 8}
     assert Counter(question.kind for question in questions) == {"analytical": 74, "analytical+filters": 5}
     assert all(question.essential_ids is not None for question in questions)
-    assert len({doc_id for question in questions for doc_id in question.expected_doc_ids}) == 402
+    assert len({doc_id for question in questions for doc_id in question.expected_doc_ids}) == 412
 
 
 def test_the_questions_that_abstain_list_context_documents_only(questions):
@@ -110,7 +110,7 @@ def test_a_rationale_describes_the_documents(questions):
 def test_either_of_groups_of_the_batch(questions):
     by_id = {question.id: question for question in questions}
     check = check_questions(questions)
-    assert (check.either_of_questions, check.either_of_groups) == (36, 90)
+    assert (check.either_of_questions, check.either_of_groups) == (37, 94)
     assert check.more_requirements_than_k == ("an-23",)
     assert len(by_id["an-23"].requirements) == 12
     # Twenty-four sets of minutes carry the same proposal: two requirements, not three documents picked.
