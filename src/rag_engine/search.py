@@ -274,7 +274,12 @@ class SearchFilters:
 
 
 def _readable(key: str) -> models.FieldCondition:
-    """The points whose ``key`` holds a date Qdrant reads, whatever the date."""
+    """The points whose ``key`` holds a date Qdrant reads, whatever the date.
+
+    Written as "on or after 0001-01-01T00:00:00Z", the first instant ``datetime`` has. A
+    stored date before it would not count as readable; Qdrant reads none (it refuses the
+    year 0000 and negative years), and neither does the engine.
+    """
     first = _midnight(datetime.date.min)
     return models.FieldCondition(key=key, range=models.DatetimeRange(gte=first))
 
@@ -542,7 +547,10 @@ def search(
 
     - ``"legacy"``, the filter of payload schema v1: a chunk passes when
       ``first <= date < last + 1 day``, ``date`` being the payload field as Qdrant reads it.
-    - ``"interval"``: a chunk passes when ``date_start <= last`` **and**
+    - ``"interval"`` (on a collection in strict mode it needs the indexes on ``date_start``
+      and ``date_end``: without them the server refuses the filter, and the error is a
+      :class:`rag_engine.store.MissingIndexError`; ``auto`` never sends it there): a chunk
+      passes when ``date_start <= last`` **and**
       ``date_end >= first`` (the interval it is dated to has a day in common with the
       range, both bounds included), **or** when it passes the legacy condition. The second
       half is for a collection that is being upgraded: a chunk written under schema v1 has

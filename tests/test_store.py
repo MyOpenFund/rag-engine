@@ -30,6 +30,7 @@ from rag_engine.store import (
     CollectionMismatchError,
     CollectionNotFoundError,
     DateFieldsError,
+    MissingIndexError,
     QdrantAuthError,
     QdrantStore,
     ReservedKeyError,
@@ -1939,3 +1940,72 @@ def test_clearing_a_date_removes_the_interval_and_leaves_the_rest(payload_store)
 def test_a_reserved_key_is_named_before_the_date_keys_are_looked_at():
     with pytest.raises(ReservedKeyError):
         QdrantStore(client=PayloadClient()).set_payload("col", "d", {"text": "t", "date": "2016-07-01"})
+
+
+# ---------------------------------------------------------------------------
+# A collection in strict mode that refuses a filter on a field without an index
+# ---------------------------------------------------------------------------
+def index_required(field: str, kind: str) -> UnexpectedResponse:
+    """The answer of Qdrant 1.20 to a filter on an unindexed field of a strict collection, byte for byte."""
+    message = (
+        f'Bad request: Index required but not found for "{field}" of one of the following types: '
+        f"[{kind}]. Help: Create an index for this key or use a different filter."
+    )
+    body = json.dumps({"status": {"error": message}, "time": 2.3e-6})
+    return http_error(400, body.encode())
+
+
+@pytest.mark.parametrize("step", ["count_error", "set_error"])
+def test_set_payload_on_a_collection_that_refuses_the_unindexed_filter_names_the_index(step):
+    error = index_required("doc_id", "keyword")
+    store = QdrantStore(client=PayloadClient(**{step: error}))
+    with pytest.raises(MissingIndexError) as raised:
+        store.set_payload("col", "d", {"title": "x"})
+    message = str(raised.value)
+    assert "'col'" in message and "'doc_id'" in message and "keyword" in message
+    assert "ensure_payload_indexes" in message
+    assert raised.value.__cause__ is error
+    assert isinstance(raised.value, StoreError) and isinstance(raised.value, RagEngineError)
+
+
+class QueryClient:
+    def __init__(self, error) -> None:
+        self.error = error
+
+    def query_points(self, **kwargs):
+        raise self.error
+
+
+def test_query_on_a_collection_that_refuses_the_unindexed_filter_names_the_index():
+    error = index_required("date_start", "datetime")
+    with pytest.raises(MissingIndexError) as raised:
+        QdrantStore(client=QueryClient(error)).query("col", [0.1, 0.2], limit=3)
+    message = str(raised.value)
+    assert "'date_start'" in message and "datetime" in message and "ensure_payload_indexes" in message
+    assert raised.value.__cause__ is error
+
+
+def test_existing_doc_ids_on_a_collection_that_refuses_the_unindexed_filter_names_the_index():
+    store = QdrantStore(client=ScrollClient([], index_required("doc_id", "keyword")))
+    with pytest.raises(MissingIndexError, match="'doc_id'.*ensure_payload_indexes"):
+        store.existing_doc_ids("c", ["a"])
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        http_error(
+            400, b'{"status":{"error":"Wrong input: Vector dimension error: expected dim: 8, got 2"}}'
+        ),
+        http_error(500, b'{"status":{"error":"Index required but not found for \\"doc_id\\" of one of"}}'),
+        http_error(400, b""),
+    ],
+    ids=["another 400", "not a 400", "empty body"],
+)
+def test_any_other_answer_is_still_raised_as_the_client_raised_it(error):
+    with pytest.raises(UnexpectedResponse) as raised:
+        QdrantStore(client=QueryClient(error)).query("col", [0.1, 0.2], limit=3)
+    assert raised.value is error
+    with pytest.raises(UnexpectedResponse) as raised:
+        QdrantStore(client=PayloadClient(count_error=error)).set_payload("col", "d", {"title": "x"})
+    assert raised.value is error

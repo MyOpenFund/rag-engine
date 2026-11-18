@@ -211,6 +211,7 @@ PUBLIC_NAMES = {
         "CollectionMismatchError",
         "CollectionNotFoundError",
         "DateFieldsError",
+        "MissingIndexError",
         "QdrantAuthError",
         "QdrantStore",
         "ReservedKeyError",

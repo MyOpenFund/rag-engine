@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -35,6 +36,7 @@ __all__ = [
     "CollectionMismatchError",
     "CollectionNotFoundError",
     "DateFieldsError",
+    "MissingIndexError",
     "QdrantAuthError",
     "QdrantStore",
     "ReservedKeyError",
@@ -120,6 +122,42 @@ def _check_date_fields(doc_id: str, fields: Mapping[str, Any]) -> None:
             f"{fields['date']!r} with the precision {fields['date_precision']!r} (document {doc_id!r}; "
             f"expected {', '.join(f'{key}={expected[key]!r}' for key in wrong)}); {remedy}"
         )
+
+
+class MissingIndexError(StoreError):
+    """The collection refuses a filter because the filtered payload field has no index.
+
+    A collection in Qdrant's strict mode (``unindexed_filtering_retrieve`` or
+    ``unindexed_filtering_update`` off) answers HTTP 400 to a filter on a field without a
+    payload index, where another collection reads every point. The message names the
+    collection, the field and the kind of index, and the remedy:
+    :meth:`QdrantStore.ensure_payload_indexes`. The error of the client is its ``__cause__``.
+    """
+
+
+# The answer of Qdrant (checked on 1.20), as it is in the JSON body: the quotes are escaped there.
+_INDEX_REQUIRED = re.compile(
+    r"Index required but not found for \\*\"(?P<field>[^\"\\]+)\\*\" of one of the following types: "
+    r"\[(?P<kinds>[^\]]*)\]"
+)
+
+
+def _raise_missing_index(exc: BaseException, collection: str) -> None:
+    """Raise :class:`MissingIndexError` from ``exc`` when it is the refusal of an unindexed filter."""
+    if getattr(exc, "status_code", None) != 400:
+        return
+    content = getattr(exc, "content", b"")
+    text = content.decode("utf-8", "replace") if isinstance(content, bytes) else str(content)
+    found = _INDEX_REQUIRED.search(text)
+    if found is None:
+        return
+    field, kinds = found["field"], found["kinds"].strip() or "payload"
+    raise MissingIndexError(
+        f"collection {collection!r} refuses a filter on {field!r}: the field has no {kinds} payload "
+        f"index and the collection is in strict mode (HTTP 400). Create the indexes of the engine with "
+        f"QdrantStore.ensure_payload_indexes({collection!r}), which needs a key allowed to write, then "
+        "try again"
+    ) from exc
 
 
 def _raise_auth(exc: BaseException) -> None:
@@ -708,8 +746,11 @@ class QdrantStore:
         ``query_filter`` when one is given. The points come with their payload and their
         score, without their vector. ``limit`` must be an integer >= 1, else ``ValueError``.
 
-        HTTP 401 or 403 is a :class:`QdrantAuthError`; a collection that does not exist, a
-        vector of another dimension, and any other error is raised as the client raised it.
+        HTTP 401 or 403 is a :class:`QdrantAuthError`. A collection in strict mode that
+        refuses the filter because a filtered field has no index (HTTP 400) is a
+        :class:`MissingIndexError` naming the field and :meth:`ensure_payload_indexes`. A
+        collection that does not exist, a vector of another dimension, and any other error
+        is raised as the client raised it.
         Nothing is checked beforehand: this is one request, not two.
 
         It uses the query API (``query_points``): qdrant-client 1.10 or later, and a server
@@ -727,6 +768,7 @@ class QdrantStore:
             )
         except Exception as exc:
             _raise_auth(exc)
+            _raise_missing_index(exc, collection)
             raise
         return list(response.points)
 
@@ -785,6 +827,7 @@ class QdrantStore:
                     )
                 except Exception as exc:
                     _raise_auth(exc)
+                    _raise_missing_index(exc, collection)
                     raise
                 seen = {(point.payload or {}).get("doc_id") for point in points} & remaining
                 if not seen:
@@ -850,8 +893,11 @@ class QdrantStore:
 
         Two requests: a count, then, when there is at least one point, the write. Both go
         through a filter on ``doc_id``, which its payload index makes fast. HTTP 401 or 403
-        is a :class:`QdrantAuthError` (the write needs a key allowed to write); a collection
-        that does not exist, and any other error, is raised as the client raised it. A
+        is a :class:`QdrantAuthError` (the write needs a key allowed to write). A collection
+        in strict mode that has no index on ``doc_id`` refuses that filter (HTTP 400): a
+        :class:`MissingIndexError` naming the field and :meth:`ensure_payload_indexes`. A
+        collection that does not exist, and any other error, is raised as the client raised
+        it. A
         document ingested between the two requests is written to as well, and counted or
         not.
         """
@@ -885,6 +931,7 @@ class QdrantStore:
                 )
         except Exception as exc:
             _raise_auth(exc)
+            _raise_missing_index(exc, collection)
             raise
         return points
 

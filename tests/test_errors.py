@@ -9,6 +9,7 @@ from rag_engine.errors import RagEngineError
 from rag_engine.store import (
     CollectionMismatchError,
     DateFieldsError,
+    MissingIndexError,
     QdrantAuthError,
     ReservedKeyError,
     StoreError,
@@ -28,6 +29,7 @@ def test_the_base_is_a_plain_exception():
         CollectionMismatchError,
         ReservedKeyError,
         DateFieldsError,
+        MissingIndexError,
         UnsupportedFormatError,
         ModelIntegrityError,
         ModelDownloadError,
@@ -54,6 +56,7 @@ def test_a_reserved_key_error_is_a_store_error_and_a_value_error():
     # A bad argument of the store is a ValueError everywhere else; this one has a name as well.
     assert issubclass(ReservedKeyError, StoreError) and issubclass(ReservedKeyError, ValueError)
     assert issubclass(DateFieldsError, StoreError) and issubclass(DateFieldsError, ValueError)
+    assert issubclass(MissingIndexError, StoreError) and not issubclass(MissingIndexError, ValueError)
 
 
 def test_a_config_error_is_caught_as_the_base_and_as_a_value_error():

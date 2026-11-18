@@ -33,17 +33,19 @@ from date_corpus import (
     DATE_QUERY,
     DATE_SPEC,
     SERVER_ONLY_DOCUMENTS,
+    D,
     all_ranges,
     date_points,
     expected_documents,
     has_interval,
 )
+from qdrant_client import models
 
 from rag_engine.config import Settings
 from rag_engine.embedding import FakeEmbedder
 from rag_engine.schema import DATE_KEYS, DERIVED_KEYS, PAYLOAD_INDEXES, date_fields, date_interval_fields
 from rag_engine.search import SearchFilters, search
-from rag_engine.store import DateFieldsError, QdrantStore, ReservedKeyError
+from rag_engine.store import DateFieldsError, MissingIndexError, QdrantStore, ReservedKeyError
 
 QDRANT_URL = os.environ.get("RAG_ENGINE_IT_QDRANT_URL", "").strip()
 
@@ -488,3 +490,43 @@ def test_a_collection_upgraded_while_a_service_runs_switches_without_a_restart(s
     finally:
         reader.client.close()
         writer.client.close()
+
+
+# --------------------------------------------------------------------------------------
+# A collection in strict mode: a filter on a field without an index is refused by the server
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def strict(store):
+    """Schema v2 points in a collection that refuses unindexed filters, without any index yet."""
+    name = create(store, "v2", ())
+    store.client.update_collection(
+        collection_name=name,
+        strict_mode_config=models.StrictModeConfig(
+            enabled=True, unindexed_filtering_retrieve=False, unindexed_filtering_update=False
+        ),
+    )
+    yield name
+    store.client.delete_collection(collection_name=name)
+
+
+def test_a_strict_collection_without_indexes_is_refused_in_the_words_of_the_engine(store, strict):
+    with pytest.raises(MissingIndexError, match="'doc_id'.*keyword.*ensure_payload_indexes"):
+        store.set_payload(strict, "day-stated", {"date_kind": "meeting"})
+    with pytest.raises(MissingIndexError, match="'date_start'.*datetime.*ensure_payload_indexes") as raised:
+        found(store, strict, "2016-03-10", "2016-03-10", date_filter_mode="interval")
+    assert strict in str(raised.value) and raised.value.__cause__.status_code == 400
+    # auto reads that the two indexes are missing and sends the legacy filter, on date: refused too.
+    with pytest.raises(MissingIndexError, match="'date'.*datetime"):
+        found(store, strict, "2016-03-10", "2016-03-10")
+    # A search without a filter is not concerned.
+    assert len(search(DATE_QUERY, collection=strict, store=store, embedder=FakeEmbedder(DATE_SPEC))) == 10
+
+    # The remedy the message names.
+    assert store.ensure_payload_indexes(strict) == [field for field, _kind in PAYLOAD_INDEXES]
+    assert store.set_payload(strict, "day-stated", {"date_kind": "meeting"}) == 1
+    for mode in MODES:
+        got = found(store, strict, "2016-07-14", "2016-07-14", date_filter_mode=mode)
+        want = expected("v2", "legacy" if mode == "legacy" else "interval", D("2016-07-14"), D("2016-07-14"))
+        assert got == want, mode
