@@ -14,6 +14,7 @@ that package is installed.
 from __future__ import annotations
 
 import datetime
+import math
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -22,12 +23,20 @@ from typing import Any
 
 from qdrant_client import models
 
-from .config import Settings
+from .config import DATE_FILTER_MODES, Settings
 from .embedding import Embedder
 from .errors import RagEngineError
 from .store import QdrantStore
 
-__all__ = ["QUERY_NORMALIZATION", "Hit", "SearchError", "SearchFilters", "is_searchable", "search"]
+__all__ = [
+    "DATE_FILTER_MODES",
+    "QUERY_NORMALIZATION",
+    "Hit",
+    "SearchError",
+    "SearchFilters",
+    "is_searchable",
+    "search",
+]
 
 #: The Unicode form a query is put in before it is embedded (``normalize_query=True``): the
 #: form the chunker stores, and therefore embeds, the text of the chunks in.
@@ -142,8 +151,12 @@ class SearchFilters:
         ``doc_id``: a list (or tuple, or set) of non-blank strings, compared exactly, as they
         are (case and surrounding whitespace included).
     ``date_from``, ``date_to``
-        Bounds on ``date``, the publication date, **both inclusive**: a ``datetime.date`` or
-        a string written exactly ``YYYY-MM-DD``.
+        Bounds on the date of the document, **both inclusive**: a ``datetime.date`` or a
+        string written exactly ``YYYY-MM-DD``.
+    ``include_undated``
+        ``True`` to let a chunk without any date pass the date bounds as well; ``False``,
+        the default, leaves it out. A boolean and nothing else. **Without a date bound it
+        changes nothing.**
     ``corpus``
         The one accepted value of the payload field ``corpus``: a non-blank string.
 
@@ -167,14 +180,33 @@ class SearchFilters:
       value, and the Qdrant client could not send it;
     - a date bound that is not a full date: ``"2016"``, ``"2016-03"``, ``"10/03/2016"``, a
       date with a time, a ``datetime.datetime``, a number, a day that does not exist;
-    - ``date_from`` after ``date_to``.
+    - ``date_from`` after ``date_to``;
+    - an ``include_undated`` that is not ``True`` or ``False``: ``1``, ``"true"``, ``None``
+      given to the constructor.
 
     Dates. A bound is a whole day in UTC, the time zone Qdrant reads a stored date without
     time in: ``date_from="2016-03-10"`` starts at 2016-03-10T00:00:00Z, and
     ``date_to="2016-03-10"`` includes everything up to the end of that day, so a document
-    stored as ``2016-03-10`` or as ``2016-03-10T15:30:00Z`` passes both. **As soon as one
-    bound is set, a chunk without a readable full date is left out**: no ``date`` key, a
-    null, an empty string, or an imprecise date such as ``2016-03`` or ``2016``.
+    stored as ``2016-03-10`` or as ``2016-03-10T15:30:00Z`` passes both. What a bound is
+    compared with depends on the ``date_filter_mode`` of the search (:func:`search` has the
+    exact conditions):
+
+    - ``legacy``: the payload field ``date``. A chunk passes when its date is a day of the
+      range. A document known to the month or to the year is stored at the first day of its
+      period, and is found there only.
+    - ``interval``: the interval the chunk is dated to, ``date_start`` to ``date_end``
+      (:func:`rag_engine.schema.date_interval`). A chunk passes when that interval and the
+      range have at least one day in common: a document of July 2016 passes
+      ``date_from="2016-07-14", date_to="2016-07-14"``, and a document of the year 2016
+      passes any range that touches 2016. A chunk that has a readable ``date`` and no
+      interval yet (written before schema v2 and not upgraded) still passes as in
+      ``legacy``.
+
+    **As soon as one bound is set, a chunk without a readable date is left out, unless**
+    ``include_undated`` **is true**: no ``date`` key, a null, an empty string, or a partial
+    date such as ``2016-03`` or ``2016`` (the engine stores no interval for those either).
+    With ``include_undated=True`` those chunks pass every date bound, in both modes; the
+    dated chunks outside the range are still left out.
 
     The filters are stored in a fixed form, whatever was given: the lists as tuples without
     duplicates, the dates as ``datetime.date``. The object is immutable and hashable, and a
@@ -188,6 +220,7 @@ class SearchFilters:
     date_from: datetime.date | None = None
     date_to: datetime.date | None = None
     corpus: str | None = None
+    include_undated: bool = False
 
     def __post_init__(self) -> None:
         for name, _key in _LIST_FIELDS:
@@ -202,6 +235,8 @@ class SearchFilters:
             raise SearchError(f"corpus must be a non-blank string or None, got {self.corpus!r}")
         if self.corpus is not None and not _encodable(self.corpus):
             raise _not_encodable("corpus", "is", self.corpus)
+        if type(self.include_undated) is not bool:  # 1, "true", "false": not guessed
+            raise SearchError(f"include_undated must be True or False, got {self.include_undated!r}")
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> SearchFilters:
@@ -215,7 +250,8 @@ class SearchFilters:
         The keys are the names of the fields. A key that is missing, or whose value is
         ``None`` (a JSON ``null``), is not set; an empty mapping restricts nothing. The
         values follow the rules of the constructor, and are refused with the same
-        :class:`SearchError`.
+        :class:`SearchError`: ``include_undated`` is a JSON ``true`` or ``false``, never
+        ``1`` or ``"true"``.
 
         **A key that is not a field is refused**, with a :class:`SearchError` that names
         every unknown key and lists the fields: a misspelt filter must not be ignored, and
@@ -237,11 +273,77 @@ class SearchFilters:
         return cls(**{name: value for name, value in mapping.items() if value is not None})
 
 
-def _qdrant_filter(filters: SearchFilters | None) -> models.Filter | None:
-    """The Qdrant filter of ``filters``; ``None`` when nothing restricts the search."""
+def _readable(key: str) -> models.FieldCondition:
+    """The points whose ``key`` holds a date Qdrant reads, whatever the date."""
+    first = _midnight(datetime.date.min)
+    return models.FieldCondition(key=key, range=models.DatetimeRange(gte=first))
+
+
+def _date_in_range(filters: SearchFilters) -> models.FieldCondition:
+    """The legacy condition: the payload field ``date`` is a day of the range."""
+    # The bounds are sent as datetimes with their time zone, never as text: given the
+    # string "2016", qdrant-client reads a Unix timestamp and matches almost everything.
+    lower = _midnight(filters.date_from) if filters.date_from is not None else None
+    # Inclusive upper bound = strictly before the next day at 00:00 UTC. A stored date
+    # may carry a time ("2016-03-10T15:30:00Z"); "lte 2016-03-10" would mean midnight
+    # and leave that document out of its own day, and "lte 23:59:59.999999" depends on
+    # the precision dates are stored with. "lt the next day" depends on neither.
+    upper = None
+    if filters.date_to is not None and filters.date_to < datetime.date.max:
+        upper = _midnight(filters.date_to + _ONE_DAY)
+    if lower is not None or upper is not None:
+        return models.FieldCondition(key="date", range=models.DatetimeRange(gte=lower, lt=upper))
+    # date_to is the last day of the calendar and has no next day: every readable
+    # date passes, and a chunk without one is still left out.
+    return _readable("date")
+
+
+def _interval_overlaps(filters: SearchFilters) -> models.Filter:
+    """The interval condition: ``date_start`` to ``date_end`` has a day in common with the range."""
+    # Both fields are stored at midnight UTC and date_end is the last day, included: the
+    # overlap of two closed intervals of days is two comparisons, with both bounds included.
+    must: list[models.Condition] = []
+    if filters.date_to is not None:
+        must.append(
+            models.FieldCondition(
+                key="date_start", range=models.DatetimeRange(lte=_midnight(filters.date_to))
+            )
+        )
+    if filters.date_from is not None:
+        must.append(
+            models.FieldCondition(
+                key="date_end", range=models.DatetimeRange(gte=_midnight(filters.date_from))
+            )
+        )
+    return models.Filter(must=must)
+
+
+def _date_condition(filters: SearchFilters, intervals: bool) -> models.Condition:
+    """What the date bounds of ``filters`` ask of a point, in interval or in legacy mode."""
+    in_range = _date_in_range(filters)
+    if not intervals:
+        if not filters.include_undated:
+            return in_range  # the filter of payload schema v1, as it has always been sent
+        return models.Filter(should=[in_range, models.Filter(must_not=[_readable("date")])])
+    # The legacy condition stays in the union: a point written before schema v2, which has a
+    # date and no interval yet, must not disappear when the indexes are created before the
+    # points are upgraded. For a point that has its interval the union adds nothing: the day
+    # its date falls on is always inside its interval.
+    should: list[models.Condition] = [_interval_overlaps(filters), in_range]
+    if filters.include_undated:
+        should.append(models.Filter(must_not=[_readable("date_start"), _readable("date")]))
+    return models.Filter(should=should)
+
+
+def _qdrant_filter(filters: SearchFilters | None, *, intervals: bool = False) -> models.Filter | None:
+    """The Qdrant filter of ``filters``; ``None`` when nothing restricts the search.
+
+    ``intervals`` chooses how the date bounds are applied: on ``date_start`` and ``date_end``
+    (``True``) or on ``date`` alone (``False``, the filter of payload schema v1).
+    """
     if filters is None:
         return None
-    must: list[models.FieldCondition] = []
+    must: list[models.Condition] = []
     if filters.corpus is not None:
         must.append(models.FieldCondition(key="corpus", match=models.MatchValue(value=filters.corpus)))
     for name, key in _LIST_FIELDS:
@@ -249,24 +351,15 @@ def _qdrant_filter(filters: SearchFilters | None) -> models.Filter | None:
         if accepted is not None:
             must.append(models.FieldCondition(key=key, match=models.MatchAny(any=list(accepted))))
     if filters.date_from is not None or filters.date_to is not None:
-        # The bounds are sent as datetimes with their time zone, never as text: given the
-        # string "2016", qdrant-client reads a Unix timestamp and matches almost everything.
-        lower = _midnight(filters.date_from) if filters.date_from is not None else None
-        # Inclusive upper bound = strictly before the next day at 00:00 UTC. A stored date
-        # may carry a time ("2016-03-10T15:30:00Z"); "lte 2016-03-10" would mean midnight
-        # and leave that document out of its own day, and "lte 23:59:59.999999" depends on
-        # the precision dates are stored with. "lt the next day" depends on neither.
-        upper = None
-        if filters.date_to is not None and filters.date_to < datetime.date.max:
-            upper = _midnight(filters.date_to + _ONE_DAY)
-        if lower is not None or upper is not None:
-            must.append(models.FieldCondition(key="date", range=models.DatetimeRange(gte=lower, lt=upper)))
-        else:
-            # date_to is the last day of the calendar and has no next day: every readable
-            # date passes, and a chunk without one is still left out.
-            first = _midnight(datetime.date.min)
-            must.append(models.FieldCondition(key="date", range=models.DatetimeRange(gte=first)))
+        must.append(_date_condition(filters, intervals))
     return models.Filter(must=must) if must else None
+
+
+def _uses_intervals(store: QdrantStore, collection: str, mode: str, refresh: float) -> bool:
+    """Whether a date bound is applied to the intervals, for ``mode`` on ``collection``."""
+    if mode == "auto":
+        return store.has_date_intervals(collection, max_age=refresh)
+    return mode == "interval"
 
 
 @dataclass(frozen=True)
@@ -361,6 +454,8 @@ def search(
     limit: int | None = None,
     max_limit: int | None = None,
     normalize_query: bool = True,
+    date_filter_mode: str | None = None,
+    date_filter_refresh: float | None = None,
 ) -> list[Hit]:
     """Return the chunks of ``collection`` closest to ``query``, best first.
 
@@ -378,7 +473,10 @@ def search(
         search(query, collection=..., store=store, embedder=embedder,
                limit=settings.search_limit, max_limit=settings.search_max_limit)
 
-    ``RAG_ENGINE_SEARCH_LIMIT`` and ``RAG_ENGINE_SEARCH_MAX_LIMIT`` have no effect otherwise.
+    ``RAG_ENGINE_SEARCH_LIMIT`` and ``RAG_ENGINE_SEARCH_MAX_LIMIT`` have no effect otherwise,
+    and neither have ``RAG_ENGINE_DATE_FILTER_MODE`` and ``RAG_ENGINE_DATE_FILTER_REFRESH``
+    (``date_filter_mode=settings.date_filter_mode``,
+    ``date_filter_refresh=settings.date_filter_refresh``).
 
     Arguments:
 
@@ -414,13 +512,47 @@ def search(
       for Japanese (voiced kana), Korean and Vietnamese it does not, and only an NFKD query
       is cut into the tokens the chunks were cut into. Leave it on; ``False`` is for a
       collection whose passages were embedded in another form.
+    - ``date_filter_mode``: how the date bounds of ``filters`` are applied, one of
+      :data:`DATE_FILTER_MODES`; ``None`` means the default, ``"auto"``. It matters only
+      when ``date_from`` or ``date_to`` is set. See "Date bounds" below.
+    - ``date_filter_refresh``: in ``auto`` mode, the number of seconds the store keeps what
+      it read of the collection before it asks again: zero or a positive, finite number;
+      ``None`` means the default, 300.
+
+    Date bounds. ``first`` and ``last`` are ``date_from`` and ``date_to`` at 00:00 UTC;
+    with one bound only, the conditions on the other are left out.
+
+    - ``"legacy"``, the filter of payload schema v1: a chunk passes when
+      ``first <= date < last + 1 day``, ``date`` being the payload field as Qdrant reads it.
+    - ``"interval"``: a chunk passes when ``date_start <= last`` **and**
+      ``date_end >= first`` (the interval it is dated to has a day in common with the
+      range, both bounds included), **or** when it passes the legacy condition. The second
+      half is for a collection that is being upgraded: a chunk written under schema v1 has
+      a ``date`` and no interval until ``QdrantStore.set_payload`` gives it one, and must
+      not disappear in the meantime. For a chunk that has its interval the second half
+      adds nothing, because the day of its ``date`` is inside its interval. **Every chunk
+      that passes in** ``legacy`` **mode passes in** ``interval`` **mode**, whatever part
+      of the collection has been upgraded.
+    - ``"auto"``, the default: ``interval`` when the collection has a datetime index on
+      both ``date_start`` and ``date_end``, ``legacy`` otherwise
+      (:meth:`rag_engine.store.QdrantStore.has_date_intervals`). The store reads the payload
+      schema of the collection, one read request, and keeps the answer for
+      ``date_filter_refresh`` seconds: a collection upgraded while a search service runs is
+      followed after that time at most, without a restart, and a search without a date
+      bound never asks. The store logs the mode each time it changes.
+
+    With ``include_undated=True`` a chunk also passes when it has no readable date: no
+    readable ``date`` in ``legacy`` mode; neither a readable ``date_start`` nor a readable
+    ``date`` in ``interval`` mode.
 
     Errors. :class:`SearchError` (a ``ValueError`` and a ``RagEngineError``), raised before
     the embedder or the store is called: a ``query`` or a ``collection`` that is not a
     non-blank string or that cannot be encoded as UTF-8 (a lone surrogate), a ``query``
     without any searchable character, a ``filters`` that is not a ``SearchFilters``, a ``limit`` or a
     ``max_limit`` that is not an integer >= 1, a ``limit`` above ``max_limit``, a
-    ``normalize_query`` that is not a boolean. Nothing else is caught: an error of the
+    ``normalize_query`` that is not a boolean, a ``date_filter_mode`` that is not one of the
+    three, a ``date_filter_refresh`` that is not zero or a positive number. Nothing else is
+    caught: an error of the
     embedder is raised unchanged, a refused API key is a
     :class:`rag_engine.store.QdrantAuthError`, and a collection that does not exist, a
     collection of another dimension or an unreachable server is raised as the Qdrant client
@@ -443,6 +575,18 @@ def search(
         raise SearchError(f"filters must be a SearchFilters or None, got {type(filters).__name__}")
     if not isinstance(normalize_query, bool):
         raise SearchError(f"normalize_query must be True or False, got {normalize_query!r}")
+    mode = Settings.date_filter_mode if date_filter_mode is None else date_filter_mode
+    if not isinstance(mode, str) or mode not in DATE_FILTER_MODES:
+        raise SearchError(f"date_filter_mode must be one of {', '.join(DATE_FILTER_MODES)}, got {mode!r}")
+    refresh = Settings.date_filter_refresh if date_filter_refresh is None else date_filter_refresh
+    try:
+        usable = type(refresh) in (int, float) and math.isfinite(refresh) and refresh >= 0
+    except OverflowError:  # an integer too large to be a float
+        usable = False
+    if not usable:
+        raise SearchError(
+            f"date_filter_refresh must be zero or a positive number of seconds, got {date_filter_refresh!r}"
+        )
     wanted = Settings.search_limit if limit is None else _limit("limit", limit)
     maximum = Settings.search_max_limit if max_limit is None else _limit("max_limit", max_limit)
     if wanted > maximum:
@@ -456,11 +600,14 @@ def search(
             "isolated accents or other marks, which become a space and a combining mark, "
             f"got {query!a}"
         )
+    # Asked before the query is embedded, and only for a search that has a date bound.
+    bounded = filters is not None and (filters.date_from is not None or filters.date_to is not None)
+    intervals = bounded and _uses_intervals(store, collection, mode, refresh)
     vector = embedder.encode_query(text)
     points = store.query(
         collection,
         vector.tolist() if hasattr(vector, "tolist") else list(vector),
-        query_filter=_qdrant_filter(filters),
+        query_filter=_qdrant_filter(filters, intervals=intervals),
         limit=wanted,
     )
     return [_hit(point) for point in points]

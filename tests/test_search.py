@@ -261,7 +261,7 @@ def test_from_mapping_mixes_nulls_and_values():
     assert filters == SearchFilters(doc_types=["A1"])
 
 
-ALLOWED = "source_codes, doc_types, languages, doc_ids, date_from, date_to, corpus"
+ALLOWED = "source_codes, doc_types, languages, doc_ids, date_from, date_to, corpus, include_undated"
 
 
 @pytest.mark.parametrize(
@@ -350,7 +350,9 @@ def test_filters_are_frozen():
 
 
 def test_every_field_defaults_to_no_restriction():
-    assert all(value is None for value in dataclasses.asdict(SearchFilters()).values())
+    defaults = dataclasses.asdict(SearchFilters())
+    assert defaults.pop("include_undated") is False  # the one field that is not a restriction
+    assert all(value is None for value in defaults.values())
     assert [f.name for f in dataclasses.fields(SearchFilters)] == [
         "source_codes",
         "doc_types",
@@ -359,6 +361,7 @@ def test_every_field_defaults_to_no_restriction():
         "date_from",
         "date_to",
         "corpus",
+        "include_undated",
     ]
 
 
@@ -1033,7 +1036,7 @@ def test_any_other_store_error_is_raised_unchanged(embedder):
 def test_one_request_with_the_payload_and_without_the_vectors(embedder):
     client = RecordingClient()
     store = QdrantStore(client=client)
-    filters = SearchFilters(source_codes=["ecb"], date_to="2016-03-10")
+    filters = SearchFilters(source_codes=["ecb"], doc_types=["minutes"])
 
     assert (
         search(QUERY, collection=COLLECTION, store=store, embedder=embedder, filters=filters, limit=7) == []
@@ -1054,6 +1057,34 @@ def test_one_request_with_the_payload_and_without_the_vectors(embedder):
         "with_payload",
         "with_vectors",
     }
+
+
+@pytest.mark.parametrize("mode", ["legacy", "interval"])
+def test_a_date_bound_in_a_named_mode_is_one_request_too(embedder, mode):
+    client = RecordingClient()
+    store = QdrantStore(client=client)
+    filters = SearchFilters(source_codes=["ecb"], date_to="2016-03-10")
+
+    search(
+        QUERY, collection=COLLECTION, store=store, embedder=embedder, filters=filters, date_filter_mode=mode
+    )
+
+    (request,) = client.requests  # the client has no other method: the collection was not asked
+    assert request["query_filter"] == _qdrant_filter(filters, intervals=mode == "interval")
+
+
+def test_a_date_bound_in_auto_mode_reads_the_collection_first(embedder):
+    client = RecordingClient()
+    store = QdrantStore(client=client)
+    with pytest.raises(AttributeError, match="get_collection"):
+        search(
+            QUERY,
+            collection=COLLECTION,
+            store=store,
+            embedder=embedder,
+            filters=SearchFilters(date_to="2016-03-10"),
+        )
+    assert client.requests == []
 
 
 def test_a_string_point_id_and_an_empty_payload_make_a_hit(embedder):

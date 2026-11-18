@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
+import threading
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
@@ -22,7 +25,7 @@ from qdrant_client import QdrantClient, models
 
 from rag_engine.config import Settings
 from rag_engine.errors import RagEngineError
-from rag_engine.schema import PAYLOAD_INDEXES
+from rag_engine.schema import DERIVED_KEYS, PAYLOAD_INDEXES
 
 __all__ = [
     "AUTH_STATUSES",
@@ -85,6 +88,21 @@ def _positive_int(name: str, value: object) -> int:
     if type(value) is not int or value < 1:  # a bool is an int subclass, and is not a count
         raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
     return value
+
+
+def _now() -> float:
+    """Seconds on a clock that never goes back: the age of a cached answer is measured on it."""
+    return time.monotonic()
+
+
+def _max_age(value: object) -> float:
+    try:
+        usable = type(value) in (int, float) and math.isfinite(value) and value >= 0  # type: ignore[arg-type]
+    except OverflowError:  # an integer too large to be a float
+        usable = False
+    if not usable:
+        raise ValueError(f"max_age must be zero or a positive number of seconds, got {value!r}")
+    return float(value)  # type: ignore[arg-type]
 
 
 def _index_kinds(indexes: Iterable[Any]) -> list[tuple[str, models.PayloadSchemaType]]:
@@ -177,6 +195,9 @@ class QdrantStore:
     ) -> None:
         if port is not None:
             _port(port)
+        # What has_date_intervals last read, per collection: (answer, when on the clock of _now).
+        self._date_intervals: dict[str, tuple[bool, float]] = {}
+        self._date_intervals_lock = threading.Lock()
         if client is not None:
             # Nothing to connect to: the environment is not read, so a variable that has
             # nothing to do with this store (a bad QDRANT_PORT, say) cannot make it fail.
@@ -481,6 +502,10 @@ class QdrantStore:
             )
         created: list[str] = []
         for field, kind in missing:
+            if field in DERIVED_KEYS:
+                # What has_date_intervals remembers of this collection is about to be out of date.
+                with self._date_intervals_lock:
+                    self._date_intervals.pop(collection, None)
             logger.info(
                 "Creating %s payload index on %r in Qdrant collection %r", kind.value, field, collection
             )
@@ -493,6 +518,67 @@ class QdrantStore:
                 raise
             created.append(field)
         return created
+
+    def has_date_intervals(self, collection: str, *, max_age: float | None = None) -> bool:
+        """Whether ``collection`` has a datetime index on both ``date_start`` and ``date_end``.
+
+        This is how a search in ``date_filter_mode="auto"`` decides between the interval
+        filter and the filter on ``date`` (:func:`rag_engine.search.search`). The two indexes
+        are created by :meth:`ensure_payload_indexes` since payload schema v2; a collection
+        written before it, and never upgraded, has neither.
+
+        It reads the payload schema of the collection (one ``get_collection`` request, which
+        a read-only API key may send) and **keeps the answer for** ``max_age`` **seconds**,
+        per store and per collection. Within that time it answers from memory, without a
+        request. ``max_age`` defaults to ``Settings.date_filter_refresh`` as the class
+        defines it (300); ``0`` asks every time; anything but zero or a positive, finite
+        number is a ``ValueError``. An answer older than the ``max_age`` of the call is
+        asked again, whatever ``max_age`` it was stored under.
+
+        A collection whose indexes are created while a long-lived process holds this store
+        is therefore seen at most ``max_age`` seconds late, without a restart. When the same
+        store creates them (:meth:`ensure_payload_indexes`), the remembered answer is
+        dropped at once.
+
+        The answer says that the **indexes** exist, not that every point carries the two
+        fields: the indexes may be created before the points written under schema v1 are
+        given their interval. The interval filter of :func:`rag_engine.search.search` is
+        built for that case.
+
+        Each time the answer for a collection is first known, or changes, one line is logged
+        at INFO level. HTTP 401 or 403 is a :class:`QdrantAuthError`; a collection that does
+        not exist, and any other error, is raised as the client raised it, and nothing is
+        remembered. qdrant-client's local mode keeps no payload index: there the answer is
+        always ``False``.
+        """
+        age = Settings.date_filter_refresh if max_age is None else _max_age(max_age)
+        with self._date_intervals_lock:
+            known = self._date_intervals.get(collection)
+        if known is not None and 0 <= _now() - known[1] < age:
+            return known[0]
+        try:
+            schema = self._client.get_collection(collection_name=collection).payload_schema or {}
+        except Exception as exc:
+            _raise_auth(exc)
+            raise
+        kinds = {field: getattr(schema.get(field), "data_type", None) for field in DERIVED_KEYS}
+        answer = all(getattr(kind, "value", kind) == "datetime" for kind in kinds.values())
+        with self._date_intervals_lock:
+            self._date_intervals[collection] = (answer, _now())
+        if known is None or known[0] != answer:
+            if answer:
+                logger.info(
+                    "Qdrant collection %r has datetime indexes on date_start and date_end: "
+                    "date filters in auto mode use the intervals",
+                    collection,
+                )
+            else:
+                logger.info(
+                    "Qdrant collection %r has no datetime index on both date_start and date_end: "
+                    "date filters in auto mode use the date field (legacy)",
+                    collection,
+                )
+        return answer
 
     def query(
         self,

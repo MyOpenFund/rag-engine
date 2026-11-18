@@ -8,7 +8,7 @@ import sys
 import pytest
 
 import rag_engine.config as config_module
-from rag_engine.config import ConfigError, Settings
+from rag_engine.config import DATE_FILTER_MODES, ConfigError, Settings
 
 SECRET = "k3y-Zx9-DISTINCTIVE-41f7"
 
@@ -30,6 +30,8 @@ DEFAULTS = {
     "parity_min": 0.999,
     "onnx_threads": None,
     "qdrant_timeout": 60.0,
+    "date_filter_mode": "auto",
+    "date_filter_refresh": 300.0,
 }
 
 # Every variable where a blank value means "use the default".
@@ -49,6 +51,8 @@ BLANK_FALLS_BACK = [
     "RAG_ENGINE_PARITY_MIN",
     "RAG_ENGINE_ONNX_THREADS",
     "RAG_ENGINE_QDRANT_TIMEOUT",
+    "RAG_ENGINE_DATE_FILTER_MODE",
+    "RAG_ENGINE_DATE_FILTER_REFRESH",
 ]
 
 
@@ -89,6 +93,8 @@ def test_all_values_read_from_the_mapping():
         "RAG_ENGINE_PARITY_MIN": " 0.9995 ",
         "RAG_ENGINE_ONNX_THREADS": " 2 ",
         "RAG_ENGINE_QDRANT_TIMEOUT": " 15 ",
+        "RAG_ENGINE_DATE_FILTER_MODE": " Interval ",
+        "RAG_ENGINE_DATE_FILTER_REFRESH": " 30 ",
     }
     assert dataclasses.asdict(Settings.from_env(env)) == {
         "qdrant_host": "qdrant.internal",
@@ -108,6 +114,8 @@ def test_all_values_read_from_the_mapping():
         "parity_min": 0.9995,
         "onnx_threads": 2,
         "qdrant_timeout": 15.0,
+        "date_filter_mode": "interval",
+        "date_filter_refresh": 30.0,
     }
 
 
@@ -455,6 +463,10 @@ INVALID_KWARGS = [
     {"onnx_threads": "2"},
     {"qdrant_timeout": 0},
     {"qdrant_timeout": "60"},
+    {"date_filter_mode": "Interval"},
+    {"date_filter_mode": None},
+    {"date_filter_refresh": -1},
+    {"date_filter_refresh": "300"},
 ]
 
 
@@ -750,3 +762,72 @@ def test_direct_qdrant_timeout_that_is_not_positive_and_finite_is_refused(value)
 def test_direct_qdrant_timeout_must_be_a_number(value):
     with pytest.raises(ConfigError, match="RAG_ENGINE_QDRANT_TIMEOUT=.*must be a number"):
         Settings(qdrant_timeout=value)
+
+
+# ---------------------------------------------------------------------------
+# date_filter_mode and date_filter_refresh
+# ---------------------------------------------------------------------------
+def test_the_date_filter_modes_are_the_three_documented_ones():
+    assert DATE_FILTER_MODES == ("auto", "interval", "legacy")
+    assert Settings.date_filter_mode == "auto"
+    assert Settings.date_filter_refresh == 300.0
+
+
+@pytest.mark.parametrize("mode", DATE_FILTER_MODES)
+def test_date_filter_mode_is_read_stripped_and_lower_cased_from_the_environment(mode):
+    assert Settings.from_env({"RAG_ENGINE_DATE_FILTER_MODE": f" {mode.upper()} "}).date_filter_mode == mode
+    assert Settings(date_filter_mode=mode).date_filter_mode == mode
+
+
+@pytest.mark.parametrize("raw", ["intervals", "on", "v2", "auto,legacy"])
+def test_an_unknown_date_filter_mode_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_MODE=.*auto, interval, legacy"):
+        Settings.from_env({"RAG_ENGINE_DATE_FILTER_MODE": raw})
+    with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_MODE=.*auto, interval, legacy"):
+        Settings(date_filter_mode=raw)
+
+
+@pytest.mark.parametrize("value", ["AUTO", " auto", 1, True, None])
+def test_direct_date_filter_mode_is_matched_exactly(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_MODE="):
+        Settings(date_filter_mode=value)
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("0", 0.0), (" 60 ", 60.0), ("2.5", 2.5), ("1e3", 1000.0)])
+def test_date_filter_refresh_is_read_as_a_number_of_seconds(raw, expected):
+    value = Settings.from_env({"RAG_ENGINE_DATE_FILTER_REFRESH": raw}).date_filter_refresh
+    assert type(value) is float
+    assert value == expected
+
+
+@pytest.mark.parametrize("raw", ["soon", "5m", "1,5"])
+def test_date_filter_refresh_that_is_not_a_number_is_refused(raw):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_REFRESH=.*not a number"):
+        Settings.from_env({"RAG_ENGINE_DATE_FILTER_REFRESH": raw})
+
+
+@pytest.mark.parametrize("raw", ["-1", "-0.5", "nan", "inf", "-inf"])
+def test_date_filter_refresh_that_is_negative_or_not_finite_is_refused(raw):
+    with pytest.raises(
+        ConfigError, match="RAG_ENGINE_DATE_FILTER_REFRESH=.*zero or a positive number of seconds"
+    ):
+        Settings.from_env({"RAG_ENGINE_DATE_FILTER_REFRESH": raw})
+
+
+@pytest.mark.parametrize("value", [0, 0.0, 1, 30, 2.5])
+def test_direct_date_filter_refresh_accepts_zero_and_positive_numbers(value):
+    assert Settings(date_filter_refresh=value).date_filter_refresh == value
+
+
+@pytest.mark.parametrize("value", [-1, -0.5, float("nan"), float("inf"), 10**400])
+def test_direct_date_filter_refresh_that_is_negative_or_not_finite_is_refused(value):
+    with pytest.raises(
+        ConfigError, match="RAG_ENGINE_DATE_FILTER_REFRESH=.*zero or a positive number of seconds"
+    ):
+        Settings(date_filter_refresh=value)
+
+
+@pytest.mark.parametrize("value", [True, "300", None, [300]])
+def test_direct_date_filter_refresh_must_be_a_number(value):
+    with pytest.raises(ConfigError, match="RAG_ENGINE_DATE_FILTER_REFRESH=.*must be a number"):
+        Settings(date_filter_refresh=value)

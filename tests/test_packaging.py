@@ -181,7 +181,14 @@ def test_fastembed_loaded_without_being_installed_is_reported():
 PUBLIC_NAMES = {
     "rag_engine": {"__version__"},
     "rag_engine.errors": {"RagEngineError"},
-    "rag_engine.config": {"BACKENDS", "NO_PREFIX", "ConfigError", "Settings", "valid_ocr_languages"},
+    "rag_engine.config": {
+        "BACKENDS",
+        "DATE_FILTER_MODES",
+        "NO_PREFIX",
+        "ConfigError",
+        "Settings",
+        "valid_ocr_languages",
+    },
     "rag_engine.schema": {
         "DATE_PRECISIONS",
         "DERIVED_KEYS",
@@ -240,6 +247,7 @@ PUBLIC_NAMES = {
     },
     "rag_engine.ingest": {"IngestResult", "ingest_document"},
     "rag_engine.search": {
+        "DATE_FILTER_MODES",
         "QUERY_NORMALIZATION",
         "Hit",
         "SearchError",

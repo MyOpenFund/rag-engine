@@ -15,9 +15,11 @@ from dataclasses import dataclass, fields
 
 from rag_engine.errors import RagEngineError
 
-__all__ = ["BACKENDS", "NO_PREFIX", "ConfigError", "Settings", "valid_ocr_languages"]
+__all__ = ["BACKENDS", "DATE_FILTER_MODES", "NO_PREFIX", "ConfigError", "Settings", "valid_ocr_languages"]
 
 BACKENDS = ("torch", "onnx")
+#: How a date bound of a search is applied (``Settings.date_filter_mode``); the first is the default.
+DATE_FILTER_MODES = ("auto", "interval", "legacy")
 NO_PREFIX = "none"
 
 _ECHO_LIMIT = 80
@@ -115,6 +117,16 @@ def _backend(environ: Mapping[str, str], name: str, default: str) -> str:
     return backend
 
 
+def _date_filter_mode(environ: Mapping[str, str], name: str, default: str) -> str:
+    raw = _text(environ, name)
+    if raw is None:
+        return default
+    mode = raw.lower()
+    if mode not in DATE_FILTER_MODES:
+        raise ConfigError(f"{name}={_show(environ[name])} is not one of {', '.join(DATE_FILTER_MODES)}")
+    return mode
+
+
 def _prefix(environ: Mapping[str, str], name: str, default: str) -> str:
     """Unset or empty: the default. ``none``: no prefix. Anything else: the value, verbatim."""
     raw = environ.get(name, "")
@@ -140,11 +152,13 @@ class Settings:
     * Direct construction takes values as they are and converts nothing: an integer must be an
       ``int`` (not a ``bool``, a ``float`` or a numeric string), ``qdrant_https`` must be a
       ``bool`` (the string ``"false"`` is refused, it would be truthy), ``parity_min`` must be
-      a ``float`` (not an ``int``, a ``bool`` or a numeric string), ``qdrant_timeout`` must be
-      an ``int`` or a ``float`` (not a ``bool`` or a numeric string), ``onnx_threads`` must be
-      an ``int`` or ``None``, every other field must be a ``str``, and ``backend`` must be
-      exactly ``"torch"`` or ``"onnx"``. Strings are not stripped. An empty or whitespace-only
-      ``qdrant_host`` or ``model_name`` is refused; an empty or whitespace-only
+      a ``float`` (not an ``int``, a ``bool`` or a numeric string), ``qdrant_timeout`` and
+      ``date_filter_refresh`` must be an ``int`` or a ``float`` (not a ``bool`` or a numeric
+      string), ``onnx_threads`` must be an ``int`` or ``None``, every other field must be a
+      ``str``, ``backend`` must be exactly ``"torch"`` or ``"onnx"``, and
+      ``date_filter_mode`` exactly ``"auto"``, ``"interval"`` or ``"legacy"``. Strings are
+      not stripped. An empty or whitespace-only ``qdrant_host`` or ``model_name`` is
+      refused; an empty or whitespace-only
       ``qdrant_api_key`` or ``model_cache`` becomes ``None``.
 
     The API key is never printed: ``repr()`` and ``str()`` show ``qdrant_api_key=<set>`` or
@@ -232,6 +246,24 @@ class Settings:
         Number of hits returned when the caller gives no limit, at least 1.
     ``search_max_limit`` — ``RAG_ENGINE_SEARCH_MAX_LIMIT``, default ``50``
         Largest limit a caller may ask for, at least 1 and not below ``search_limit``.
+    ``date_filter_mode`` — ``RAG_ENGINE_DATE_FILTER_MODE``, default ``"auto"``
+        How a date bound of a search is applied, one of :data:`DATE_FILTER_MODES`.
+        ``interval``: a chunk passes when the interval it is dated to (``date_start`` to
+        ``date_end``) overlaps the range. ``legacy``: a chunk passes when its ``date`` is in
+        the range, as before the intervals existed. ``auto``: ``interval`` on a collection
+        where ``date_start`` and ``date_end`` are both indexed, ``legacy`` on any other one;
+        the collection is asked, and the answer kept for ``date_filter_refresh`` seconds.
+        Case-insensitive and stripped in the environment; matched exactly in direct
+        construction. Like the limits, nothing reads it behind the caller's back: the caller
+        passes it on, as ``search(..., date_filter_mode=settings.date_filter_mode)``. The
+        ``rag-engine eval`` command does not pass it: an evaluation runs in ``auto``.
+    ``date_filter_refresh`` — ``RAG_ENGINE_DATE_FILTER_REFRESH``, default ``300``
+        Seconds the answer to "does this collection have the interval indexes?" is kept by a
+        store before it is asked again (``auto`` only): zero or a positive, finite number.
+        It bounds the time a long-lived search service takes to follow a collection whose
+        indexes were created while it runs. ``0`` asks before every search with a date
+        bound. The caller passes it on, as
+        ``search(..., date_filter_refresh=settings.date_filter_refresh)``.
 
     In the environment, an unset or blank variable gives the default (a blank placeholder
     copied from a template is not an error). The two prefixes follow their own rule above:
@@ -255,6 +287,8 @@ class Settings:
     parity_min: float = 0.999
     onnx_threads: int | None = None
     qdrant_timeout: float = 60.0
+    date_filter_mode: str = "auto"
+    date_filter_refresh: float = 300.0
 
     def __post_init__(self) -> None:
         self._check_types()
@@ -290,6 +324,20 @@ class Settings:
             raise ConfigError(
                 f"RAG_ENGINE_QDRANT_TIMEOUT={_show(self.qdrant_timeout)} must be a positive number of seconds"
             )
+        if self.date_filter_mode not in DATE_FILTER_MODES:
+            raise ConfigError(
+                f"RAG_ENGINE_DATE_FILTER_MODE={_show(self.date_filter_mode)} is not one of "
+                f"{', '.join(DATE_FILTER_MODES)}"
+            )
+        try:
+            usable = math.isfinite(self.date_filter_refresh) and self.date_filter_refresh >= 0
+        except OverflowError:  # an integer too large to be a float
+            usable = False
+        if not usable:
+            raise ConfigError(
+                f"RAG_ENGINE_DATE_FILTER_REFRESH={_show(self.date_filter_refresh)} must be zero or a "
+                "positive number of seconds"
+            )
         if self.search_limit > self.search_max_limit:
             raise ConfigError(
                 f"RAG_ENGINE_SEARCH_LIMIT={_show(self.search_limit)} is above "
@@ -305,6 +353,7 @@ class Settings:
             ("RAG_ENGINE_QUERY_PREFIX", self.query_prefix),
             ("RAG_ENGINE_BACKEND", self.backend),
             ("RAG_ENGINE_OCR_LANGUAGES", self.ocr_languages),
+            ("RAG_ENGINE_DATE_FILTER_MODE", self.date_filter_mode),
         ):
             if not isinstance(value, str):
                 raise ConfigError(f"{name}={_show(value)} must be a string, not {type(value).__name__}")
@@ -336,6 +385,11 @@ class Settings:
             raise ConfigError(
                 f"RAG_ENGINE_QDRANT_TIMEOUT={_show(self.qdrant_timeout)} must be a number of seconds "
                 f"(an int or a float), not {type(self.qdrant_timeout).__name__}"
+            )
+        if type(self.date_filter_refresh) not in (int, float):  # a bool is not a duration
+            raise ConfigError(
+                f"RAG_ENGINE_DATE_FILTER_REFRESH={_show(self.date_filter_refresh)} must be a number of "
+                f"seconds (an int or a float), not {type(self.date_filter_refresh).__name__}"
             )
         if self.qdrant_api_key is not None:
             if not isinstance(self.qdrant_api_key, str):
@@ -391,4 +445,6 @@ class Settings:
             parity_min=_float(env, "RAG_ENGINE_PARITY_MIN", cls.parity_min),
             onnx_threads=_optional_int(env, "RAG_ENGINE_ONNX_THREADS"),
             qdrant_timeout=_float(env, "RAG_ENGINE_QDRANT_TIMEOUT", cls.qdrant_timeout),
+            date_filter_mode=_date_filter_mode(env, "RAG_ENGINE_DATE_FILTER_MODE", cls.date_filter_mode),
+            date_filter_refresh=_float(env, "RAG_ENGINE_DATE_FILTER_REFRESH", cls.date_filter_refresh),
         )
