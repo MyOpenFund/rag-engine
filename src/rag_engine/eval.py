@@ -284,6 +284,10 @@ class Question:
         document of each group. Each group is a non-empty list of distinct ``doc_id``; a
         document is in one group at most, and is neither in ``essential_ids`` nor in
         ``acceptable_ids``. Empty unless given. :attr:`requirements` puts the two together.
+
+        A question says which of its documents are essential as soon as one of the three
+        fields is given, an empty list included: ``essential_any_of=[]`` alone means what
+        ``essential_ids=[]`` alone means. ``None``, and a field left out, give nothing.
     ``must_include``, ``must_not_include``
         Short texts a right answer holds, and typical false statements it must not hold. Kept
         for a scorer of answers: the engine returns documents and writes no answer, so nothing
@@ -313,7 +317,7 @@ class Question:
     must_include: tuple[str, ...] = ()
     must_not_include: tuple[str, ...] = ()
     run_unfiltered: bool = False
-    essential_any_of: tuple[tuple[str, ...], ...] = ()
+    essential_any_of: tuple[tuple[str, ...], ...] | None = None  # a tuple once built, never None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -361,7 +365,9 @@ class Question:
         essential, acceptable = self.essential_ids, self.acceptable_ids
         groups = _groups(self.essential_any_of if self.essential_any_of is not None else ())
         members = tuple(doc_id for group in groups for doc_id in group)
-        graded = essential is not None or acceptable is not None or bool(groups)
+        # Given, even empty: an empty list of groups states "no group", as an empty list of
+        # essential documents states "none is essential".
+        graded = essential is not None or acceptable is not None or self.essential_any_of is not None
         if graded:
             essential = _doc_ids("essential_ids", essential if essential is not None else ())
             acceptable = _doc_ids("acceptable_ids", acceptable if acceptable is not None else ())
@@ -512,8 +518,9 @@ def _question_of(record: object) -> Question:
     rerun = record.get("run_unfiltered")
     if rerun is not None and not isinstance(rerun, bool):
         raise EvalError(f"'run_unfiltered' must be true or false, got {rerun!r}")
-    graded = any(record.get(name) is not None for name in ("essential_ids", "acceptable_ids"))
-    graded = graded or bool(record.get("essential_any_of"))
+    graded = any(
+        record.get(name) is not None for name in ("essential_ids", "essential_any_of", "acceptable_ids")
+    )
     if "expected_doc_ids" not in record and not graded:
         raise EvalError("'expected_doc_ids' is missing")
     if not graded and record["expected_doc_ids"] is None:
@@ -535,7 +542,7 @@ def _question_of(record: object) -> Question:
         must_include=record["must_include"] if record.get("must_include") is not None else (),
         must_not_include=record["must_not_include"] if record.get("must_not_include") is not None else (),
         run_unfiltered=bool(rerun),
-        essential_any_of=record["essential_any_of"] if record.get("essential_any_of") is not None else (),
+        essential_any_of=record.get("essential_any_of"),
     )
     _check_normalised(question)
     return question
@@ -593,7 +600,9 @@ def load_questions(path: str | os.PathLike[str]) -> QuestionSet:
       group at most, and in neither of the two lists above; the members of the groups count
       among the expected documents, between the essential and the acceptable ones. On a
       question that abstains, ``essential_ids`` is empty and there is no group: the
-      documents it lists are context documents (``acceptable_ids`` or ``expected_doc_ids``);
+      documents it lists are context documents (``acceptable_ids`` or ``expected_doc_ids``).
+      One of these three fields given, even as an empty list, makes the question one that
+      states its essential documents; ``null`` counts as left out;
     - ``must_include``, ``must_not_include`` (optional): lists of non-blank strings, none
       twice, and none in both; kept, not scored;
     - ``run_unfiltered`` (optional): ``true`` or ``false``; ``true`` only on a question

@@ -1658,6 +1658,34 @@ def test_a_question_may_state_groups_only():
     assert Question(id="q", question="alpha", essential_ids=[], acceptable_ids=["a"]).requirements == ()
 
 
+def test_an_empty_list_of_groups_states_the_essential_documents_like_an_empty_essential_list(tmp_path):
+    """A field that is given, even empty, makes the question one that states what it needs."""
+    for name in ("essential_ids", "essential_any_of"):
+        only = {name: []}
+        # On a question that abstains, nothing more is needed: no document, no essential one.
+        abstains = q(expected_doc_ids=..., expected_behavior="abstain", **only)
+        (loaded,) = load_questions(write(tmp_path, abstains))
+        assert (loaded.essential_ids, loaded.essential_any_of, loaded.acceptable_ids) == ((), (), ()), name
+        assert (loaded.expected_doc_ids, loaded.requirements) == ((), ()), name
+        assert loaded.to_dict()["essential_ids"] == [] and "essential_any_of" not in loaded.to_dict()
+        assert list(load_questions(write(tmp_path, loaded.to_dict()))) == [loaded]
+        # Next to acceptable documents: no requirement, and the acceptable ones are the expected ones.
+        (loaded,) = load_questions(write(tmp_path, q(expected_doc_ids=..., acceptable_ids=["d2"], **only)))
+        assert (loaded.essential_ids, loaded.requirements, loaded.expected_doc_ids) == ((), (), ("d2",)), name
+        # The expected documents must then be those of the three fields: none here.
+        with pytest.raises(EvalError, match="'expected_doc_ids' must name the documents of .* it adds 'd1'"):
+            load_questions(write(tmp_path, q(**only)))
+        with pytest.raises(EvalError, match="'essential_ids' and 'acceptable_ids' are empty"):
+            load_questions(write(tmp_path, q(expected_doc_ids=..., **only)))
+        built = Question(id="q", question="alpha", expected_behavior="abstain", **only)
+        assert (built.essential_ids, built.essential_any_of, built.requirements) == ((), (), ()), name
+    # Null is a field left out, for the groups as for the lists.
+    (old,) = load_questions(write(tmp_path, q(essential_any_of=None)))
+    assert (old.essential_ids, old.essential_any_of, old.requirements) == (None, (), None)
+    built = Question(id="q", question="alpha", expected_doc_ids=["a"], essential_any_of=None)
+    assert built.requirements is None
+
+
 @pytest.mark.parametrize(
     ("line", "match"),
     [
