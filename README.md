@@ -35,13 +35,13 @@ The package root exposes only `__version__`. Everything else is imported from it
 
 | Module | Main names |
 |---|---|
-| `rag_engine.config` | `Settings`, `ConfigError`, `valid_ocr_languages` |
-| `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `RESERVED_KEYS`, `PAYLOAD_INDEXES` |
-| `rag_engine.store` | `QdrantStore`, `StoreError`, `QdrantAuthError`, `CollectionMismatchError`, `CollectionNotFoundError`, `DEFAULT_TIMEOUT` |
+| `rag_engine.config` | `Settings`, `ConfigError`, `valid_ocr_languages`, `DATE_FILTER_MODES` |
+| `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `date_interval`, `date_interval_fields`, `date_fields`, `RESERVED_KEYS`, `DERIVED_KEYS`, `DATE_KEYS`, `DATE_PRECISIONS`, `PAYLOAD_INDEXES`, `PAYLOAD_SCHEMA_VERSION` |
+| `rag_engine.store` | `QdrantStore`, `StoreError`, `QdrantAuthError`, `CollectionMismatchError`, `CollectionNotFoundError`, `ReservedKeyError`, `DateFieldsError`, `MissingIndexError`, `DEFAULT_TIMEOUT` |
 | `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE`, `ModelIntegrityError`, `ModelDownloadError` |
 | `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
-| `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `is_searchable`, `QUERY_NORMALIZATION` |
+| `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `is_searchable`, `QUERY_NORMALIZATION`, `DATE_FILTER_MODES` |
 | `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `Means`, `EssentialAggregate`, `EssentialMeans`, `FilterEffect`, `Abstention`, `TopScores`, `EvalError`, `DEFAULT_K`, `DEFAULT_CHUNK_LIMIT`, `DEFAULT_BOOTSTRAP_RESAMPLES`, `DEFAULT_INTERVAL_MIN_DOCUMENTS`, `DEFAULT_SCORE_LEVELS`, `BOOTSTRAP_SEED`, `INTERVAL_LEVEL`, `BEHAVIORS`, `DEFAULT_BEHAVIOR`, `UNFILTERED_SUFFIX`, `UNFILTERED_TAG`, `QUESTION_FIELDS`, `FILTER_FIELDS` |
 | `rag_engine.eval_check` | `check_questions`, `load_catalogue`, `format_check`, `QuestionCheck`, `CatalogueEntry`, `DocumentReference` |
 | `rag_engine.cli` | `main` (the `rag-engine` command) |
@@ -52,10 +52,13 @@ The package root exposes only `__version__`. Everything else is imported from it
 | Class | Module | Raised when |
 |---|---|---|
 | `ConfigError` (also a `ValueError`) | `rag_engine.config` | a setting has an invalid value |
-| `StoreError` | `rag_engine.store` | base of the three below |
+| `StoreError` | `rag_engine.store` | base of the six below |
 | `QdrantAuthError` | `rag_engine.store` | Qdrant refuses the API key (HTTP 401 or 403) |
 | `CollectionMismatchError` | `rag_engine.store` | a collection is not one unnamed cosine vector of the expected dimension, or a payload field is indexed with another kind of index |
 | `CollectionNotFoundError` | `rag_engine.store` | `check_collection` is asked about a collection that does not exist |
+| `ReservedKeyError` (also a `ValueError`) | `rag_engine.store` | `set_payload` is asked to set a payload key the engine owns (`doc_id`, `filename`, `chunk_number`, `ingestion_date`, `text`, `page`) |
+| `DateFieldsError` (also a `ValueError`) | `rag_engine.store` | `set_payload` is given one of `date`, `date_precision`, `date_start`, `date_end` without the others, or an interval that is not the one of the date: build them with `date_fields` |
+| `MissingIndexError` | `rag_engine.store` | a collection in strict mode refuses a filter on a payload field that has no index (HTTP 400): create the indexes with `ensure_payload_indexes` |
 | `UnsupportedFormatError` (also a `ValueError`) | `rag_engine.chunking` | a file has an extension the engine does not read |
 | `SearchError` (also a `ValueError`) | `rag_engine.search` | a search argument or a filter cannot be used as it is |
 | `EvalError` (also a `ValueError`) | `rag_engine.eval` | a question file, a question or an evaluation parameter is unusable |
@@ -102,6 +105,9 @@ In qdrant-client's local mode (`QdrantClient(":memory:")`, tests) a missing coll
 | `RAG_ENGINE_OCR_LANGUAGES` | `eng` | Tesseract languages joined by `+`, without whitespace, e.g. `eng+fra`. The caller passes it to `ingest_document` (see below) |
 | `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. The caller passes it to `search` (see [Searching](#searching)) |
 | `RAG_ENGINE_SEARCH_MAX_LIMIT` | `50` | Largest limit a caller may ask for; not below the default limit. Passed to `search` by the caller too |
+| `RAG_ENGINE_DATE_FILTER_MODE` | `auto` | How a date bound of a search is applied: `auto`, `interval` or `legacy` (case-insensitive); see [Date bounds and intervals](#date-bounds-and-intervals). Passed to `search` by the caller too (`date_filter_mode=settings.date_filter_mode`) |
+| `RAG_ENGINE_DATE_FILTER_REFRESH` | `300` | In `auto` mode, seconds a store keeps what it read of a collection (are `date_start` and `date_end` indexed?) before it asks again: zero or a positive number; `0` asks before every search with a date bound. Passed to `search` by the caller too (`date_filter_refresh=settings.date_filter_refresh`) |
+| `RAG_ENGINE_DATE_FILTER_RETRY` | `30` | In `auto` mode, seconds a store waits before it tries again to read a collection it could not read: zero or a positive number. Meanwhile a search with a date bound is served with the last known answer, or the `legacy` filter. Passed to `search` by the caller too (`date_filter_retry=settings.date_filter_retry`) |
 
 An unset or blank variable gives the default, and surrounding whitespace is ignored. An invalid value raises `ConfigError` (a `ValueError`) naming the variable and the value as it was set, cut to 80 characters.
 
@@ -200,11 +206,74 @@ What it guarantees:
 - **One ingestion date per document.** Every point of a document carries the same `ingestion_date`, the local time of the ingestion as an ISO string (or the `ingestion_date` argument, for a replay or a test).
 - **Nothing written for an empty document.** A file with no extractable text gives `IngestResult(chunks=0, pages=0, empty=True)`; the embedder and the store are not called. It is not an error.
 - **Errors propagate.** Nothing is caught: an unsupported format, a parser error, an embedding error or a Qdrant error reaches the caller unchanged, and the caller decides what a failed document means. A store error carries the number of points written before it in `points_written`; a failed write is not undone, and ingesting the document again repairs it.
-- **Checked before any work.** A blank `doc_id` or `collection`, an unusable `batch_size`, an `ocr_languages` the settings would refuse, or metadata that sets a reserved payload key (`filename`, `chunk_number`, `ingestion_date`, `text`, `page`, or a `doc_id` different from the document's own) raises `ValueError` before the file is read. A `doc_id` equal to the document's id is accepted.
+- **Checked before any work.** A blank `doc_id` or `collection`, an unusable `batch_size`, an `ocr_languages` the settings would refuse, or metadata that sets a reserved payload key (`filename`, `chunk_number`, `ingestion_date`, `text`, `page`, or a `doc_id` different from the document's own) or a derived one (`date_start`, `date_end`) raises `ValueError` before the file is read. A `doc_id` equal to the document's id is accepted.
 
 `IngestResult.pages` counts the distinct pages chunks start on (0 for a format without pages). The other arguments are `ocr`, `ocr_languages` and `chunking_options` (see below), and `batch_size` (points per write; left out, the batch size of the store, which is `RAG_ENGINE_BATCH_SIZE` when the store was built from the settings). The batch size does not bound memory or the embedding call: all the chunk texts of a document are embedded in one `encode_passage` call.
 
-The points are the ones the previous pipeline wrote: `tests/fixtures/golden/` holds points captured from it for two documents, and the tests require the same ids, payloads and vectors.
+The points are the ones the previous pipeline wrote, plus two payload keys: `tests/fixtures/golden/` holds points captured from that pipeline for two documents, and the tests require the same ids, the same vectors, every captured payload key with its value and in its order, and nothing more than `date_start` and `date_end` after them.
+
+### Payload schema
+
+One point is one chunk. Its payload is version 2 of the schema (`rag_engine.schema.PAYLOAD_SCHEMA_VERSION`): version 1, the payload the previous pipeline wrote, and two keys the engine derives. The version is the name of the layout; it is not stored in the points.
+
+| Keys | Written by | What |
+|---|---|---|
+| `doc_id` | the engine | the id of the document, first key of the payload |
+| `corpus`, `source_code`, `doc_type`, `title`, `date`, `year`, `language`, `sha256`, `provenance`, and any other key | the caller's `metadata`, copied as given | what the source knows of the document. `date_precision` (`day`, `month`, `year`) and `date_kind` (`meeting`, `publication`, `period`) are such keys: ordinary metadata, not reserved |
+| `filename`, `chunk_number`, `ingestion_date`, `text`, `page` (absent for a format without pages) | the engine | which chunk the point is and where it comes from |
+| `date_start`, `date_end` (**new in version 2**; absent without a readable `date`) | the engine, from `date` and `date_precision` | the first and the last day the document is dated to |
+
+**The interval.** A producer that knows a document to the month or to the year only stores the first day of the period in `date` and says so in `date_precision`. `rag_engine.schema.date_interval(date, date_precision)` turns the two into the interval a search compares with its bounds:
+
+| `date_precision` | `date_start` | `date_end` |
+|---|---|---|
+| `day` | the day | the same day |
+| `month` | the first day of the month `date` falls in | its last day (28, 29, 30 or 31) |
+| `year` | 1 January of the year `date` falls in | 31 December |
+| absent, null, or any other value (`"Month"`, `"quarter"`, a number) | as `day` | as `day` |
+
+Both are RFC 3339 strings at midnight UTC, and **`date_end` is the last day itself, not the day after**: `2016-07-01` with `month` gives `2016-07-01T00:00:00Z` and `2016-07-31T00:00:00Z`. An unknown precision is read as a day because that is what every point written before version 2 means. A document without a date, or with a date that is not a full one (`null`, `""`, `"2016-03"`, `"2016"`), has no interval, whatever its precision; nothing is raised. `date` itself is never rewritten.
+
+**Which `date` values give an interval.** **The supported input is a full date written `YYYY-MM-DD`**: it is what the producers of the corpus write, and the engine and the datetime index of Qdrant read it alike. The engine also reads a date followed by a time (`2016-03-10T15:30:00Z`, `2016-03-10 15:30`, with or without an offset): the interval is then built on the **UTC day** of that instant, so `2016-03-11T00:30:00+02:00` is dated 10 March, and with `month` or `year` it is the month or the year of that UTC day. The engine has its own reader, close to the one of Qdrant but not the same, and a few forms are read by one only (checked on Qdrant 1.20):
+
+| Stored `date` | The engine (interval) | The datetime index (`date`) | What a date bound does with the document |
+|---|---|---|---|
+| a time without seconds followed by `Z` or an offset: `2016-03-10T12:00Z` | reads | does not read | found by its interval only; in `legacy` mode, and until it has its interval, it counts as undated |
+| a leading space or a leading `+`: `" 2016-03-10"`, `"+2016-03-10"`; a 60th second: `2016-03-10T12:00:60Z`; a list holding a date: `["2016-03-10"]` | does not read: no interval | reads | found by its `date` in every mode, as a day, whatever its `date_precision` |
+
+None of these comes from a producer of the corpus; a source that writes one should be corrected rather than relied on.
+
+`date_start` and `date_end` cannot be given in the metadata (`rag_engine.schema.DERIVED_KEYS`): a pair that disagreed with `date` would make a search answer two ways.
+
+### Correcting the payload of a document
+
+`QdrantStore.set_payload(collection, doc_id, fields)` sets payload keys on every point of one document, without a new embedding: the vectors are not sent, read or rewritten, the ids and the other keys do not change. It returns the number of points of the document; a document without any point gives 0 and writes nothing.
+
+```python
+from rag_engine.schema import date_fields
+
+# A date that was a placeholder: the document is of July 2016, known to the month.
+store.set_payload(
+    "central-bank-e5b-v1",
+    doc_id,
+    {**date_fields("2016-07-01", "month", year=2016), "date_kind": "meeting", "title": "Minutes, July 2016"},
+)
+```
+
+- **A date is changed with `date_fields`, and in no other way.** A search reads four keys: `date`, `date_precision`, `date_start` and `date_end` (`rag_engine.schema.DATE_KEYS`). `date_fields(date, date_precision=None, *, year=...)` returns the four, the interval being the one an ingestion writes, and `year` when it is given. `set_payload` checks it: a call that sets one of the four must set them all, and `date_start` / `date_end` must be the interval of the `date` and `date_precision` of the same call. Anything else is a `DateFieldsError` (a `StoreError` and a `ValueError`) that names what is missing or wrong, and nothing is sent. Without the check, a new `date` kept its old interval, an interval written alone kept the old `date` (which still passes a bound by itself), and a withdrawn date kept its interval: in each case the document was found under a date it no longer had.
+- **Giving, changing, withdrawing.** `date_fields("2016-07-13", "day")` for a date; `date_fields(date, precision)` with the values a document already has, to give their interval to points written before version 2; `date_fields(None)` to withdraw a date: the four keys are removed and the document is undated from then on.
+- **`year` is the caller's.** The engine does not derive it and does not check it against `date`; no filter of `search` reads it. Left out of `date_fields`, the points keep the `year` they have, so **a correction that moves a date to another year passes `year=` too** (`year=None` removes it).
+- **A `None` removes the key** (Qdrant merges the fields into the payload and drops a null; checked on 1.20). This is how `date_fields("2016-07-13")`, which has no precision, erases a stored `date_precision`.
+- **Reserved keys are refused** with a `ReservedKeyError` (a `StoreError` and a `ValueError`) naming them: `doc_id`, `filename`, `chunk_number`, `ingestion_date`, `text`, `page` say which chunk a point is and change only by ingesting the document again. A `fields` that is empty or not a mapping, and a blank `doc_id`, are a `ValueError`. Nothing is sent in either case.
+- **Not while the same document is being ingested.** The method counts, then writes: two requests. Points of the document written between the two may not be counted (the returned number is then too low), and a batch of an ingestion that started before the correction and lands after it writes whole payloads, with the old metadata. Correct a document when no ingestion of it runs; after one, a correction can simply be repeated.
+- Both requests go through a filter on `doc_id`, and the write waits until it is applied. A refused API key is a `QdrantAuthError`. A collection in strict mode without an index on `doc_id` refuses the filter: a `MissingIndexError` that names the field and `ensure_payload_indexes`. Any other failure is raised as the client raised it. Repeating the call changes nothing more.
+
+**Upgrading a collection written before version 2.** In any order, and while it is searched:
+
+1. `store.ensure_payload_indexes(collection)` creates the indexes on `date_start` and `date_end` (it returns their two names). From then on a search in `auto` mode uses the intervals; no document is lost meanwhile ([Date bounds and intervals](#date-bounds-and-intervals)).
+2. For each document, `store.set_payload(collection, doc_id, date_fields(date, date_precision, year=year))` with the values of the source: it writes the interval, and corrects the date, the precision and the year where the source has changed. A document without a date is given `date_fields(None)`, which leaves it without the four keys.
+
+The vectors are byte for byte the same afterwards, and the payloads are those an ingestion under version 2 writes.
 
 ## Payload indexes
 
@@ -214,14 +283,16 @@ Search filters need payload indexes: Qdrant answers a filter on an indexed field
 |---|---|---|
 | `doc_id`, `source_code`, `doc_type`, `language`, `corpus` | keyword | exact match, one value or several |
 | `year` | integer | exact match and range |
-| `date` | datetime | range |
+| `date` | datetime | range (date bounds in `legacy` mode) |
+| `date_start`, `date_end` | datetime | range (date bounds in `interval` mode); **their presence is what `auto` mode reads** |
 
 `QdrantStore.ensure_payload_indexes` creates the ones a collection does not have yet and returns the fields it created an index for:
 
 ```python
 store = QdrantStore(settings=Settings.from_env())
 store.ensure_payload_indexes("central-bank-e5b-v1")
-# ['doc_id', 'source_code', 'doc_type', 'language', 'corpus', 'year', 'date'] the first time, [] afterwards
+# ['doc_id', 'source_code', 'doc_type', 'language', 'corpus', 'year', 'date', 'date_start', 'date_end']
+# the first time, [] afterwards; ['date_start', 'date_end'] on a collection indexed before schema version 2
 ```
 
 - **On an existing collection.** An index is built from the points already there; no point is rewritten, no document has to be ingested again. The call returns once every index is built and usable. Run it once per collection, before or after ingesting; running it again does nothing and returns `[]`.
@@ -230,6 +301,7 @@ store.ensure_payload_indexes("central-bank-e5b-v1")
 - **Never replaces an index.** If a field is already indexed with another kind (a keyword index on `date`, say), the call raises `CollectionMismatchError` naming the field, the expected kind and the one found, and creates nothing. Qdrant itself would drop the existing index and build the other one; removing an index stays a decision of the operator (`store.client.delete_payload_index`).
 - **Errors.** A refused API key is a `QdrantAuthError`. A collection that does not exist is not created: the error of the client is raised, like any other failure. Indexes created before a failure stay, and a second call creates the rest.
 - **Another list.** `ensure_payload_indexes(collection, [("page", "integer")])` takes any list of `(field, kind)`, a kind being the name of a Qdrant payload index type.
+- **Creating the two date indexes changes how date bounds are applied.** A search in `auto` mode uses the intervals on a collection where `date_start` and `date_end` are both indexed. It is safe to create them before the points written under schema version 1 have their interval: see [Date bounds and intervals](#date-bounds-and-intervals).
 
 **A value an index cannot read.** No value is ever refused, neither when an index is built nor when a point is written: the point stays stored, and a search without a filter on that field still returns it. But **a filter on that field no longer sees it**. Checked on Qdrant 1.20:
 
@@ -237,11 +309,11 @@ store.ensure_payload_indexes("central-bank-e5b-v1")
 |---|---|---|
 | `year` (integer) | an integer (`2016`), a float with an integral value (`2016.0`) | a string (`"2016"`), a float such as `2016.5`, a boolean, a null, a missing key |
 | keyword fields | a string, a list of strings | a number, a boolean, a null, a missing key: a filter, which matches strings, never finds them |
-| `date` (datetime) | `2016-03-10` (taken as midnight UTC); with a time after `T` or a space (`2016-03-10T12:00:00`, `2016-03-10 12:00:00`, `2016-03-10T12:00`); with `Z` or an offset (`2016-03-10T12:00:00+02:00`); also the lenient `2016-3-10` | `2016-03`, `2016`, an empty string, a null, a missing key, an integer (`20160310`, a Unix timestamp), `10/03/2016` |
+| `date`, `date_start`, `date_end` (datetime) | `2016-03-10` (taken as midnight UTC); with a time after `T` or a space (`2016-03-10T12:00:00`, `2016-03-10 12:00:00`, `2016-03-10T12:00`); with `Z` or an offset (`2016-03-10T12:00:00+02:00`); also the lenient `2016-3-10` | `2016-03`, `2016`, an empty string, a null, a missing key, an integer (`20160310`, a Unix timestamp), `10/03/2016` |
 
 The index changes the answer in one case: without an integer index, a range on `year` still matches `2016.5`; once the index exists it does not. A `year` stored as the string `"2016"` matches no integer range, with or without the index. **Before creating the indexes on a collection that already holds points, check the types of the stored values** of `year` and of the keyword fields (read a sample with `store.client.scroll(collection, with_payload=["year", "source_code", "doc_type", "language", "corpus", "doc_id"])`): a field written with another type has to be rewritten before its filter can be trusted.
 
-**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. A document without a date the index reads is left out as soon as a date bound is set, with or without the index; its `year` is indexed on its own, but `search` has no filter on `year` in this version.
+**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. `date_start` and `date_end` are the engine's own, always written at midnight UTC ([Payload schema](#payload-schema)). A document without a date the index reads is left out as soon as a date bound is set, with or without the index, unless the search asks for the undated documents (`include_undated`); its `year` is indexed on its own, but `search` has no filter on `year` in this version.
 
 **Date bounds.** A bound must be a full date, and what happens to another value depends on how it reaches Qdrant:
 
@@ -257,7 +329,7 @@ qdrant-client's local mode (`QdrantClient(":memory:")`) keeps no payload index: 
 
 `search` (in `rag_engine.search`, base install) embeds a query, asks Qdrant for the closest chunks that pass the filters, and returns them as `Hit` objects, best first. It is one dense cosine search; several chunks of one document may come back, nothing is grouped.
 
-Like `ingest_document`, `search` reads no settings and no environment variable. The caller builds everything from `Settings.from_env()` and passes it on, the two limits included: without `limit=settings.search_limit` and `max_limit=settings.search_max_limit`, the limits are the built-in 10 and 50, whatever `RAG_ENGINE_SEARCH_LIMIT` and `RAG_ENGINE_SEARCH_MAX_LIMIT` say.
+Like `ingest_document`, `search` reads no settings and no environment variable. The caller builds everything from `Settings.from_env()` and passes it on, the two limits included: without `limit=settings.search_limit` and `max_limit=settings.search_max_limit`, the limits are the built-in 10 and 50, whatever `RAG_ENGINE_SEARCH_LIMIT` and `RAG_ENGINE_SEARCH_MAX_LIMIT` say. The same goes for `date_filter_mode`, `date_filter_refresh` and `date_filter_retry` (built-in `auto`, 300 and 30 seconds).
 
 ```python
 from rag_engine.config import Settings
@@ -280,17 +352,21 @@ hits = search(
     filters=SearchFilters(
         source_codes=["ecb", "fed"],  # ecb OR fed
         doc_types=["monetary-policy-statement", "minutes"],  # AND one of these types
-        date_from="2016-01-01",  # AND published from this day...
+        date_from="2016-01-01",  # AND dated from this day...
         date_to="2016-03-10",  # ...to this day, both included
+        # include_undated=True,  # also the documents without any date
     ),
     limit=settings.search_limit,  # RAG_ENGINE_SEARCH_LIMIT; not read otherwise
     max_limit=settings.search_max_limit,  # RAG_ENGINE_SEARCH_MAX_LIMIT; not read otherwise
+    date_filter_mode=settings.date_filter_mode,  # RAG_ENGINE_DATE_FILTER_MODE; not read otherwise
+    date_filter_refresh=settings.date_filter_refresh,  # RAG_ENGINE_DATE_FILTER_REFRESH; not read otherwise
+    date_filter_retry=settings.date_filter_retry,  # RAG_ENGINE_DATE_FILTER_RETRY; not read otherwise
 )
 for hit in hits:
     print(f"{hit.score:.3f}", hit.doc_id, hit.date, hit.page, hit.text[:80])
 ```
 
-**Check the collection once, at start.** `search` itself sends one request and checks nothing: on a collection that does not exist, or that has another dimension, it raises the error of the Qdrant client, at the first query. A search service therefore calls `store.check_collection(collection, embedder.dim)` once when it starts. It sends two read requests and never creates or changes anything, so it works with a read-only API key, and it says what is wrong in the engine's own words:
+**Check the collection once, at start.** `search` itself sends one request (and, in `auto` mode with a date bound, one read of the collection every `date_filter_refresh` seconds) and checks nothing: on a collection that does not exist, or that has another dimension, it raises the error of the Qdrant client, at the first query. A search service therefore calls `store.check_collection(collection, embedder.dim)` once when it starts. It sends two read requests and never creates or changes anything, so it works with a read-only API key, and it says what is wrong in the engine's own words:
 
 | `check_collection` raises | When |
 |---|---|
@@ -315,7 +391,7 @@ filters = SearchFilters.from_mapping(arguments)  # SearchFilters(source_codes=["
 
 SearchFilters.from_mapping({"source": ["ecb"]})
 # SearchError: unknown filter 'source' (the filters are: source_codes, doc_types, languages, doc_ids,
-# date_from, date_to, corpus)
+# date_from, date_to, corpus, include_undated)
 ```
 
 The keys are the field names below. A missing key and a `null` both mean "not set"; a key that is not a field is a `SearchError` naming it and listing the fields (`SearchFilters(**arguments)` would raise a bare `TypeError`); the values are checked exactly as the constructor checks them.
@@ -323,7 +399,8 @@ The keys are the field names below. A missing key and a `null` both mean "not se
 | Field | Payload field | Value |
 |---|---|---|
 | `source_codes`, `doc_types`, `languages`, `doc_ids` | `source_code`, `doc_type`, `language`, `doc_id` | a list (or tuple, or set) of non-blank strings, matched exactly |
-| `date_from`, `date_to` | `date` | a `datetime.date`, or a string written exactly `YYYY-MM-DD` |
+| `date_from`, `date_to` | `date_start` and `date_end`, or `date` (see below) | a `datetime.date`, or a string written exactly `YYYY-MM-DD` |
+| `include_undated` | none | `True` or `False` (the default); a JSON `true` or `false`, never `1` or `"true"` |
 | `corpus` | `corpus` | one non-blank string |
 
 - Fields are combined with **AND**; the values of one list with **OR**.
@@ -333,7 +410,27 @@ The keys are the field names below. A missing key and a `null` both mean "not se
 - A string that cannot be encoded as UTF-8 is refused, in a list and as `corpus`: a lone surrogate, which `json.loads('"\\ud800"')` returns and a client may therefore send. The error names the field, instead of the serialisation error the Qdrant client would raise later.
 - There is no filter on `year` in this version.
 
-**Dates.** Both bounds are inclusive, and a bound is a whole day in UTC: `date_to="2016-03-10"` keeps a document stored as `2016-03-10` and one stored as `2016-03-10T15:30:00Z`. (The upper bound is sent to Qdrant as "before the next day at 00:00 UTC", so it does not depend on the time of day a date was stored with.) Only a full date is a bound: `"2016"`, `"2016-03"`, `"10/03/2016"`, a date with a time, a `datetime.datetime` or a number raise a `SearchError`, and so does `date_from` after `date_to`. The check is the engine's own, on purpose: handed the string `"2016"`, qdrant-client reads a Unix timestamp and the filter matches almost everything. **As soon as one bound is set, a chunk without a full date is left out**: no `date`, a null, an empty string, or an imprecise date such as `2016-03` (see [Payload indexes](#payload-indexes)).
+**Dates.** Both bounds are inclusive, and a bound is a whole day in UTC: `date_to="2016-03-10"` keeps a document stored as `2016-03-10` and one stored as `2016-03-10T15:30:00Z`. (The upper bound is sent to Qdrant as "before the next day at 00:00 UTC", so it does not depend on the time of day a date was stored with.) Only a full date is a bound: `"2016"`, `"2016-03"`, `"10/03/2016"`, a date with a time, a `datetime.datetime` or a number raise a `SearchError`, and so does `date_from` after `date_to`. The check is the engine's own, on purpose: handed the string `"2016"`, qdrant-client reads a Unix timestamp and the filter matches almost everything. **As soon as one bound is set, a chunk without a full date is left out, unless `include_undated` is true**: no `date`, a null, an empty string, or a partial date such as `2016-03` (see [Payload indexes](#payload-indexes)).
+
+### Date bounds and intervals
+
+A document is not always dated to the day. The minutes of a meeting may be known to the month, a report to the year; the producer then stores the first day of the period in `date` and says `month` or `year` in `date_precision`, and the engine stores the whole period as `date_start` and `date_end` ([Payload schema](#payload-schema)). A date bound can be compared with either, and `date_filter_mode` says which.
+
+| `date_filter_mode` | A chunk passes the bounds when | The filter sent to Qdrant (`first`, `last`: `date_from`, `date_to` at 00:00 UTC) |
+|---|---|---|
+| `legacy` | its `date` is a day of the range. A document of July 2016, stored as `2016-07-01`, is found on 1 July and nowhere else in July | `must: date >= first AND date < last + 1 day` — the filter of schema version 1, unchanged |
+| `interval` | the interval it is dated to has at least one day in common with the range, both bounds included: a document of July 2016 passes `date_from="2016-07-14", date_to="2016-07-14"`, a document of the year 2016 passes any range that touches 2016. **Or** its `date` is a day of the range | `must: should [ (date_start <= last AND date_end >= first), (date >= first AND date < last + 1 day) ]` |
+| `auto` (the default) | as `interval` on a collection where `date_start` and `date_end` both have a datetime index, as `legacy` on any other | one of the two above |
+
+With one bound only, the conditions on the other bound are left out. The overlap is exact because of the stored form: both ends at midnight UTC, the end being the last day itself, so two inclusive comparisons decide, whatever the length of the month. A document dated to the day has `date_start = date_end`, and the two modes give it the same answer for every range.
+
+**`auto`, and how fast it follows a collection.** The store reads the payload schema of the collection (`QdrantStore.has_date_intervals`: one `get_collection` request, which a read-only API key may send) and keeps the answer for `date_filter_refresh` seconds, per store and per collection. A search without a date bound never asks. A collection whose two indexes are created while a search service runs is therefore followed at most `date_filter_refresh` seconds later (300 by default), without a restart; `0` asks before every search with a date bound. The store that creates the indexes itself (`ensure_payload_indexes`) forgets its answer at once. Each time the answer for a collection is first known, or changes, the store logs one line at INFO level (logger `rag_engine.store`). Local mode keeps no index, so `auto` is `legacy` there; `date_filter_mode="interval"` works on any collection, indexed or not, unless the collection is in Qdrant's strict mode: there a filter on a field without an index is refused, and the engine raises a `MissingIndexError` that names the field and `ensure_payload_indexes`.
+
+**`auto` is never a new reason for a search to fail.** When the read of the collection fails or times out, the search is still sent: with the last answer the store had for that collection, however old, or with the `legacy` filter when it never had one. The store logs one WARNING when a collection stops being readable (not one per search) and one INFO line when it can be read again, and leaves the collection alone for `date_filter_retry` seconds (30 by default, `RAG_ENGINE_DATE_FILTER_RETRY`) before it tries the read again: no search in between sends it. A refused API key is treated like any other failure of that read, and the search that follows, sent with the same key, raises the `QdrantAuthError` itself. A read that times out costs the one search that tries it the timeout of the store, once per retry delay: a search service keeps `RAG_ENGINE_QDRANT_TIMEOUT` short. (`QdrantStore.uses_date_intervals` is this tolerant reading; `has_date_intervals` raises.)
+
+**A collection that is half upgraded loses nothing.** The indexes can exist before every point has its interval: a collection written under schema version 1 gets the indexes from the next `ensure_payload_indexes`, and its points get `date_start` and `date_end` later, document by document, from `set_payload` and `date_fields`. This is why the interval filter keeps the legacy condition as a second way in: a chunk that has a `date` and no interval yet passes exactly as it did before. For a chunk that has its interval the second condition adds nothing, since the day of its `date` is always inside its interval. So, **for every range, whatever part of the collection has been upgraded: every chunk the legacy filter returns, the interval filter returns too**; the upgrade only adds the month and year documents inside their period. `tests/integration/test_date_intervals_integration.py` checks it on a real server for several hundred ranges, on a collection half upgraded and on one upgraded step by step under a running reader.
+
+**Undated documents.** `include_undated=True` also lets through the chunks that have no readable date at all: no `date` the datetime index reads in `legacy` mode; neither such a `date` nor a `date_start` in `interval` mode (`should [..., must_not [date_start readable, date readable]]`). The dated chunks outside the range are still left out. Without a date bound the option changes nothing: no filter is sent for it. The default, `False`, is the behaviour of every earlier version.
 
 **Queries.** A query must hold something to search for: at least one letter, number, symbol or punctuation mark (Unicode general categories L, N, S, P), in any script. `"2016"`, `"€"` and `"$AAPL"` are queries, and so is punctuation alone (`"???"`): degenerate, but typed. A query made only of combining marks, zero-width or other invisible characters, control characters and spaces is refused with a `SearchError` ("the query has no searchable character") instead of returning a full ranked list for a question that asks nothing. The rule holds for the normalised query too: an isolated accent such as `"¨"` or `"´"`, which NFKD writes as a space and a combining mark, is refused when it is the whole query. A query or a collection name that cannot be encoded as UTF-8 (a lone surrogate) is refused as well.
 

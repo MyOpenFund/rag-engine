@@ -9,6 +9,7 @@ ones the previous pipeline wrote for them (``expected.json``, see the README of 
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 from pathlib import Path
 from types import MappingProxyType
@@ -22,7 +23,7 @@ from rag_engine.chunking import Chunk, ChunkingOptions, UnsupportedFormatError
 from rag_engine.config import ConfigError, Settings
 from rag_engine.embedding import FakeEmbedder, ModelSpec
 from rag_engine.ingest import IngestResult, ingest_document
-from rag_engine.schema import RESERVED_KEYS, point_id
+from rag_engine.schema import DERIVED_KEYS, RESERVED_KEYS, date_interval_fields, point_id
 from rag_engine.store import QdrantAuthError, QdrantStore
 
 GOLDEN_DIR = Path(__file__).parent / "fixtures" / "golden"
@@ -30,6 +31,8 @@ SPEC = ModelSpec(name="fake", dim=8, passage_prefix="passage: ", query_prefix="q
 COLLECTION = "docs-fake-v1"
 DOC_ID = "ecb/press-release/2025-01-30"
 METADATA = {"corpus": "central-bank", "source_code": "ecb", "date": "2025-01-30", "year": 2025}
+# What the engine derives from the date of METADATA (schema v2).
+INTERVAL = {"date_start": "2025-01-30T00:00:00Z", "date_end": "2025-01-30T00:00:00Z"}
 WHEN = "2026-01-02T03:04:05.000006"
 
 
@@ -145,6 +148,7 @@ def test_one_point_per_chunk_with_the_schema_payload_and_the_passage_vector(setu
         "ingestion_date": WHEN,
         "text": "third chunk",
         "page": 2,
+        **INTERVAL,
     }
     assert list(points[2].payload) == [
         "doc_id",
@@ -154,6 +158,8 @@ def test_one_point_per_chunk_with_the_schema_payload_and_the_passage_vector(setu
         "ingestion_date",
         "text",
         "page",
+        "date_start",
+        "date_end",
     ]
     expected = FakeEmbedder(SPEC).encode_passage([chunk.text for chunk in THREE])
     for point, vector in zip(points, expected):
@@ -232,6 +238,8 @@ def test_metadata_without_date_is_accepted(setup, monkeypatch):
     stub_chunker(monkeypatch, THREE)
     setup.ingest(metadata={"corpus": "central-bank"})
     assert all("date" not in point.payload for point in setup.client.written)
+    assert all("date_start" not in point.payload for point in setup.client.written)
+    assert all("date_end" not in point.payload for point in setup.client.written)
     assert setup.client.written[0].payload["corpus"] == "central-bank"
 
 
@@ -587,6 +595,7 @@ def test_end_to_end_in_qdrant_local_mode_and_a_second_ingestion_overwrites_in_pl
         "ingestion_date": later,
         "text": "chunk number 4",
         "page": 3,
+        **INTERVAL,
     }
     assert {record.payload["ingestion_date"] for record in stored} == {later}
     np.testing.assert_allclose(
@@ -618,6 +627,15 @@ def test_a_missing_collection_is_an_error_not_a_creation(memory_store, monkeypat
 
 GOLDEN = json.loads((GOLDEN_DIR / "expected.json").read_text(encoding="utf-8"))
 GOLDEN_DOCUMENTS = {document["file"]: document for document in GOLDEN["documents"]}
+#: expected.json is the capture of the previous pipeline and is never edited: this is its hash.
+GOLDEN_SHA256 = "37decb35098adcb1292eb083feeeefdf90cc402cf2d8ef1c56f05539c91e398d"
+#: What schema v2 adds to every point of a golden document, per ``doc_id``: the two derived keys.
+GOLDEN_V2_KEYS = json.loads((GOLDEN_DIR / "expected_v2_keys.json").read_text(encoding="utf-8"))
+
+
+def golden_payload(document: dict, captured: dict) -> dict:
+    """The payload the engine must write for a captured one: the same, then the keys of schema v2."""
+    return {**captured, **GOLDEN_V2_KEYS[document["doc_id"]]}
 
 
 def golden_run(document: dict, **kwargs) -> tuple[IngestResult, list]:
@@ -635,6 +653,19 @@ def golden_run(document: dict, **kwargs) -> tuple[IngestResult, list]:
     )
     assert {name for name, _ in client.calls} == {document["collection"]}
     return result, client.written
+
+
+def test_the_capture_of_the_previous_pipeline_is_untouched_and_the_v2_keys_are_the_only_addition():
+    assert hashlib.sha256((GOLDEN_DIR / "expected.json").read_bytes()).hexdigest() == GOLDEN_SHA256
+    assert set(GOLDEN_V2_KEYS) == {document["doc_id"] for document in GOLDEN_DOCUMENTS.values()}
+    for document in GOLDEN_DOCUMENTS.values():
+        added = GOLDEN_V2_KEYS[document["doc_id"]]
+        assert list(added) == list(DERIVED_KEYS)
+        # Derived from the captured metadata, by the function a later correction calls too.
+        metadata = document["metadata"]
+        assert added == date_interval_fields(metadata["date"], metadata.get("date_precision"))
+        for point in document["points"]:
+            assert not set(DERIVED_KEYS) & set(point["payload"])  # the capture is schema v1
 
 
 def test_the_golden_fixture_is_the_one_described():
@@ -673,11 +704,20 @@ def test_the_points_are_exactly_the_ones_of_the_previous_pipeline(name):
     assert len(points) == len(expected)
     assert [point.id for point in points] == [point["id"] for point in expected]
     for point, golden in zip(points, expected):
-        assert point.payload == golden["payload"]
-        assert list(point.payload) == list(golden["payload"])  # same key order too
+        # Every key the previous pipeline wrote, with its value, in its order...
+        captured = golden["payload"]
+        assert {key: point.payload[key] for key in captured} == captured
+        assert list(point.payload)[: len(captured)] == list(captured)  # same key order too
+        # ... and nothing after them but the two keys of schema v2.
+        assert list(point.payload)[len(captured) :] == list(DERIVED_KEYS)
+        assert point.payload == golden_payload(document, captured)
         assert point.vector == golden["vector"]
     # Through JSON as well: what is sent to Qdrant is the same document, types included.
-    assert json.loads(json.dumps([point.payload for point in points])) == [p["payload"] for p in expected]
+    assert json.loads(json.dumps([point.payload for point in points])) == [
+        golden_payload(document, p["payload"]) for p in expected
+    ]
+    without = [{k: v for k, v in point.payload.items() if k not in DERIVED_KEYS} for point in points]
+    assert json.loads(json.dumps(without)) == [p["payload"] for p in expected]
 
     pages = {point["payload"]["page"] for point in expected if "page" in point["payload"]}
     assert result == IngestResult(chunks=len(expected), pages=len(pages), empty=False)
@@ -710,7 +750,9 @@ def test_without_ingestion_date_a_real_document_gets_one_iso_date_for_all_its_po
     assert isinstance(datetime.datetime.fromisoformat(when), datetime.datetime)
     # Everything but the date is still what the previous pipeline wrote.
     for point, golden in zip(points, document["points"]):
-        assert {**point.payload, "ingestion_date": document["ingestion_date"]} == golden["payload"]
+        assert {**point.payload, "ingestion_date": document["ingestion_date"]} == golden_payload(
+            document, golden["payload"]
+        )
 
 
 @pytest.mark.parametrize("content", ["", "   \n\n\t\n"], ids=["empty", "blank"])
@@ -739,4 +781,6 @@ def test_the_golden_default_ocr_mode_gives_the_same_points_on_a_host_without_ocr
         ingestion_date=document["ingestion_date"],
     )
     assert [point.id for point in client.written] == [point["id"] for point in document["points"]]
-    assert [point.payload for point in client.written] == [point["payload"] for point in document["points"]]
+    assert [point.payload for point in client.written] == [
+        golden_payload(document, point["payload"]) for point in document["points"]
+    ]

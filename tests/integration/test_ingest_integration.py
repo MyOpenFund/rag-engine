@@ -2,7 +2,8 @@
 
 The two documents of ``tests/fixtures/golden/`` are parsed with the real libraries, written to
 the server, and read back: what the server holds must be what the previous pipeline wrote
-(``expected.json``, see the README of that folder). ``tests/test_ingest.py`` checks the same
+(``expected.json``, see the README of that folder), with the two keys schema v2 adds to each
+payload (``expected_v2_keys.json``) and nothing else. ``tests/test_ingest.py`` checks the same
 points as they leave the engine; here they have gone through the server.
 """
 
@@ -34,6 +35,7 @@ GOLDEN_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "golden"
 GOLDEN = json.loads((GOLDEN_DIR / "expected.json").read_text(encoding="utf-8"))
 DOCUMENTS = GOLDEN["documents"]
 MARKDOWN = next(document for document in DOCUMENTS if document["file"].endswith(".md"))
+V2_KEYS = json.loads((GOLDEN_DIR / "expected_v2_keys.json").read_text(encoding="utf-8"))
 EXPECTED_POINTS = [point for document in DOCUMENTS for point in document["points"]]
 # A cosine collection may store the vectors normalised. Those of the FakeEmbedder already have
 # unit length, so what comes back differs from what was sent by float32 rounding at most.
@@ -101,7 +103,10 @@ def assert_holds(store, collection: str, expected: list[dict]) -> None:
     assert sorted(stored) == sorted(point["id"] for point in expected)
     for point in expected:
         record = stored[point["id"]]
-        assert record.payload == point["payload"]
+        # What the previous pipeline wrote, key for key, and the two derived keys of schema v2.
+        added = V2_KEYS[point["payload"]["doc_id"]]
+        assert {key: record.payload[key] for key in point["payload"]} == point["payload"]
+        assert record.payload == {**point["payload"], **added}
         assert len(record.vector) == len(point["vector"])
         assert record.vector == pytest.approx(point["vector"], abs=VECTOR_TOLERANCE)
 

@@ -6,8 +6,16 @@ pipeline produced for the two documents of this folder: `ingest_item` of the dat
 code moved into `rag_engine.ingest.ingest_document`.
 
 `tests/test_ingest.py` ingests the same two documents with `ingest_document` and asserts that
-the points are the same: same number, same order, same ids, same payloads (keys, key order and
-values), same vectors. This is what keeps the points already in Qdrant valid.
+the points are the same: same number, same order, same ids, same vectors, and every payload
+key of the capture with its value, in its order. This is what keeps the points already in
+Qdrant valid.
+
+Since payload schema v2 the engine writes two more keys after those, `date_start` and
+`date_end`, derived from the `date` of the metadata. They are not in `expected.json`, which
+stays the capture of the previous pipeline, byte for byte (the test pins its SHA-256). They
+are pinned next to it, in `expected_v2_keys.json`: per `doc_id`, the two keys every point of
+the document must carry. The test requires the payload of the engine to be the captured
+payload followed by exactly those two keys, and nothing else.
 
 **Do not regenerate `expected.json` to make a failing test pass.** A difference means the
 engine no longer writes what is stored.
@@ -19,6 +27,7 @@ engine no longer writes what is stored.
 | `monetary-policy-statement.md` | Markdown, six headed sections, French and English text. No pages: 5 points without `page`. |
 | `inflation-report-extract.pdf` | PDF, 3 pages (the second one short), written once by PyMuPDF. 3 points, on pages 0, 1 and 2. |
 | `expected.json` | The captured points and everything the test needs to reproduce them. |
+| `expected_v2_keys.json` | Written by hand, not captured: per `doc_id`, the `date_start` and `date_end` that payload schema v2 adds to each point (both documents are dated to the day). |
 
 `expected.json`, per document: `file`, `collection`, `doc_id`, `metadata` (the payload given
 by the source, as the vault source of the data-orchestrator builds it), `ingestion_date` (the one of the capture, which the test

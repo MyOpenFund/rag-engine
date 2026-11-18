@@ -43,7 +43,7 @@ def fixture_embedder() -> FakeEmbedder:
 
 
 def fixture_points(embedder: FakeEmbedder | None = None) -> list[models.PointStruct]:
-    """The corpus as schema v1 points, one per chunk, with the vectors of a ``FakeEmbedder``."""
+    """The corpus as schema v2 points, one per chunk, with the vectors of a ``FakeEmbedder``."""
     embedder = embedder if embedder is not None else fixture_embedder()
     points = []
     for document in fixture_corpus()["documents"]:

@@ -233,9 +233,11 @@ def _filters_dict(filters: SearchFilters | None) -> dict[str, Any] | None:
     result: dict[str, Any] = {}
     for name in FILTER_FIELDS:
         value = getattr(filters, name)
-        if value is None:
+        if value is None or value is False:  # False: the default of a boolean filter, not written
             continue
-        if isinstance(value, tuple):
+        if isinstance(value, bool):
+            result[name] = value
+        elif isinstance(value, tuple):
             result[name] = list(value)
         elif isinstance(value, str):
             result[name] = value
