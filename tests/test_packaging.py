@@ -1,15 +1,18 @@
 """Packaging guarantees: the base import stays light."""
 
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import os
 import pkgutil
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 # What the engine never imports at import time: the embedding backends and the document parsers.
 BACKENDS_AND_PARSERS = ("torch", "sentence_transformers", "fastembed", "chunknorris", "markitdown")
@@ -413,3 +416,204 @@ def test_the_package_does_not_need_the_evaluation_files():
     for module in (rag_engine.eval, rag_engine.cli):
         source = Path(module.__file__).read_text(encoding="utf-8")
         assert "__file__" not in source
+
+
+# Publication metadata: the distribution is published on PyPI as `myopenfund-rag-engine`.
+# The import name (`rag_engine`), the command and the tag prefix are unchanged.
+ROOT = PYPROJECT.parent
+DIST = "myopenfund-rag-engine"
+CREDIT = (
+    "Created and maintained by [Marc Jeulin](https://github.com/jeulinmarc), "
+    "part of [MyOpenFund](https://github.com/MyOpenFund)."
+)
+RELEASE = ROOT / ".github" / "workflows" / "release.yml"
+CI = ROOT / ".github" / "workflows" / "tests.yml"
+BLOB = "https://github.com/MyOpenFund/rag-engine/blob/main/"
+
+
+def _project(pyproject):
+    return pyproject["project"]
+
+
+def _workflow(path):
+    # PyYAML reads the bare key `on` as the boolean True.
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["on"] = data.pop(True, data.get("on"))
+    return data
+
+
+def _upload_index(steps):
+    return [i for i, s in enumerate(steps) if s.get("uses", "").startswith("actions/upload-artifact@")]
+
+
+def test_name_and_dynamic_version(pyproject):
+    project = _project(pyproject)
+    assert project["name"] == DIST
+    assert "version" in project["dynamic"]
+    assert "version" not in project
+    assert pyproject["tool"]["hatch"]["version"]["path"] == "src/rag_engine/__init__.py"
+
+
+def test_installed_version_matches_init():
+    import rag_engine
+
+    assert importlib.metadata.version(DIST) == rag_engine.__version__ == "0.1.0"
+
+
+def test_credit(pyproject):
+    project = _project(pyproject)
+    assert project["authors"] == [{"name": "Marc Jeulin"}]
+    assert project["maintainers"] == [{"name": "Marc Jeulin"}]
+    assert "myopenfund" in project["keywords"]
+    urls = project["urls"]
+    assert urls["Organization"] == "https://github.com/MyOpenFund"
+    assert urls["Homepage"] == "https://github.com/MyOpenFund/rag-engine"
+    assert urls["Source"] == "https://github.com/MyOpenFund/rag-engine"
+    assert urls["Issues"] == "https://github.com/MyOpenFund/rag-engine/issues"
+    assert urls["Changelog"] == f"{BLOB}CHANGELOG.md"
+    assert project["readme"] == "README.md"
+
+
+def test_license_spdx_without_classifier_and_python_classifiers(pyproject):
+    project = _project(pyproject)
+    assert project["license"] == "MIT"
+    assert not [c for c in project["classifiers"] if c.startswith("License ::")]
+    assert "Development Status :: 3 - Alpha" in project["classifiers"]
+    for version in ("3.10", "3.11", "3.12", "3.13"):
+        assert f"Programming Language :: Python :: {version}" in project["classifiers"]
+
+
+def test_license_copyright():
+    assert "Copyright (c) 2026 Marc Jeulin" in (ROOT / "LICENSE").read_text(encoding="utf-8")
+
+
+def test_readme_credit_install_and_migration():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    assert lines[0] == "# rag-engine"
+    assert next(line for line in lines[1:] if line.strip()) == CREDIT
+    for extra in ("onnx", "torch", "ingest"):
+        assert f'pip install "{DIST}[{extra}]"' in text
+    assert "`rag-engine[" not in text and 'pip install "rag-engine[' not in text
+    assert "pip uninstall -y rag-engine" in text
+    assert "git+https://github.com/MyOpenFund/rag-engine" in text
+    assert "**Working across repos**" in text
+
+
+def test_readme_links_are_absolute():
+    # README.md is the PyPI description: relative links would 404 there.
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "](#" not in text
+    targets = re.findall(r"\]\(([^)\s]+)\)", text)
+    assert targets
+    relative = [t for t in targets if not t.startswith("https://")]
+    assert not relative, relative
+    assert f"{BLOB}CHANGELOG.md" in text
+    assert f"{BLOB}eval/README.md" in text
+
+
+def test_dev_extra_has_pyyaml(pyproject):
+    assert any(d.startswith("pyyaml") for d in _project(pyproject)["optional-dependencies"]["dev"])
+
+
+def test_changelog_has_version_section():
+    lines = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith("## 0.1.0") for line in lines)
+
+
+def test_no_git_urls_in_metadata(pyproject):
+    project = _project(pyproject)
+    deps = list(project["dependencies"])
+    for extra in project["optional-dependencies"].values():
+        deps += extra
+    assert not [d for d in deps if "git+" in d or "@" in d]
+
+
+def test_release_workflow_publishes_through_environment():
+    workflow = _workflow(RELEASE)
+    assert workflow["permissions"] == {}
+    assert workflow["on"]["push"]["tags"] == ["v*"]
+    assert list(workflow["on"]["workflow_dispatch"]["inputs"]) == ["target"]
+    publish = workflow["jobs"]["publish"]
+    assert publish["environment"] == "${{ github.event_name == 'workflow_dispatch' && 'testpypi' || 'pypi' }}"
+    assert publish["permissions"] == {"id-token": "write"}
+    with_id_token = [
+        name for name, job in workflow["jobs"].items() if "id-token" in job.get("permissions", {})
+    ]
+    assert with_id_token == ["publish"]
+    assert publish["needs"] in ("build", ["build"])
+
+
+def test_actions_pinned_by_sha():
+    ci = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    texts = [RELEASE.read_text(encoding="utf-8"), yaml.safe_dump(ci["jobs"]["package"])]
+    for text in texts:
+        uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(\S+)", text, re.MULTILINE)
+        assert uses
+        for ref in uses:
+            assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", ref), ref
+
+
+def test_tag_check_present_with_prefix_v():
+    steps = _workflow(RELEASE)["jobs"]["build"]["steps"]
+    checks = [i for i, s in enumerate(steps) if "tag_version" in s.get("run", "") and "exit 1" in s["run"]]
+    assert len(checks) == 1
+    assert steps[checks[0]]["if"] == "github.event_name == 'push'"
+    assert "${GITHUB_REF_NAME#v}" in steps[checks[0]]["run"]
+    assert DIST in steps[checks[0]]["run"]
+    upload = _upload_index(steps)
+    assert upload and checks[0] < upload[0]
+
+
+def test_build_checks_tag_is_on_default_branch():
+    steps = _workflow(RELEASE)["jobs"]["build"]["steps"]
+    checks = [i for i, s in enumerate(steps) if "merge-base --is-ancestor" in s.get("run", "")]
+    assert len(checks) == 1
+    assert "origin/main" in steps[checks[0]]["run"]
+    assert steps[checks[0]]["if"] == "github.event_name == 'push'"
+    assert steps[0]["with"]["fetch-depth"] == 0
+    upload = _upload_index(steps)
+    assert upload and checks[0] < upload[0]
+
+
+def test_testpypi_publish_skips_existing_but_pypi_does_not():
+    steps = {s["name"]: s for s in _workflow(RELEASE)["jobs"]["publish"]["steps"] if "name" in s}
+    assert steps["Publish to TestPyPI"]["with"]["skip-existing"] is True
+    assert "skip-existing" not in steps["Publish to PyPI"].get("with", {})
+
+
+def test_concurrency_group():
+    assert _workflow(RELEASE)["concurrency"]["group"] == "release-${{ github.ref }}"
+
+
+def test_github_release_is_push_only_verifies_tag_and_uses_the_changelog():
+    job = _workflow(RELEASE)["jobs"]["github-release"]
+    assert job["if"] == "github.event_name == 'push'"
+    runs = " ".join(s.get("run", "") for s in job["steps"])
+    assert "--verify-tag" in runs
+    assert "--generate-notes" in runs
+    assert "--notes-file" in runs
+    assert "CHANGELOG.md" in runs
+
+
+def test_smoke_uses_cli_version_and_onnx_extra():
+    for path in (RELEASE, CI):
+        text = path.read_text(encoding="utf-8")
+        assert '/bin/rag-engine" --version' in text, path
+        assert "[onnx]" in text, path
+        assert "ONNX_MODELS" in text, path
+
+
+def test_dependabot_covers_github_actions_only():
+    config = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
+    assert [(u["package-ecosystem"], u["schedule"]["interval"]) for u in config["updates"]] == [
+        ("github-actions", "weekly")
+    ]
+
+
+def test_ci_keeps_its_jobs_and_adds_package():
+    jobs = _workflow(CI)["jobs"]
+    assert {"tests", "integration", "parity", "package"} <= set(jobs)
+    runs = " ".join(s.get("run", "") for s in jobs["package"]["steps"])
+    assert "build==1.6.1 twine==7.0.0" in runs
+    assert "twine check --strict" in runs
