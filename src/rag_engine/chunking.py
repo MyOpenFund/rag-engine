@@ -86,7 +86,7 @@ PDF_ENABLE_ML_FEATURES = False
 # words only; passed by name for the same reason as above.
 _CHUNKER_HARD_MAX_TOKEN_COUNT = None
 
-_INSTALL_HINT = "document parsing needs the ingest extra: pip install 'rag-engine[ingest]'"
+_INSTALL_HINT = "document parsing needs the ingest extra: pip install 'myopenfund-rag-engine[ingest]'"
 
 _patch_warning_logged = False
 

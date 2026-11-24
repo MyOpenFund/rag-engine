@@ -128,4 +128,8 @@ jobs:
           "$RUNNER_TEMP/smoke/bin/python" -c "import rag_engine; print(rag_engine.__file__)"
           "$RUNNER_TEMP/smoke/bin/python" -c "from rag_engine.embedding import ONNX_MODELS; assert len(ONNX_MODELS) >= 1"
           expected="$("$RUNNER_TEMP/smoke/bin/python" -c "import importlib.metadata as m; print(m.version('myopenfund-rag-engine'))")"
-          test "$("$RUNNER_TEMP/smoke/bin/rag-engine" --version)" = "rag-engine $expected"
+          shown="$("$RUNNER_TEMP/smoke/bin/rag-engine" --version)"
+          if [ "$shown" != "rag-engine $expected" ]; then
+            echo "rag-engine --version printed '$shown' but the wheel is $expected"
+            exit 1
+          fi

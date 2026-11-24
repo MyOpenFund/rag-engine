@@ -47,7 +47,11 @@ jobs:
           "$RUNNER_TEMP/smoke/bin/python" -c "import rag_engine; print(rag_engine.__file__)"
           "$RUNNER_TEMP/smoke/bin/python" -c "from rag_engine.embedding import ONNX_MODELS; assert len(ONNX_MODELS) >= 1"
           expected="$("$RUNNER_TEMP/smoke/bin/python" -c "import importlib.metadata as m; print(m.version('myopenfund-rag-engine'))")"
-          test "$("$RUNNER_TEMP/smoke/bin/rag-engine" --version)" = "rag-engine $expected"
+          shown="$("$RUNNER_TEMP/smoke/bin/rag-engine" --version)"
+          if [ "$shown" != "rag-engine $expected" ]; then
+            echo "rag-engine --version printed '$shown' but the wheel is $expected"
+            exit 1
+          fi
       - name: Tag check (the wheel version must equal the tag version)
         if: github.event_name == 'push'
         run: |
@@ -111,11 +115,14 @@ jobs:
           # `## <version>` heading and the next `## ` heading), else generated notes.
           version="${GITHUB_REF_NAME#v}"
           notes="$RUNNER_TEMP/notes.md"
-          awk -v h="## $version" '
-            f && /^## / { exit }
-            $0 == h || index($0, h " ") == 1 { f = 1; next }
-            f
-          ' CHANGELOG.md > "$notes"
+          : > "$notes"
+          if [ -f CHANGELOG.md ]; then
+            awk -v h="## $version" '
+              f && /^## / { exit }
+              $0 == h || index($0, h " ") == 1 { f = 1; next }
+              f
+            ' CHANGELOG.md > "$notes"
+          fi
           if grep -q '[^[:space:]]' "$notes"; then
             notes_args=(--notes-file "$notes")
           else

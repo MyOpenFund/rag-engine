@@ -617,3 +617,16 @@ def test_ci_keeps_its_jobs_and_adds_package():
     runs = " ".join(s.get("run", "") for s in jobs["package"]["steps"])
     assert "build==1.6.1 twine==7.0.0" in runs
     assert "twine check --strict" in runs
+
+
+def test_install_hints_name_the_published_distribution():
+    # The PyPI name `rag-engine` belongs to another project: the hints must name ours.
+    from rag_engine import chunking, embedding
+
+    for hint, extra in (
+        (embedding._TORCH_EXTRA, "torch"),
+        (embedding._ONNX_EXTRA, "onnx"),
+        (chunking._INSTALL_HINT, "ingest"),
+    ):
+        assert f"'{DIST}[{extra}]'" in hint
+        assert "'rag-engine[" not in hint

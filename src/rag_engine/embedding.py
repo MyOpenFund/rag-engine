@@ -12,9 +12,9 @@ are imported when a :class:`TorchEmbedder` is built (or :func:`detect_device` is
 
 Backends:
 
-* :class:`TorchEmbedder` — sentence-transformers, extra ``rag-engine[torch]``;
+* :class:`TorchEmbedder` — sentence-transformers, extra ``myopenfund-rag-engine[torch]``;
 * :class:`OnnxEmbedder` — fastembed on the ONNX runtime (CPU), without PyTorch, extra
-  ``rag-engine[onnx]``. The files of a model of :data:`ONNX_MODELS` (the ONNX file, the
+  ``myopenfund-rag-engine[onnx]``. The files of a model of :data:`ONNX_MODELS` (the ONNX file, the
   tokenizer and the configuration) are pinned to one revision, and each is checked against
   its SHA-256 before the model is loaded;
 * :class:`FakeEmbedder` — deterministic vectors without any model, for tests.
@@ -65,11 +65,11 @@ logger = logging.getLogger(__name__)
 
 _TORCH_EXTRA = (
     "the torch embedding backend needs the 'torch' and 'sentence-transformers' packages: "
-    "install them with: pip install 'rag-engine[torch]'"
+    "install them with: pip install 'myopenfund-rag-engine[torch]'"
 )
 _ONNX_EXTRA = (
     "the onnx embedding backend needs the 'fastembed' package: "
-    "install it with: pip install 'rag-engine[onnx]'"
+    "install it with: pip install 'myopenfund-rag-engine[onnx]'"
 )
 
 
@@ -269,7 +269,7 @@ def detect_device() -> str:
 
 
 class TorchEmbedder(BaseEmbedder):
-    """sentence-transformers backend (extra ``rag-engine[torch]``).
+    """sentence-transformers backend (extra ``myopenfund-rag-engine[torch]``).
 
     ``device``
         Device given to the model; ``None`` picks the best one (:func:`detect_device`).
@@ -706,7 +706,7 @@ def _register_pinned(text_embedding: Any, name: str, known: OnnxModel) -> str:
 
 
 class OnnxEmbedder(BaseEmbedder):
-    """fastembed backend on the ONNX runtime, on CPU, without PyTorch (extra ``rag-engine[onnx]``).
+    """fastembed backend on the ONNX runtime, on CPU, without PyTorch (extra ``myopenfund-rag-engine[onnx]``).
 
     ``cache_dir``
         Directory where the model files are stored; ``None`` leaves the default of fastembed
