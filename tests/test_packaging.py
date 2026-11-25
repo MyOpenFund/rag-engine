@@ -777,7 +777,11 @@ def _run_gate(tmp_path, response, status):
     }
     return subprocess.run(
         ["bash", "-e", "-c", job["steps"][gate]["run"]],
-        env=env, capture_output=True, text=True, timeout=30, check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
     )
 
 
