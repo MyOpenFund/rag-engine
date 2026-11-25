@@ -2,7 +2,7 @@
 
 All notable changes to rag-engine are recorded here. Versions follow [semantic versioning](https://semver.org).
 
-## 0.1.0 — Unreleased
+## 0.1.0 — 2026-11-25
 
 First version: ingestion, the two embedding backends, filtered search, and the evaluation of that search.
 
