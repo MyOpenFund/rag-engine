@@ -533,9 +533,10 @@ def hybrid_search(
       id under the same lock as the search), and it returns the hits to give back
       (:func:`rag_engine.select.select_diverse`, an MMR, ...). A candidate whose point is
       missing (a write cut half-way left its SQLite row alone, so only FTS found it) has no
-      vector: it is left out of ``hits``, so out of the result, and the number left out is
-      logged as a warning. Without a selector the first ``limit`` fused candidates are
-      returned. The query is embedded once either way.
+      vector: it is left out of ``hits``, so out of the result, and the number and the point
+      ids left out are logged as a warning. Without a selector, or when ``limit`` holds every
+      fused candidate (no vector is read and the selector is not called), the first ``limit``
+      fused candidates are returned. The query is embedded once either way.
 
     ``limit``, ``candidates`` and ``rrf_k`` are integers >= 1, else :class:`SearchError`
     (``limit`` may exceed ``candidates``: the fusion holds up to ``2 * candidates`` chunks).
@@ -573,7 +574,7 @@ def hybrid_search(
         served = index._served([hit.point_id for hit in dense if isinstance(hit.point_id, int)])
         dense = [hit for hit in dense if hit.point_id in served]
         fused = _fuse(dense, lexical, rrf_k)
-        if selector is None:
+        if selector is None or limit >= len(fused):
             return fused[:limit]
         # The vectors of the same state of the index as the candidates.
         fused, vectors = _with_vectors(index, fused)
@@ -611,11 +612,13 @@ def _with_vectors(index: LocalIndex, hits: list[Hit]) -> tuple[list[Hit], np.nda
     stored = {record.id: record.vector for record in records}
     kept = [hit for hit in hits if hit.point_id in stored]
     if len(kept) < len(hits):
+        missing = [hit.point_id for hit in hits if hit.point_id not in stored]
         logger.warning(
-            "%d of %d candidates have no point in %s and were left out of the selection",
-            len(hits) - len(kept),
+            "%d of %d candidates have no point in %s and were left out of the selection: %s",
+            len(missing),
             len(hits),
             index.collection,
+            missing,
         )
     vectors = np.array([stored[hit.point_id] for hit in kept], dtype=np.float32).reshape(len(kept), index.dim)
     return kept, vectors

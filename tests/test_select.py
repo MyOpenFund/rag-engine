@@ -117,6 +117,43 @@ def test_isolated_candidates_are_not_selected_by_eigenmind_but_fill_up():
     assert [hits.index(hit) for hit in chosen] == [0, 1, 4]
 
 
+def test_keep_top_zero_pins_the_isolate_behaviour():
+    pytest.importorskip("eigenmind")
+    vectors, _ = _clusters([1, 3, 3])  # rank 0 is an isolate
+    hits = _hits(7)
+    assert [hits.index(h) for h in select_diverse(hits, vectors, 2, keep_top=0)] == [1, 4]
+
+
+def test_keep_top_one_keeps_the_best_hit_even_when_isolated():
+    pytest.importorskip("eigenmind")
+    vectors, _ = _clusters([1, 3, 3])
+    hits = _hits(7)
+    assert [hits.index(h) for h in select_diverse(hits, vectors, 2, keep_top=1)] == [0, 1]
+    assert [hits.index(h) for h in select_diverse(hits, vectors, 3, keep_top=1)] == [0, 1, 4]
+
+
+def test_keep_top_leaves_the_kept_hits_near_duplicates_out_of_the_selection():
+    pytest.importorskip("eigenmind")
+    vectors, _ = _clusters([3, 3])
+    hits = _hits(6)
+    # Rank 0 is kept; ranks 1 and 2 are its near-duplicates, so the other slot goes to rank 3.
+    assert [hits.index(h) for h in select_diverse(hits, vectors, 2, keep_top=1)] == [0, 3]
+
+
+def test_keep_top_at_least_limit_gives_the_first_hits(monkeypatch):
+    monkeypatch.setitem(sys.modules, "eigenmind", None)  # not needed, so not imported
+    vectors, _ = _clusters([3, 3])
+    hits = _hits(6)
+    assert select_diverse(hits, vectors, 2, keep_top=2) == hits[:2]
+    assert select_diverse(hits, vectors, 2, keep_top=5) == hits[:2]
+
+
+def test_the_default_time_limit_is_two_seconds():
+    import inspect
+
+    assert inspect.signature(select_diverse).parameters["time_limit"].default == 2.0
+
+
 def test_solver_failure_falls_back_to_fused_rank(monkeypatch):
     eigenmind = pytest.importorskip("eigenmind")
 
@@ -198,7 +235,16 @@ def test_refuses_vectors_not_aligned_with_the_hits(vectors):
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"role": "spectral_attention"}, {"threshold": 1.0}, {"threshold": -0.1}, {"time_limit": 0}],
+    [
+        {"role": "spectral_attention"},
+        {"threshold": 1.0},
+        {"threshold": -0.1},
+        {"time_limit": 0},
+        {"time_limit": True},
+        {"keep_top": -1},
+        {"keep_top": True},
+        {"keep_top": 1.0},
+    ],
 )
 def test_refuses_bad_options(kwargs):
     vectors, _ = _clusters([3, 3])

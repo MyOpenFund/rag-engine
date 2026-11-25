@@ -298,12 +298,28 @@ def test_selector_input_leaves_out_a_candidate_without_its_point(index, embedder
     seen, selector = _spy()
     with caplog.at_level("WARNING", logger="rag_engine.local"):
         hits = hybrid_search(
-            "capex two", index=index, embedder=embedder, filters=None, limit=5, selector=selector
+            "capex two", index=index, embedder=embedder, filters=None, limit=2, selector=selector
         )
     assert gone not in {hit.point_id for hit in seen["hits"]}
     assert gone not in {hit.point_id for hit in hits}
     assert seen["vectors"].shape == (len(seen["hits"]), SPEC.dim) == (2, SPEC.dim)
-    assert "1 of 3 candidates have no point" in caplog.text
+    assert f"1 of 3 candidates have no point in {COLLECTION}" in caplog.text
+    assert f"[{gone}]" in caplog.text
+
+
+def test_selector_is_not_called_when_limit_holds_every_candidate(index, embedder, monkeypatch):
+    _add(index, embedder, "a", ["capex one", "capex two", "capex three"])
+
+    def selector(hits, vectors, limit):
+        raise AssertionError("not called")
+
+    def no_retrieve(*args, **kwargs):
+        raise AssertionError("no vector is read")
+
+    monkeypatch.setattr(index.store.client, "retrieve", no_retrieve)
+    plain = hybrid_search("capex", index=index, embedder=embedder, filters=None, limit=3)
+    hits = hybrid_search("capex", index=index, embedder=embedder, filters=None, limit=3, selector=selector)
+    assert hits == plain and len(hits) == 3
 
 
 def test_hybrid_search_with_select_diverse_returns_limit_hits(index, embedder):
