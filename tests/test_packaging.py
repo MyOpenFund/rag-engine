@@ -253,6 +253,8 @@ PUBLIC_NAMES = {
         "UnsupportedFormatError",
         "check_ocr_languages",
         "chunk_file",
+        "chunk_markdown",
+        "load_tokenizer",
         "ocr_available",
     },
     "rag_engine.ingest": {"IngestResult", "ingest_document"},

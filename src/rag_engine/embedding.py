@@ -581,17 +581,19 @@ def _onnx_cache_dir(cache_dir: str | os.PathLike[str] | None) -> str:
     return os.environ.get("FASTEMBED_CACHE_PATH") or os.path.join(tempfile.gettempdir(), "fastembed_cache")
 
 
-def _pinned_model_dir(name: str, known: OnnxModel, cache_dir: str) -> Path:
+def _pinned_model_dir(name: str, known: OnnxModel, cache_dir: str, only: Sequence[str] | None = None) -> Path:
     """Directory holding the files of ``known`` at its pinned revision, downloaded if needed.
 
     The files already in ``cache_dir`` are used without any request to the Hugging Face Hub.
+    ``only`` restricts the files fetched to some of the entry's files (the tokenizer, for a
+    caller that does not run the model); ``None`` means all of them.
     """
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise ImportError(_ONNX_EXTRA) from exc
     repository = known.hf or name
-    files = list(known.files)
+    files = list(known.files) if only is None else list(only)
     request: dict[str, Any] = {"revision": known.revision, "allow_patterns": files, "cache_dir": cache_dir}
 
     def missing_from(directory: Path) -> list[str]:
@@ -655,14 +657,20 @@ def _file_sha256(path: Path, *, cached: bool = False) -> tuple[str, int]:
     return digest, stat.st_size
 
 
-def _verify_pinned_files(name: str, known: OnnxModel, directory: Path) -> str:
+def _verify_pinned_files(
+    name: str, known: OnnxModel, directory: Path, only: Sequence[str] | None = None
+) -> str:
     """Check every file about to be loaded against the table; return the SHA-256 of the ONNX file.
+
+    ``only`` restricts the check to some files of the entry (see :func:`_pinned_model_dir`).
 
     The first file that differs raises :class:`ModelIntegrityError`, which names it. The
     tokenizer and configuration files (17 MB in all for E5) are read and hashed at every
     call; only the hash of the ONNX file is kept from one call to the next.
     """
     for file, (expected, expected_size) in known.files.items():
+        if only is not None and file not in only:
+            continue
         path = directory / file
         found, size = _file_sha256(path, cached=file == known.model_file)
         if found != expected or size != expected_size:
