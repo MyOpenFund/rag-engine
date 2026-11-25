@@ -89,3 +89,12 @@ meaningless vectors: a smoke test only.
 
 The table is recorded in the task ledger with the questions file hash (`questions_sha256` in the
 JSON output).
+
+**A swept winner needs confirmation.** The sweep picks the best of many configurations on the very
+questions that score them, so its gain is optimistic. A threshold / `keep_top` / solver chosen this way
+is confirmed on questions it was not chosen on (a held-out part of the set, or new questions) before
+eigenmind becomes the default.
+
+A passage counts only if it comes from one of the question's `expected_doc_ids` (a sentence repeated
+by another year's 10-K is no hit), and the span comparison is done in NFKD with curly quotes and
+dashes folded to ASCII and zero-width characters dropped, as the index stores text in NFKD.

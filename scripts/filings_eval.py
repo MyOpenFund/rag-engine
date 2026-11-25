@@ -56,6 +56,8 @@ from rag_engine.select import DEFAULT_THRESHOLD, select_diverse
 PROFILES: dict[str, Callable[[], ChunkingOptions]] = {"v1": ChunkingOptions, "v2": ChunkingOptions.v2}
 #: The depth of the passages scored (hit@5 and hit@10 are read from it).
 DEFAULT_K = 10
+#: The smallest ``k`` the table can be printed with: it reads hit@10.
+MIN_K = 10
 #: The metric the two decision rules read.
 DECISION_METRIC = "hit_at_10"
 _FAKE_SPEC = ModelSpec(name="fake", dim=16, passage_prefix="passage: ", query_prefix="query: ")
@@ -201,6 +203,24 @@ def retrievals(
     return result
 
 
+def check_inputs(questions: Sequence[Question], profiles: Sequence[str], k: int) -> None:
+    """``ValueError`` before any work when the run could not finish or would be meaningless.
+
+    Every profile is known, ``k`` is at least :data:`MIN_K` (the table reads hit@5, hit@10 and
+    MRR@10), and every question that does not abstain has ``expected_spans``.
+    """
+    unknown = [p for p in profiles if p not in PROFILES]
+    if unknown:
+        raise ValueError(f"unknown chunking profile {', '.join(unknown)} (known: {', '.join(PROFILES)})")
+    if not isinstance(k, int) or k < MIN_K:
+        raise ValueError(f"k must be an integer >= {MIN_K} (the table reads hit@10), got {k!r}")
+    bare = [q.id for q in questions if q.expected_behavior != "abstain" and not q.expected_spans]
+    if bare:
+        raise ValueError(
+            f"questions without expected_spans: {', '.join(bare[:5])}{' ...' if len(bare) > 5 else ''}"
+        )
+
+
 def run_matrix(
     filings: Sequence[Filing],
     questions: Sequence[Question],
@@ -220,6 +240,10 @@ def run_matrix(
     interval_min_questions: int = DEFAULT_INTERVAL_MIN_QUESTIONS,
 ) -> list[Row]:
     """Build one index per profile in a temporary directory and score every retrieval on it."""
+    check_inputs(questions, profiles, k)
+    # One encode before any timer: the first call of a model loads and warms it.
+    embedder.encode_passage(["warm-up"])
+    embedder.encode_query("warm-up")
     rows: list[Row] = []
     with tempfile.TemporaryDirectory(prefix="filings_eval_") as tmp:
         for label in profiles:
@@ -238,23 +262,16 @@ def run_matrix(
                     solvers=solvers,
                     time_limit=time_limit,
                 ).items():
-                    searches = 0
-
-                    def timed(question: Question, run=run) -> list[Hit]:
-                        nonlocal searches
-                        searches += 1
-                        return run(question)
-
                     started = time.perf_counter()
+                    hits = {question.id: run(question) for question in questions}
+                    ms = 1000.0 * (time.perf_counter() - started) / max(len(questions), 1)
                     report = evaluate_passages(
                         questions,
-                        timed,
+                        lambda question, hits=hits: hits[question.id],
                         k=k,
                         bootstrap_resamples=bootstrap_resamples,
                         interval_min_questions=interval_min_questions,
                     )
-                    elapsed = time.perf_counter() - started
-                    ms = 1000.0 * elapsed / max(searches, 1)
                     rows.append(Row(label, name, report, seconds, ms, chunks, params))
             finally:
                 index.close()
@@ -376,6 +393,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     filings = load_filings(args.filings)
     questions = load_questions(args.questions)
+    profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
+    check_inputs(questions, profiles, args.k)
     if args.backend == "fake":
         embedder: Embedder = FakeEmbedder(_FAKE_SPEC)
         tokenizer: Any = _WordTokenizer()
@@ -391,7 +410,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         embedder,
         tokenizer,
         model_name=model_name,
-        profiles=[p.strip() for p in args.profiles.split(",") if p.strip()],
+        profiles=profiles,
         k=args.k,
         candidates=args.candidates,
         rrf_k=args.rrf_k,
@@ -413,7 +432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
              "report": r.report.to_dict()}
             for r in rows
         ]  # fmt: skip
-        args.json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        args.json.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
     return 0
 
 

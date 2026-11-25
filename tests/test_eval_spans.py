@@ -242,3 +242,48 @@ def test_eigenmind_verdict_needs_a_non_overlapping_interval():
     assert script.eigenmind_verdict(report([1] * 20 + [None] * 20), much_better)[0] is True
     assert script.eigenmind_verdict(much_better, base)[0] is False
     assert script.eigenmind_verdict(report([1, None]), much_better)[0] is False  # too few questions
+
+
+# --- review round 1 -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("span", "stored"),
+    [
+        (
+            "The Company\u2019s cash totaled $4.2 billion \u2014 Caf\u00e9\u2122 brand",
+            "the company's cash totaled $4.2 billion - cafe\u0301TM brand",
+        ),
+        ("\u201cquoted\u201d text", '"quoted" text'),
+        ("2023\u20132024 growth", "2023-2024 growth"),
+        ("zero\u200bwidth and soft\u00adhyphen", "zerowidth and softhyphen"),
+    ],
+)
+def test_span_hit_folds_unicode_typography_on_both_sides(span, stored):
+    import unicodedata
+
+    assert span_hit(unicodedata.normalize("NFKD", stored), [span])
+    assert span_hit(span, [stored])
+    assert span_hit("prefix " + unicodedata.normalize("NFKD", span) + " suffix", [span])
+
+
+def test_a_hit_must_come_from_an_expected_filing():
+    question = _question("q", ("repeated sentence",))
+    hits = [_hit("a repeated sentence here", doc_id="fy2023"), _hit("a repeated sentence here", doc_id="d")]
+    report = evaluate_passages(QuestionSet((question,)), lambda q: hits, k=5)
+    assert report.results[0].rank == 2
+
+
+def test_k_below_ten_is_refused_before_any_work():
+    script = _script()
+    with pytest.raises(ValueError, match="k must be"):
+        script.check_inputs([_question("q", ("x",))], ["v1"], 5)
+    with pytest.raises(ValueError, match="profile"):
+        script.check_inputs([_question("q", ("x",))], ["v3"], 10)
+    with pytest.raises(ValueError, match="expected_spans"):
+        script.check_inputs([Question(id="n", question="q?", expected_doc_ids=("d",))], ["v1"], 10)
+
+
+def test_an_empty_report_writes_null_not_nan():
+    report = PassageReport(k=10, results=())
+    assert json.loads(json.dumps(report.to_dict(), allow_nan=False))["hit_at_10"]["value"] is None

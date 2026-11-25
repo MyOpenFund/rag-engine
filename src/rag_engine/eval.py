@@ -69,6 +69,7 @@ import math
 import os
 import random
 import statistics
+import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import Any, overload
@@ -2537,20 +2538,36 @@ def format_report(report: EvalReport) -> str:
 
 # --- passages ---------------------------------------------------------------------------------------
 
-#: The metrics of a :class:`PassageReport` that carry an interval, besides the ones for each ``k``.
+#: Salt of the seed of the passage intervals, so they do not repeat the draws of the document ones.
 _PASSAGE_INTERVAL_SEED = "passages"
 
 
+_FOLDED = str.maketrans(
+    {
+        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2033": '"',
+        "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-",
+        "\u2212": "-",
+        "\u00ad": None, "\u200b": None, "\u200c": None, "\u200d": None, "\u2060": None, "\ufeff": None,
+    }
+)  # fmt: skip
+
+
 def _squash(text: str) -> str:
-    """``text`` without case and with every run of white space as one space, for :func:`span_hit`."""
-    return " ".join(text.casefold().split())
+    """The form :func:`span_hit` compares: NFKD (the form chunks are stored in), curly quotes and
+    dashes in ASCII, zero-width characters dropped, case-folded, white space runs as one space."""
+    text = unicodedata.normalize(QUERY_NORMALIZATION, text).translate(_FOLDED)
+    return " ".join(unicodedata.normalize(QUERY_NORMALIZATION, text.casefold()).split())
 
 
 def span_hit(hit_text: str | None, spans: Sequence[str]) -> bool:
-    """Whether the passage ``hit_text`` holds one of ``spans``, ignoring case and white space.
+    """Whether the passage ``hit_text`` holds one of ``spans``, ignoring case, white space and typography.
 
-    Both sides are case-folded and every run of white space (line breaks of a table or of a
-    hard-wrapped paragraph included) becomes one space before the containment is tested. A
+    Both sides are put in :data:`QUERY_NORMALIZATION` (the form the index stores text in), curly
+    quotes and apostrophes become ASCII ones, en and em dashes become ``-``, zero-width characters
+    and soft hyphens are dropped, text is case-folded and every run of white space (line breaks of
+    a table or of a hard-wrapped paragraph included) becomes one space before the containment is
+    tested. A
     passage without text, no span, and a blank span give ``False``.
     """
     if not hit_text:
@@ -2660,7 +2677,7 @@ class PassageReport:
         for metric in self._metric_names():
             interval = self.interval(metric)
             result[metric] = {
-                "value": self.value(metric),
+                "value": None if math.isnan(self.value(metric)) else self.value(metric),
                 "interval": None if interval is None else list(interval),
             }
         result["misses"] = [r.id for r in self.results if r.rank is None]
@@ -2699,7 +2716,8 @@ def evaluate_passages(
     (dense, hybrid, selected), the caller decides; at most ``k`` are read. A question that
     abstains is run and reported apart (:class:`PassageAbstention`), never scored; every other
     question needs ``expected_spans`` (``EvalError`` otherwise). The report gives hit@n and
-    MRR@n for any ``n <= k``.
+    MRR@n for any ``n <= k``. When the question lists ``expected_doc_ids``, a passage counts
+    only if it comes from one of them: a sentence repeated by another year's filing is no hit.
 
     Returns a :class:`PassageReport` rather than an :class:`EvalReport`: that one ranks
     documents, has no notion of a passage, and its aggregates are built around expected
@@ -2719,9 +2737,12 @@ def evaluate_passages(
             top = hits[0].score if hits else None
             abstentions.append(PassageAbstention(question.id, len(hits), top))
             continue
-        rank = next(
-            (i for i, hit in enumerate(hits, start=1) if span_hit(hit.text, question.expected_spans)), None
-        )
+        wanted = question.expected_doc_ids or ()
+
+        def holds(hit: Hit, question: Question = question, wanted: Sequence[str] = wanted) -> bool:
+            return (not wanted or hit.doc_id in wanted) and span_hit(hit.text, question.expected_spans)
+
+        rank = next((i for i, hit in enumerate(hits, start=1) if holds(hit)), None)
         results.append(PassageResult(question.id, rank, len(hits), question.kind))
     return PassageReport(
         k=k,
