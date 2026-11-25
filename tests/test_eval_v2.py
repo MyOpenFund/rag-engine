@@ -109,6 +109,7 @@ def test_the_fields_of_the_first_version_keep_their_place():
         "must_not_include",
         "run_unfiltered",
         "essential_any_of",
+        "expected_spans",  # the passage-level field, documented in eval/filings_README.md
     )
     assert BEHAVIORS == ("answer", "correct_premise", "abstain")
 
@@ -1609,7 +1610,8 @@ def test_the_example_line_of_the_documentation_is_a_valid_question(tmp_path):
     readme = (root / "eval" / "README.md").read_text(encoding="utf-8")
     assert '"id": "an-' not in readme  # an example is not a question of the analytical batch
     (line,) = [line for line in readme.splitlines() if line.startswith('{"id": "ex-01"')]
-    assert set(json.loads(line)) == set(QUESTION_FIELDS)  # complete: every field of the format
+    # complete: every field of the document-level format (expected_spans is the passage-level one)
+    assert set(json.loads(line)) == set(QUESTION_FIELDS) - {"expected_spans"}
     (question,) = load_questions(write(tmp_path, line))
     assert (question.expected_behavior, question.run_unfiltered) == ("answer", True)
     members = tuple(doc_id for group in question.essential_any_of for doc_id in group)

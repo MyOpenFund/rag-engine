@@ -50,6 +50,11 @@ question asked without filters, with an interval obtained by resampling the docu
 The essential metrics are read per question: the share of questions that have all they need
 among the first ``k``, with an interval obtained by resampling the questions.
 
+A second, smaller scorer grades **passages** instead of documents (:func:`evaluate_passages`): it is
+for corpora of a few long documents, where the document is found by any search and chunk ids differ
+between chunkers. A question carries ``expected_spans``, short verbatim texts of the answer, and a
+retrieved passage is a hit when it holds one (:func:`span_hit`).
+
 This module imports no embedding backend and no parser, and needs the standard library only
 besides the engine: ``torch`` is never imported unless the torch backend is built. Through the
 store it imports ``qdrant-client``, which may itself load ``fastembed`` (and with it the ONNX
@@ -64,7 +69,7 @@ import math
 import os
 import random
 import statistics
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import Any, overload
 
@@ -72,7 +77,7 @@ from . import __version__
 from .config import Settings
 from .embedding import Embedder
 from .errors import RagEngineError
-from .search import QUERY_NORMALIZATION, SearchError, SearchFilters, is_searchable, search
+from .search import QUERY_NORMALIZATION, Hit, SearchError, SearchFilters, is_searchable, search
 from .store import QdrantStore
 
 __all__ = [
@@ -99,14 +104,19 @@ __all__ = [
     "FilterEffect",
     "Means",
     "NotInCollection",
+    "PassageAbstention",
+    "PassageReport",
+    "PassageResult",
     "Question",
     "QuestionResult",
     "QuestionSet",
     "RankedDocument",
     "TopScores",
     "evaluate",
+    "evaluate_passages",
     "format_report",
     "load_questions",
+    "span_hit",
 ]
 
 #: Number of documents the metrics look at, unless ``k`` is given.
@@ -158,6 +168,7 @@ QUESTION_FIELDS: tuple[str, ...] = (
     "must_not_include",
     "run_unfiltered",
     "essential_any_of",
+    "expected_spans",
 )
 
 _REQUIRED = ("id", "question")
@@ -297,6 +308,11 @@ class Question:
     ``run_unfiltered``
         ``True`` to score the question a second time without its filters. Refused on a
         question that carries none.
+    ``expected_spans``
+        Short verbatim texts of the filing that answer the question, for the passage-level
+        evaluation (:func:`evaluate_passages`): a retrieved passage is a hit when it holds one
+        of them (:func:`span_hit`). Distinct non-blank strings; empty unless given, and always
+        empty on a question that abstains. :func:`evaluate` does not read them.
 
     The fields are checked when the question is built (``EvalError``); lists are kept as
     tuples. A document id may not start or end with a space, ``must_include`` and
@@ -320,6 +336,7 @@ class Question:
     must_not_include: tuple[str, ...] = ()
     run_unfiltered: bool = False
     essential_any_of: tuple[tuple[str, ...], ...] | None = None  # a tuple once built, never None
+    expected_spans: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -342,8 +359,10 @@ class Question:
                 f"'kind' may not end with {UNFILTERED_SUFFIX!r}, got {self.kind!r}: the suffix names the "
                 "second run of a kind, without its filters"
             )
-        for name in ("tags", "must_include", "must_not_include"):
+        for name in ("tags", "must_include", "must_not_include", "expected_spans"):
             object.__setattr__(self, name, _strings(name, getattr(self, name)))
+        if self.expected_spans and self.expected_behavior == "abstain":
+            raise EvalError("'expected_spans' is given on a question whose 'expected_behavior' is 'abstain'")
         both = [text for text in self.must_include if text in self.must_not_include]
         if both:
             raise EvalError(
@@ -456,7 +475,7 @@ class Question:
             result["filters"] = filters
         if self.run_unfiltered:
             result["run_unfiltered"] = True
-        for name in ("must_include", "must_not_include"):
+        for name in ("must_include", "must_not_include", "expected_spans"):
             if getattr(self, name):
                 result[name] = list(getattr(self, name))
         if self.kind is not None:
@@ -545,6 +564,7 @@ def _question_of(record: object) -> Question:
         must_not_include=record["must_not_include"] if record.get("must_not_include") is not None else (),
         run_unfiltered=bool(rerun),
         essential_any_of=record.get("essential_any_of"),
+        expected_spans=record["expected_spans"] if record.get("expected_spans") is not None else (),
     )
     _check_normalised(question)
     return question
@@ -607,6 +627,9 @@ def load_questions(path: str | os.PathLike[str]) -> QuestionSet:
       states its essential documents; ``null`` counts as left out;
     - ``must_include``, ``must_not_include`` (optional): lists of non-blank strings, none
       twice, and none in both; kept, not scored;
+    - ``expected_spans`` (optional): a list of non-blank strings, none twice, the verbatim
+      passages that answer the question, scored by :func:`evaluate_passages`; not allowed on
+      a question that abstains;
     - ``run_unfiltered`` (optional): ``true`` or ``false``; ``true`` only on a question
       whose ``filters`` restrict something.
 
@@ -2510,3 +2533,202 @@ def format_report(report: EvalReport) -> str:
         if not result.top_documents:
             lines.append("    nothing was returned")
     return "\n".join(lines)
+
+
+# --- passages ---------------------------------------------------------------------------------------
+
+#: The metrics of a :class:`PassageReport` that carry an interval, besides the ones for each ``k``.
+_PASSAGE_INTERVAL_SEED = "passages"
+
+
+def _squash(text: str) -> str:
+    """``text`` without case and with every run of white space as one space, for :func:`span_hit`."""
+    return " ".join(text.casefold().split())
+
+
+def span_hit(hit_text: str | None, spans: Sequence[str]) -> bool:
+    """Whether the passage ``hit_text`` holds one of ``spans``, ignoring case and white space.
+
+    Both sides are case-folded and every run of white space (line breaks of a table or of a
+    hard-wrapped paragraph included) becomes one space before the containment is tested. A
+    passage without text, no span, and a blank span give ``False``.
+    """
+    if not hit_text:
+        return False
+    haystack = _squash(hit_text)
+    return any(needle and needle in haystack for needle in map(_squash, spans))
+
+
+@dataclass(frozen=True)
+class PassageResult:
+    """One scored question of :func:`evaluate_passages`.
+
+    ``rank`` is the 1-based position of the first passage holding an expected span among the
+    ``k`` returned, or ``None``. ``returned`` is the number of passages the run gave (at most
+    ``k`` are read).
+    """
+
+    id: str
+    rank: int | None
+    returned: int
+    kind: str | None = None
+
+
+@dataclass(frozen=True)
+class PassageAbstention:
+    """A question the corpus does not answer: searched, never scored.
+
+    ``returned`` passages came back; ``top_score`` is the score of the first one, ``None`` when
+    there was none.
+    """
+
+    id: str
+    returned: int
+    top_score: float | None
+
+
+@dataclass(frozen=True)
+class PassageReport:
+    """The result of :func:`evaluate_passages`: passage metrics with intervals over the questions.
+
+    ``results`` holds one :class:`PassageResult` per scored question, in the order of the
+    questions; ``abstentions`` the questions that abstain, reported apart. ``k`` is the depth
+    searched; ``hit_at(n)`` and ``mrr_at(n)`` read any ``n <= k``. Intervals are percentile
+    intervals obtained by resampling the questions (``bootstrap_resamples`` draws, seed
+    :data:`BOOTSTRAP_SEED`, level :data:`INTERVAL_LEVEL`), given only for a group of at least
+    ``interval_min_questions`` questions. A sibling of :class:`EvalReport`, which scores
+    documents and cannot say "this passage, not just this document".
+    """
+
+    k: int
+    results: tuple[PassageResult, ...]
+    abstentions: tuple[PassageAbstention, ...] = ()
+    bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES
+    interval_min_questions: int = DEFAULT_INTERVAL_MIN_QUESTIONS
+    questions_file: str | None = None
+    questions_sha256: str | None = None
+
+    def _values(self, metric: str) -> list[float]:
+        name, _, depth = metric.rpartition("_")
+        if name not in ("hit_at", "mrr"):
+            raise EvalError(f"unknown metric {metric!r} (hit_at_<n> or mrr_<n>)")
+        if not depth.isdigit() or not 1 <= int(depth) <= self.k:
+            raise EvalError(f"the depth of {metric!r} must be an integer from 1 to k={self.k}")
+        n = int(depth)
+        if name == "hit_at":
+            return [float(r.rank is not None and r.rank <= n) for r in self.results]
+        return [1.0 / r.rank if r.rank is not None and r.rank <= n else 0.0 for r in self.results]
+
+    def value(self, metric: str) -> float:
+        values = self._values(metric)
+        return math.fsum(values) / len(values) if values else float("nan")
+
+    def hit_at(self, n: int) -> float:
+        """Share of the scored questions with an expected span among the first ``n`` passages."""
+        return self.value(f"hit_at_{n}")
+
+    def mrr_at(self, n: int) -> float:
+        """Mean reciprocal rank of the first passage holding a span, ``0`` past ``n`` or never."""
+        return self.value(f"mrr_{n}")
+
+    def interval(self, metric: str) -> tuple[float, float] | None:
+        """Interval of ``metric`` (``hit_at_5``, ``mrr_10``, ...), or ``None`` for too few questions."""
+        values = self._values(metric)
+        if not values or len(values) < self.interval_min_questions:
+            return None
+        return _intervals(
+            [(v,) for v in values],
+            resamples=self.bootstrap_resamples,
+            seed=f"{BOOTSTRAP_SEED}:{_PASSAGE_INTERVAL_SEED}",
+            metrics=("m",),
+        )["m"]
+
+    def _metric_names(self) -> list[str]:
+        depths = sorted({n for n in (1, 3, 5, 10, self.k) if n <= self.k})
+        return [f"{kind}_{n}" for n in depths for kind in ("hit_at", "mrr")]
+
+    def to_dict(self) -> dict[str, Any]:
+        """The report as plain data: each metric with its value and interval, the misses, the abstentions."""
+        result: dict[str, Any] = {
+            "k": self.k,
+            "questions": len(self.results),
+            "questions_file": self.questions_file,
+            "questions_sha256": self.questions_sha256,
+            "bootstrap_resamples": self.bootstrap_resamples,
+            "interval_level": INTERVAL_LEVEL,
+        }
+        for metric in self._metric_names():
+            interval = self.interval(metric)
+            result[metric] = {
+                "value": self.value(metric),
+                "interval": None if interval is None else list(interval),
+            }
+        result["misses"] = [r.id for r in self.results if r.rank is None]
+        result["abstentions"] = [
+            {"id": a.id, "returned": a.returned, "top_score": a.top_score} for a in self.abstentions
+        ]
+        return result
+
+    def format(self) -> str:
+        """The report as text: one line per metric, then the abstentions."""
+        lines = [f"{len(self.results)} questions scored on passages, k={self.k}"]
+        for metric in self._metric_names():
+            kind, _, depth = metric.rpartition("_")
+            label = f"hit@{depth}" if kind == "hit_at" else f"MRR@{depth}"
+            interval = self.interval(metric)
+            span = "" if interval is None else f"  [{interval[0]:.3f}, {interval[1]:.3f}]"
+            lines.append(f"  {label:<8} {self.value(metric):.3f}{span}")
+        if self.abstentions:
+            tops = [a.top_score for a in self.abstentions if a.top_score is not None]
+            best = f", highest top score {max(tops):.3f}" if tops else ""
+            lines.append(f"  {len(self.abstentions)} abstention questions searched, not scored{best}")
+        return "\n".join(lines)
+
+
+def evaluate_passages(
+    questions: Sequence[Question],
+    run: Callable[[Question], Sequence[Hit]],
+    *,
+    k: int = DEFAULT_K,
+    bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    interval_min_questions: int = DEFAULT_INTERVAL_MIN_QUESTIONS,
+) -> PassageReport:
+    """Score ``run`` on passages: where is the first passage holding an expected span?
+
+    ``run(question)`` returns the passages (hits, best first) for the question: any retrieval
+    (dense, hybrid, selected), the caller decides; at most ``k`` are read. A question that
+    abstains is run and reported apart (:class:`PassageAbstention`), never scored; every other
+    question needs ``expected_spans`` (``EvalError`` otherwise). The report gives hit@n and
+    MRR@n for any ``n <= k``.
+
+    Returns a :class:`PassageReport` rather than an :class:`EvalReport`: that one ranks
+    documents, has no notion of a passage, and its aggregates are built around expected
+    documents. The interval machinery (:func:`_intervals`, level, seed, resamples) is shared.
+    """
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise EvalError(f"'k' must be an integer >= 1, got {k!r}")
+    results: list[PassageResult] = []
+    abstentions: list[PassageAbstention] = []
+    for question in questions:
+        if question.expected_behavior != "abstain" and not question.expected_spans:
+            raise EvalError(
+                f"question {question.id!r} has no 'expected_spans': it cannot be scored on passages"
+            )
+        hits = list(run(question))[:k]
+        if question.expected_behavior == "abstain":
+            top = hits[0].score if hits else None
+            abstentions.append(PassageAbstention(question.id, len(hits), top))
+            continue
+        rank = next(
+            (i for i, hit in enumerate(hits, start=1) if span_hit(hit.text, question.expected_spans)), None
+        )
+        results.append(PassageResult(question.id, rank, len(hits), question.kind))
+    return PassageReport(
+        k=k,
+        results=tuple(results),
+        abstentions=tuple(abstentions),
+        bootstrap_resamples=bootstrap_resamples,
+        interval_min_questions=interval_min_questions,
+        questions_file=getattr(questions, "path", None),
+        questions_sha256=getattr(questions, "sha256", None),
+    )
