@@ -157,10 +157,17 @@ class ChunkingOptions:
       rows as fit under the cap.
     - ``context_header``: each chunk carries ``context``, its path of headings, and the
       heading lines at the top of its text are dropped (the context says the same).
-    - ``overlap_tokens``: when a paragraph alone is longer than the cap and is cut in windows,
-      the end of a window is repeated at the start of the next, up to this many tokens.
+    - ``context_max_tokens``: most tokens a context may take. A longer one loses its middle
+      heading levels, then words of its last label and of its title, then characters, until it
+      fits. ``None``: no limit of its own (it still has to leave room for text under the cap:
+      ``ValueError`` at chunking time when not even one character fits).
+    - ``overlap_tokens``: when one over-long block (a paragraph, a line, a table row) is cut in
+      windows of words, the end of a window is repeated at the start of the next, up to this
+      many tokens. There is no overlap between the pieces of a table, nor between paragraphs or
+      lines packed together; only between the windows of a single block.
     - ``version``: a label of the profile, ``"v1"`` or ``"v2"``, for a collection to record
-      what it was ingested with. It changes nothing in the cut.
+      what it was ingested with. It changes nothing in the cut, and ``"v1"`` is refused when
+      any of the fields above is set, so the label cannot misstate the cut.
     """
 
     max_headers_to_use: str = "h4"
@@ -171,6 +178,7 @@ class ChunkingOptions:
     table_rows_per_chunk: int | None = None
     context_header: bool = False
     overlap_tokens: int = 0
+    context_max_tokens: int | None = None
     version: str = "v1"
 
     @classmethod
@@ -182,7 +190,9 @@ class ChunkingOptions:
         - ``table_rows_per_chunk=None``: a long table is split by tokens, the header row and the
           separator line repeated in every piece.
         - ``context_header=True``: the title and headings above a chunk are embedded with it.
-        - ``overlap_tokens=32``: overlap between the windows of an over-long paragraph.
+        - ``overlap_tokens=32``: overlap between the windows of an over-long block.
+        - ``context_max_tokens=120``: a quarter of the cap, so that the context never crowds the
+          text out.
 
         A collection ingested with v1 needs a clean re-ingestion to move to v2.
         """
@@ -191,6 +201,7 @@ class ChunkingOptions:
             table_rows_per_chunk=None,
             context_header=True,
             overlap_tokens=32,
+            context_max_tokens=120,
             version="v2",
         )
 
@@ -217,6 +228,7 @@ class ChunkingOptions:
             ("max_chunk_token_count", 8, True),
             ("table_rows_per_chunk", 1, True),
             ("overlap_tokens", 0, False),
+            ("context_max_tokens", 1, True),
         ):
             value = getattr(self, name)
             if value is None and nullable:
@@ -228,10 +240,29 @@ class ChunkingOptions:
                 f"overlap_tokens ({self.overlap_tokens}) must be below max_chunk_token_count "
                 f"({self.max_chunk_token_count})"
             )
+        if (
+            self.max_chunk_token_count is not None
+            and self.context_max_tokens is not None
+            and self.context_max_tokens >= self.max_chunk_token_count
+        ):
+            raise ValueError(
+                f"context_max_tokens ({self.context_max_tokens}) must be below max_chunk_token_count "
+                f"({self.max_chunk_token_count})"
+            )
         if not isinstance(self.context_header, bool):
             raise ValueError(f"context_header must be a bool, got {self.context_header!r}")  # noqa: TRY004
         if not isinstance(self.version, str) or not self.version.strip():
             raise ValueError(f"version must be a non-empty string, got {self.version!r}")
+        if self.version == "v1" and (
+            self.max_chunk_token_count is not None
+            or self.table_rows_per_chunk is not None
+            or self.context_header
+            or self.overlap_tokens
+            or self.context_max_tokens is not None
+        ):
+            raise ValueError(
+                'version "v1" is the profile without any v2 field: set version="v2" (or use v2())'
+            )
 
 
 class UnsupportedFormatError(RagEngineError, ValueError):
@@ -439,9 +470,11 @@ def chunk_markdown(
 
 
 def _check_tokenizer(options: ChunkingOptions, tokenizer: object) -> None:
-    if options.max_chunk_token_count is not None and tokenizer is None:
+    if tokenizer is None and (
+        options.max_chunk_token_count is not None or options.context_max_tokens is not None
+    ):
         raise ValueError(
-            f"max_chunk_token_count={options.max_chunk_token_count} needs a tokenizer "
+            "max_chunk_token_count and context_max_tokens need a tokenizer "
             "(see rag_engine.chunking.load_tokenizer); none was given"
         )
 
@@ -564,9 +597,6 @@ def _patch_line_spacing(pdf_parser_class) -> None:
 # ---------------------------------------------------------------------------
 
 _CONTEXT_SEPARATOR = " › "
-#: A context may take at most this share of the token cap; the heading levels between the title
-#: and the last heading are dropped until it fits.
-_CONTEXT_MAX_SHARE = 4
 _HEADING_MARK = re.compile(r"^\s*#+\s*")
 
 
@@ -584,12 +614,31 @@ def _context_path(headers: Sequence[str], title: str | None, limit: int | None, 
     if not parts:
         return None
     if limit is not None:
-        while len(parts) > 2 and count(_CONTEXT_SEPARATOR.join(parts)) > limit:
-            del parts[1]
-        words = parts[-1].split()
-        while len(words) > 1 and count(_CONTEXT_SEPARATOR.join([*parts[:-1], " ".join(words)])) > limit:
-            words.pop()
-        parts[-1] = " ".join(words)
+        # Drop the middle levels, then words of the last label, then words of the title.
+        while count(_CONTEXT_SEPARATOR.join(parts)) > limit:
+            if len(parts) > 2:
+                del parts[1]
+                continue
+            words = parts[-1].split() if len(parts) == 2 else []
+            if len(words) > 1:
+                parts[-1] = " ".join(words[:-1])
+                continue
+            words = parts[0].split()
+            if len(words) > 1:
+                parts[0] = " ".join(words[:-1])
+                continue
+            break
+        joined = _CONTEXT_SEPARATOR.join(parts)
+        if count(joined) > limit:  # a single long word: cut characters
+            low, high = 0, len(joined)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if count(joined[:middle]) <= limit:
+                    low = middle
+                else:
+                    high = middle - 1
+            joined = joined[:low]
+        return joined or None
     return _CONTEXT_SEPARATOR.join(parts)
 
 
@@ -615,8 +664,7 @@ def _v2_chunks(
     context = None
     prefix = ""
     if options.context_header:
-        limit = None if cap is None else cap // _CONTEXT_MAX_SHARE
-        context = _context_path(headers, title, limit, count)
+        context = _context_path(headers, title, options.context_max_tokens, count)
         if not body.strip():
             return []
     elif lead:
@@ -631,12 +679,17 @@ def _v2_chunks(
     def fits(piece: str) -> bool:
         return count(make(piece).embedded_text) <= cap
 
+    if not fits("x"):
+        raise ValueError(
+            f"not even one character fits under max_chunk_token_count={cap} with a context of "
+            f"{count(context or '')} tokens: raise the cap or set context_max_tokens"
+        )
     if fits(body):
         return [make(body)]
     pieces: list[str] = []
     for kind, content in _blocks(body):
         if kind == "table":
-            pieces.extend(_split_table(content[0], content[1], fits, options))
+            pieces.extend(_split_table(content[0], content[1], fits, count, options))
         else:
             pieces.extend(_split_prose(content, fits, count, options.overlap_tokens))
     return [make(piece) for piece in pieces if piece.strip()]
@@ -678,9 +731,14 @@ def _blocks(body: str) -> list[tuple[str, object]]:
     return blocks
 
 
-def _split_table(header: list[str], rows: list[str], fits, options: ChunkingOptions) -> list[str]:
+def _split_table(header: list[str], rows: list[str], fits, count, options: ChunkingOptions) -> list[str]:
     """Pieces of a table, each starting with its header row and separator line."""
     head = "\n".join(header)
+    if not fits(head):
+        # The header alone is wider than the cap: it cannot be repeated, the table is cut as text.
+        return _windows("\n".join([*header, *rows]), fits, count, options.overlap_tokens)
+    if not rows:
+        return [head]
     pieces: list[str] = []
     group: list[str] = []
     per_chunk = options.table_rows_per_chunk
@@ -694,7 +752,7 @@ def _split_table(header: list[str], rows: list[str], fits, options: ChunkingOpti
         if not fits(head + "\n" + row):
             # A row that does not fit even alone: cut as text, without the header.
             emit()
-            pieces.extend(_windows(row, fits, None, 0))
+            pieces.extend(_windows(row, fits, count, options.overlap_tokens))
             continue
         if (per_chunk is not None and len(group) >= per_chunk) or (
             group and not fits(head + "\n" + "\n".join([*group, row]))
@@ -702,8 +760,6 @@ def _split_table(header: list[str], rows: list[str], fits, options: ChunkingOpti
             emit()
         group.append(row)
     emit()
-    if not rows:
-        pieces.append(head)
     return pieces
 
 
@@ -730,13 +786,38 @@ def _split_prose(text: str, fits, count, overlap_tokens: int) -> list[str]:
 
 
 def _windows(text: str, fits, count, overlap_tokens: int) -> list[str]:
+    """Cut ``text`` into pieces that fit: lines packed together, a line that is too long in windows of words.
+
+    Line breaks are kept (lists, pipe rows); blank lines are dropped.
+    """
+    pieces: list[str] = []
+    group: list[str] = []
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        if not fits(line):
+            if group:
+                pieces.append("\n".join(group))
+                group = []
+            pieces.extend(_word_windows(line, fits, count, overlap_tokens))
+        elif group and not fits("\n".join([*group, line])):
+            pieces.append("\n".join(group))
+            group = [line]
+        else:
+            group.append(line)
+    if group:
+        pieces.append("\n".join(group))
+    return pieces
+
+
+def _word_windows(text: str, fits, count, overlap_tokens: int) -> list[str]:
     """Cut ``text`` into windows of words that fit, the end of one repeated at the start of the next."""
-    specials = count("") if count is not None else 0
+    specials = count("")
     pieces: list[str] = []
     current: list[str] = []
 
     def overlap_of(words: list[str]) -> list[str]:
-        if count is None or overlap_tokens <= 0:
+        if overlap_tokens <= 0:
             return []
         taken: list[str] = []
         total = 0
@@ -769,6 +850,8 @@ def _windows(text: str, fits, count, overlap_tokens: int) -> list[str]:
                     low = middle
                 else:
                     high = middle - 1
+            if low == 1 and not fits(rest[:1]):
+                raise ValueError("not even one character fits under the token cap")
             pieces.append(rest[:low])
             rest = rest[low:]
         current = [rest] if rest else []

@@ -47,6 +47,7 @@ def test_v1_defaults_unchanged():
     options = ChunkingOptions()
     assert (options.max_chunk_token_count, options.table_rows_per_chunk) == (None, None)
     assert (options.context_header, options.overlap_tokens, options.version) == (False, 0, "v1")
+    assert options.context_max_tokens is None
 
 
 def test_v1_chunk_file_output_unchanged(excerpt, tmp_path):
@@ -70,6 +71,7 @@ def test_v2_profile_values():
     assert v2.table_rows_per_chunk is None
     assert v2.context_header is True
     assert v2.overlap_tokens == 32
+    assert v2.context_max_tokens == 120
     assert v2.version == "v2"
     assert "480" in (ChunkingOptions.v2.__doc__ or "")
 
@@ -130,7 +132,12 @@ def test_v2_long_paragraph_windows_overlap():
     words = [f"w{i}" for i in range(2000)]
     text = "# Doc\n\n## Part\n\n" + " ".join(words) + "\n"
     options = ChunkingOptions(
-        **{**ChunkingOptions.v2().__dict__, "max_chunk_token_count": 100, "overlap_tokens": 10}
+        **{
+            **ChunkingOptions.v2().__dict__,
+            "max_chunk_token_count": 100,
+            "overlap_tokens": 10,
+            "context_max_tokens": 20,
+        }
     )
     chunks = chunk_markdown(text, options=options, title="Doc", tokenizer=FakeTokenizer())
     tok = FakeTokenizer()
@@ -155,6 +162,11 @@ def test_options_validation():
         {"overlap_tokens": -1},
         {"max_chunk_token_count": 50, "overlap_tokens": 50},
         {"version": ""},
+        {"context_max_tokens": 0},
+        {"max_chunk_token_count": 50, "context_max_tokens": 50, "version": "v2"},
+        {"max_chunk_token_count": 480},  # version "v1" with a v2 field
+        {"context_header": True},
+        {"overlap_tokens": 5},
     ):
         with pytest.raises(ValueError):
             ChunkingOptions(**bad)
@@ -163,6 +175,97 @@ def test_options_validation():
 def test_v1_options_without_tokenizer_work(excerpt):
     chunks = chunk_markdown(excerpt)
     assert chunks and all(c.context is None for c in chunks)
+
+
+class CharTokenizer:
+    """One token per character, plus two special tokens."""
+
+    def encode(self, text: str) -> list[int]:
+        return [0] * (len(text) + 2)
+
+
+def adversarial(text, cap, *, title=None, context_max_tokens=None, overlap_tokens=0):
+    options = ChunkingOptions(
+        max_chunk_token_count=cap,
+        context_header=True,
+        overlap_tokens=overlap_tokens,
+        min_chunk_word_count=0,
+        context_max_tokens=context_max_tokens,
+        version="v2",
+    )
+    tok = CharTokenizer()
+    chunks = chunk_markdown(text, options=options, title=title, tokenizer=tok)
+    for chunk in chunks:
+        assert len(tok.encode("passage: " + chunk.embedded_text)) <= cap + len("passage: "), chunk
+        assert len(tok.encode(chunk.embedded_text)) <= cap
+    return chunks
+
+
+def assert_nothing_lost(chunks, source):
+    """Every non-blank character of ``source``, in order, is in the chunk texts (overlap repeats)."""
+    produced = iter("".join("".join(c.text.split()) for c in chunks))
+    for char in "".join(source.split()):
+        assert any(char == other for other in produced), f"text lost from {char!r}"
+
+
+def wide_header(columns=12):
+    return "| " + " | ".join(f"column{i}" for i in range(columns)) + " |", "|" + "---|" * columns
+
+
+def test_adversarial_long_title():
+    title = " ".join(f"word{i}" for i in range(60))
+    body = " ".join(f"body{i}" for i in range(300))
+    chunks = adversarial(f"# T\n\n## Part\n\n{body}\n", 100, title=title, context_max_tokens=30)
+    assert len(chunks) < 60
+    assert all(len(c.text) > 20 for c in chunks[:-1])
+    assert all(len(c.context) <= 30 for c in chunks)
+    assert_nothing_lost(chunks, body)
+
+
+def test_adversarial_context_leaves_no_room():
+    options = ChunkingOptions(max_chunk_token_count=40, context_header=True, version="v2")
+    text = "# Doc\n\n## " + "x" * 60 + "\n\n" + "body " * 300 + "\n"
+    with pytest.raises(ValueError, match="not even one character"):
+        chunk_markdown(text, options=options, title="Doc", tokenizer=CharTokenizer())
+
+
+def test_adversarial_header_only_table():
+    header, separator = wide_header()
+    chunks = adversarial(f"{header}\n{separator}\n", 60)
+    assert len(chunks) > 1
+    assert_nothing_lost(chunks, f"{header}\n{separator}")
+
+
+def test_adversarial_header_wider_than_cap_with_rows():
+    header, separator = wide_header()
+    rows = "\n".join(f"| r{i} | v{i} |" for i in range(40))
+    table = f"{header}\n{separator}\n{rows}"
+    chunks = adversarial(table + "\n", 60)
+    assert_nothing_lost(chunks, table)
+
+
+def test_adversarial_single_overlong_word():
+    word = "abcdefghij" * 40
+    chunks = adversarial(f"intro words here {word} outro\n", 50)
+    assert len(chunks) > 8
+    assert_nothing_lost(chunks, f"intro words here {word} outro")
+
+
+def test_adversarial_row_wider_than_cap():
+    wide = " ".join(f"cell{i}" for i in range(40))
+    table = f"| a | b |\n|---|---|\n| 1 | 2 |\n| {wide} | x |\n| 3 | 4 |"
+    chunks = adversarial(table + "\n", 60)
+    assert any(c.text.startswith("| a | b |\n|---|---|\n| 1 | 2 |") for c in chunks)
+    assert_nothing_lost(chunks, table)
+
+
+def test_windows_keep_line_boundaries():
+    items = "\n".join(f"- item number {i}" for i in range(80))
+    chunks = adversarial(items + "\n", 90)
+    assert len(chunks) > 5
+    for chunk in chunks:
+        assert all(line.startswith("- item number") for line in chunk.text.split("\n"))
+    assert_nothing_lost(chunks, items)
 
 
 @pytest.mark.models
