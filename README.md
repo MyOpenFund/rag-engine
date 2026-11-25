@@ -1,5 +1,7 @@
 # rag-engine
 
+Created and maintained by [Marc Jeulin](https://github.com/jeulinmarc), part of [MyOpenFund](https://github.com/MyOpenFund).
+
 **Status: ingestion, both embedding backends (PyTorch, ONNX), filtered search and the search evaluation harness are delivered.**
 
 rag-engine does two things:
@@ -7,7 +9,7 @@ rag-engine does two things:
 1. **Ingestion** of one document into [Qdrant](https://qdrant.tech): chunk, embed, write.
 2. **Search** over what was ingested: one dense search, narrowed by filters on the source, the type, the language, the document, the corpus and the publication date.
 
-It also measures that search: `rag-engine eval` runs a file of questions with known answers and reports how often the right documents come first (see [Evaluating search quality](#evaluating-search-quality)).
+It also measures that search: `rag-engine eval` runs a file of questions with known answers and reports how often the right documents come first (see [Evaluating search quality](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#evaluating-search-quality)).
 
 It is used by two MyOpenFund components: the data-orchestrator (ingestion) and the MCP server (search).
 
@@ -15,15 +17,37 @@ It is used by two MyOpenFund components: the data-orchestrator (ingestion) and t
 
 Python 3.10 or later. The base install is light; each consumer adds only the extras it needs.
 
+```
+pip install "myopenfund-rag-engine"            # base: settings, schema, store, search, evaluation
+pip install "myopenfund-rag-engine[onnx]"      # search service: ONNX embedding backend, no PyTorch
+pip install "myopenfund-rag-engine[torch]"     # ingestion: PyTorch embedding backend
+pip install "myopenfund-rag-engine[ingest]"    # document parsing and chunking
+```
+
 | Install | Adds | For |
 |---|---|---|
-| `rag-engine` | `qdrant-client` (1.10 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, indexes, writes), search, the evaluation harness and the `rag-engine` command |
-| `rag-engine[torch]` | `sentence-transformers` 6.x | PyTorch embedding backend |
-| `rag-engine[onnx]` | `fastembed` 0.9.x (ONNX runtime), `huggingface_hub` (0.20 or later) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
-| `rag-engine[ingest]` | `chunknorris`, `markitdown[pptx]`, `psutil` | document parsing and chunking |
-| `rag-engine[dev]` | `pytest`, `ruff` | development |
+| `myopenfund-rag-engine` | `qdrant-client` (1.10 or later), `numpy` | settings, payload schema, point ids, the Qdrant store (collections, indexes, writes), search, the evaluation harness and the `rag-engine` command |
+| `myopenfund-rag-engine[torch]` | `sentence-transformers` 6.x | PyTorch embedding backend |
+| `myopenfund-rag-engine[onnx]` | `fastembed` 0.9.x (ONNX runtime), `huggingface_hub` (0.20 or later) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
+| `myopenfund-rag-engine[ingest]` | `chunknorris`, `markitdown[pptx]`, `psutil` | document parsing and chunking |
+| `myopenfund-rag-engine[dev]` | `pytest`, `ruff`, `pyyaml` | development |
 
-The modules of the engine import no embedding backend and no document parser at import time: each is imported when it is used, and `torch` is never imported unless the torch backend is built. One import is not the engine's to decide: `qdrant-client`, which the store, the search, the evaluation and the command import, itself loads `fastembed` when that package is installed — so with the `onnx` extra, `import rag_engine.store` loads fastembed, the ONNX runtime, `huggingface_hub` and `tokenizers`. Without that extra none of them is loaded. Because of that import, `import rag_engine` itself sets `ORT_DISABLE_TELEMETRY=1` in the environment of the process, unless the variable is already set: the ONNX runtime reads it when it is imported (see [Embedding backends](#embedding-backends), *No telemetry*).
+If this environment installed the old distribution (`rag-engine`, from a git URL), run
+`pip uninstall -y rag-engine` before installing `myopenfund-rag-engine`: both own the same import package. The import name (`rag_engine`) and the command (`rag-engine`) do not change.
+
+To try the latest `main` before a release (dependencies still come from PyPI):
+
+```
+pip install "myopenfund-rag-engine[onnx] @ git+https://github.com/MyOpenFund/rag-engine"
+```
+
+**Working across repos**
+
+Clone the repos side by side and install this package editable over the PyPI version in the
+consumer's environment: `pip install -e ../rag-engine`. A consumer change that needs an
+unreleased version waits for this package's release before the consumer's PR merges.
+
+The modules of the engine import no embedding backend and no document parser at import time: each is imported when it is used, and `torch` is never imported unless the torch backend is built. One import is not the engine's to decide: `qdrant-client`, which the store, the search, the evaluation and the command import, itself loads `fastembed` when that package is installed — so with the `onnx` extra, `import rag_engine.store` loads fastembed, the ONNX runtime, `huggingface_hub` and `tokenizers`. Without that extra none of them is loaded. Because of that import, `import rag_engine` itself sets `ORT_DISABLE_TELEMETRY=1` in the environment of the process, unless the variable is already set: the ONNX runtime reads it when it is imported (see [Embedding backends](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#embedding-backends), *No telemetry*).
 
 `sentence-transformers` is bounded to the major version parity was measured on (`>=6,<7`: 6.0.0 to 6.3.0 today, not 5.x), for the reason `fastembed` is bounded: the vectors depend on it. Raise a bound only after `pytest -m models` has passed on the new version.
 
@@ -74,7 +98,7 @@ The package root exposes only `__version__`. Everything else is imported from it
 | `UnexpectedResponse`, status 422 | a collection name the server does not accept (a `/` in it, more than 255 characters): the request is refused before anything is looked up, from `check_collection` as well |
 | `UnexpectedResponse`, another status | any other answer of the server (500, 503, ...); 401 and 403 alone become `QdrantAuthError` |
 | `qdrant_client.http.exceptions.ResponseHandlingException` | the server cannot be reached or does not answer in time (connection refused, DNS, TLS, the timeout of the store); it wraps the error of the HTTP client |
-| `ImportError` | an embedder or a parser is built without its extra installed: the message names the extra (`rag-engine[torch]`, `rag-engine[onnx]`, `rag-engine[ingest]`) |
+| `ImportError` | an embedder or a parser is built without its extra installed: the message names the extra (`myopenfund-rag-engine[torch]`, `myopenfund-rag-engine[onnx]`, `myopenfund-rag-engine[ingest]`) |
 | `RuntimeError` | an embedder is used after `release()` or after the end of its `with` block |
 | `ValueError`, `TypeError` | a bad argument of the store, of an embedder or of `ingest_document` (a `batch_size` of 0, a blank `doc_id`, a model of another dimension than announced, a model unknown to the backend); `SearchFilters(**mapping)` with an unknown key — `SearchFilters.from_mapping` raises a `SearchError` instead |
 | the error of a parser | a file ChunkNorris or MarkItDown cannot read |
@@ -96,16 +120,16 @@ In qdrant-client's local mode (`QdrantClient(":memory:")`, tests) a missing coll
 | `RAG_ENGINE_DIM` | `768` | Vector dimension of the model |
 | `RAG_ENGINE_PASSAGE_PREFIX` | `passage: ` (with the trailing space) | Text put before each chunk when embedding; `none` for no prefix |
 | `RAG_ENGINE_QUERY_PREFIX` | `query: ` (with the trailing space) | Text put before each query when embedding; `none` for no prefix |
-| `RAG_ENGINE_BACKEND` | `torch` | Embedding backend, `torch` or `onnx` (case-insensitive); see [Embedding backends](#embedding-backends) |
-| `RAG_ENGINE_MODEL_CACHE` | none | Directory for model files. Unset leaves the backend default: the Hugging Face cache for `torch`; `FASTEMBED_CACHE_PATH`, or a folder under the system's temporary directory, for `onnx`. **Set it on a server**, to a directory of its own, read-only for the service once filled (see [Embedding backends](#embedding-backends)) |
+| `RAG_ENGINE_BACKEND` | `torch` | Embedding backend, `torch` or `onnx` (case-insensitive); see [Embedding backends](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#embedding-backends) |
+| `RAG_ENGINE_MODEL_CACHE` | none | Directory for model files. Unset leaves the backend default: the Hugging Face cache for `torch`; `FASTEMBED_CACHE_PATH`, or a folder under the system's temporary directory, for `onnx`. **Set it on a server**, to a directory of its own, read-only for the service once filled (see [Embedding backends](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#embedding-backends)) |
 | `RAG_ENGINE_PARITY_MIN` | `0.999` | Smallest cosine accepted between the `torch` and `onnx` vectors of the same text (above 0, at most 1). Read by the parity test only |
-| `ORT_DISABLE_TELEMETRY` | `1`, set by the engine | Not a setting of the engine: a variable of the ONNX runtime, which sends telemetry to its publisher unless it is `1`. `import rag_engine` sets it to `1` **when it is not set** (`os.environ.setdefault`); a value you set yourself, `0` included, is kept. It is read by the runtime when the runtime is imported; see [Embedding backends](#embedding-backends), *No telemetry* |
-| `RAG_ENGINE_ONNX_THREADS` | none | Threads the `onnx` backend runs inference on (at least 1). Unset: the ONNX runtime decides, from the cores of the host. **In a container with a CPU limit, set it to the limit**; see [Embedding backends](#embedding-backends) |
+| `ORT_DISABLE_TELEMETRY` | `1`, set by the engine | Not a setting of the engine: a variable of the ONNX runtime, which sends telemetry to its publisher unless it is `1`. `import rag_engine` sets it to `1` **when it is not set** (`os.environ.setdefault`); a value you set yourself, `0` included, is kept. It is read by the runtime when the runtime is imported; see [Embedding backends](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#embedding-backends), *No telemetry* |
+| `RAG_ENGINE_ONNX_THREADS` | none | Threads the `onnx` backend runs inference on (at least 1). Unset: the ONNX runtime decides, from the cores of the host. **In a container with a CPU limit, set it to the limit**; see [Embedding backends](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#embedding-backends) |
 | `RAG_ENGINE_BATCH_SIZE` | `100` | Points sent to Qdrant per write (at least 1). It sizes the writes only: all the chunks of a document are embedded in one call |
 | `RAG_ENGINE_OCR_LANGUAGES` | `eng` | Tesseract languages joined by `+`, without whitespace, e.g. `eng+fra`. The caller passes it to `ingest_document` (see below) |
-| `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. The caller passes it to `search` (see [Searching](#searching)) |
+| `RAG_ENGINE_SEARCH_LIMIT` | `10` | Hits returned when no limit is given. The caller passes it to `search` (see [Searching](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#searching)) |
 | `RAG_ENGINE_SEARCH_MAX_LIMIT` | `50` | Largest limit a caller may ask for; not below the default limit. Passed to `search` by the caller too |
-| `RAG_ENGINE_DATE_FILTER_MODE` | `auto` | How a date bound of a search is applied: `auto`, `interval` or `legacy` (case-insensitive); see [Date bounds and intervals](#date-bounds-and-intervals). Passed to `search` by the caller too (`date_filter_mode=settings.date_filter_mode`) |
+| `RAG_ENGINE_DATE_FILTER_MODE` | `auto` | How a date bound of a search is applied: `auto`, `interval` or `legacy` (case-insensitive); see [Date bounds and intervals](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#date-bounds-and-intervals). Passed to `search` by the caller too (`date_filter_mode=settings.date_filter_mode`) |
 | `RAG_ENGINE_DATE_FILTER_REFRESH` | `300` | In `auto` mode, seconds a store keeps what it read of a collection (are `date_start` and `date_end` indexed?) before it asks again: zero or a positive number; `0` asks before every search with a date bound. Passed to `search` by the caller too (`date_filter_refresh=settings.date_filter_refresh`) |
 | `RAG_ENGINE_DATE_FILTER_RETRY` | `30` | In `auto` mode, seconds a store waits before it tries again to read a collection it could not read: zero or a positive number. Meanwhile a search with a date bound is served with the last known answer, or the `legacy` filter. Passed to `search` by the caller too (`date_filter_retry=settings.date_filter_retry`) |
 
@@ -129,8 +153,8 @@ The API key is never printed: `repr()` and `str()` of a `Settings` show `qdrant_
 
 | Backend | Extra | Runs on | Meant for |
 |---|---|---|---|
-| `torch` | `rag-engine[torch]` | sentence-transformers, PyTorch (CUDA, MPS or CPU) | ingestion: the passages of a collection are embedded with it |
-| `onnx` | `rag-engine[onnx]` | fastembed, ONNX runtime (CPU), no PyTorch | search: a service embeds its queries without installing PyTorch |
+| `torch` | `myopenfund-rag-engine[torch]` | sentence-transformers, PyTorch (CUDA, MPS or CPU) | ingestion: the passages of a collection are embedded with it |
+| `onnx` | `myopenfund-rag-engine[onnx]` | fastembed, ONNX runtime (CPU), no PyTorch | search: a service embeds its queries without installing PyTorch |
 
 The intended setup is **passages embedded with `torch`, queries embedded with `onnx`**. It is valid only if both backends give the same vector for the same text, so this is measured, not assumed.
 
@@ -270,7 +294,7 @@ store.set_payload(
 
 **Upgrading a collection written before version 2.** In any order, and while it is searched:
 
-1. `store.ensure_payload_indexes(collection)` creates the indexes on `date_start` and `date_end` (it returns their two names). From then on a search in `auto` mode uses the intervals; no document is lost meanwhile ([Date bounds and intervals](#date-bounds-and-intervals)).
+1. `store.ensure_payload_indexes(collection)` creates the indexes on `date_start` and `date_end` (it returns their two names). From then on a search in `auto` mode uses the intervals; no document is lost meanwhile ([Date bounds and intervals](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#date-bounds-and-intervals)).
 2. For each document, `store.set_payload(collection, doc_id, date_fields(date, date_precision, year=year))` with the values of the source: it writes the interval, and corrects the date, the precision and the year where the source has changed. A document without a date is given `date_fields(None)`, which leaves it without the four keys.
 
 The vectors are byte for byte the same afterwards, and the payloads are those an ingestion under version 2 writes.
@@ -301,7 +325,7 @@ store.ensure_payload_indexes("central-bank-e5b-v1")
 - **Never replaces an index.** If a field is already indexed with another kind (a keyword index on `date`, say), the call raises `CollectionMismatchError` naming the field, the expected kind and the one found, and creates nothing. Qdrant itself would drop the existing index and build the other one; removing an index stays a decision of the operator (`store.client.delete_payload_index`).
 - **Errors.** A refused API key is a `QdrantAuthError`. A collection that does not exist is not created: the error of the client is raised, like any other failure. Indexes created before a failure stay, and a second call creates the rest.
 - **Another list.** `ensure_payload_indexes(collection, [("page", "integer")])` takes any list of `(field, kind)`, a kind being the name of a Qdrant payload index type.
-- **Creating the two date indexes changes how date bounds are applied.** A search in `auto` mode uses the intervals on a collection where `date_start` and `date_end` are both indexed. It is safe to create them before the points written under schema version 1 have their interval: see [Date bounds and intervals](#date-bounds-and-intervals).
+- **Creating the two date indexes changes how date bounds are applied.** A search in `auto` mode uses the intervals on a collection where `date_start` and `date_end` are both indexed. It is safe to create them before the points written under schema version 1 have their interval: see [Date bounds and intervals](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#date-bounds-and-intervals).
 
 **A value an index cannot read.** No value is ever refused, neither when an index is built nor when a point is written: the point stays stored, and a search without a filter on that field still returns it. But **a filter on that field no longer sees it**. Checked on Qdrant 1.20:
 
@@ -313,7 +337,7 @@ store.ensure_payload_indexes("central-bank-e5b-v1")
 
 The index changes the answer in one case: without an integer index, a range on `year` still matches `2016.5`; once the index exists it does not. A `year` stored as the string `"2016"` matches no integer range, with or without the index. **Before creating the indexes on a collection that already holds points, check the types of the stored values** of `year` and of the keyword fields (read a sample with `store.client.scroll(collection, with_payload=["year", "source_code", "doc_type", "language", "corpus", "doc_id"])`): a field written with another type has to be rewritten before its filter can be trusted.
 
-**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. `date_start` and `date_end` are the engine's own, always written at midnight UTC ([Payload schema](#payload-schema)). A document without a date the index reads is left out as soon as a date bound is set, with or without the index, unless the search asks for the undated documents (`include_undated`); its `year` is indexed on its own, but `search` has no filter on `year` in this version.
+**Dates.** `date` is the publication date exactly as the vault gives it; the engine does not rewrite it. `date_start` and `date_end` are the engine's own, always written at midnight UTC ([Payload schema](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#payload-schema)). A document without a date the index reads is left out as soon as a date bound is set, with or without the index, unless the search asks for the undated documents (`include_undated`); its `year` is indexed on its own, but `search` has no filter on `year` in this version.
 
 **Date bounds.** A bound must be a full date, and what happens to another value depends on how it reaches Qdrant:
 
@@ -321,7 +345,7 @@ The index changes the answer in one case: without an integer index, a range on `
 - through the Python client, `"2016-03"` never leaves the process: `models.DatetimeRange` raises a validation error;
 - through the Python client, **`"2016"` is accepted**: the client reads it as a Unix timestamp, 2016 seconds after the epoch (`1970-01-01T00:33:36Z`), and sends that. Nothing fails: as a lower bound it matches almost every dated point, as an upper bound almost none.
 
-This is why `rag_engine.search` accepts only a `datetime.date` or a `YYYY-MM-DD` string as a bound, and refuses everything else itself (see [Searching](#searching)).
+This is why `rag_engine.search` accepts only a `datetime.date` or a `YYYY-MM-DD` string as a bound, and refuses everything else itself (see [Searching](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#searching)).
 
 qdrant-client's local mode (`QdrantClient(":memory:")`) keeps no payload index: it accepts the creation with a warning and filters by reading every point, with the same answers.
 
@@ -410,11 +434,11 @@ The keys are the field names below. A missing key and a `null` both mean "not se
 - A string that cannot be encoded as UTF-8 is refused, in a list and as `corpus`: a lone surrogate, which `json.loads('"\\ud800"')` returns and a client may therefore send. The error names the field, instead of the serialisation error the Qdrant client would raise later.
 - There is no filter on `year` in this version.
 
-**Dates.** Both bounds are inclusive, and a bound is a whole day in UTC: `date_to="2016-03-10"` keeps a document stored as `2016-03-10` and one stored as `2016-03-10T15:30:00Z`. (The upper bound is sent to Qdrant as "before the next day at 00:00 UTC", so it does not depend on the time of day a date was stored with.) Only a full date is a bound: `"2016"`, `"2016-03"`, `"10/03/2016"`, a date with a time, a `datetime.datetime` or a number raise a `SearchError`, and so does `date_from` after `date_to`. The check is the engine's own, on purpose: handed the string `"2016"`, qdrant-client reads a Unix timestamp and the filter matches almost everything. **As soon as one bound is set, a chunk without a full date is left out, unless `include_undated` is true**: no `date`, a null, an empty string, or a partial date such as `2016-03` (see [Payload indexes](#payload-indexes)).
+**Dates.** Both bounds are inclusive, and a bound is a whole day in UTC: `date_to="2016-03-10"` keeps a document stored as `2016-03-10` and one stored as `2016-03-10T15:30:00Z`. (The upper bound is sent to Qdrant as "before the next day at 00:00 UTC", so it does not depend on the time of day a date was stored with.) Only a full date is a bound: `"2016"`, `"2016-03"`, `"10/03/2016"`, a date with a time, a `datetime.datetime` or a number raise a `SearchError`, and so does `date_from` after `date_to`. The check is the engine's own, on purpose: handed the string `"2016"`, qdrant-client reads a Unix timestamp and the filter matches almost everything. **As soon as one bound is set, a chunk without a full date is left out, unless `include_undated` is true**: no `date`, a null, an empty string, or a partial date such as `2016-03` (see [Payload indexes](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#payload-indexes)).
 
 ### Date bounds and intervals
 
-A document is not always dated to the day. The minutes of a meeting may be known to the month, a report to the year; the producer then stores the first day of the period in `date` and says `month` or `year` in `date_precision`, and the engine stores the whole period as `date_start` and `date_end` ([Payload schema](#payload-schema)). A date bound can be compared with either, and `date_filter_mode` says which.
+A document is not always dated to the day. The minutes of a meeting may be known to the month, a report to the year; the producer then stores the first day of the period in `date` and says `month` or `year` in `date_precision`, and the engine stores the whole period as `date_start` and `date_end` ([Payload schema](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#payload-schema)). A date bound can be compared with either, and `date_filter_mode` says which.
 
 | `date_filter_mode` | A chunk passes the bounds when | The filter sent to Qdrant (`first`, `last`: `date_from`, `date_to` at 00:00 UTC) |
 |---|---|---|
@@ -436,7 +460,7 @@ With one bound only, the conditions on the other bound are left out. The overlap
 
 **Query normalisation.** The chunker stores the text of the chunks in Unicode NFKD (accents and other marks as separate characters), and that text is what was embedded. `search` therefore puts the query in NFKD too before embedding it (`normalize_query=True`, the default). For French, German, Spanish or Greek the tokenizer of `intfloat/multilingual-e5-base` gives the same tokens for both forms, so nothing changes. For Japanese (voiced kana), Korean and Vietnamese it does not: typed as usual (NFC), `デフレ脱却` is cut into `デ`, `フレ`, `脱`, `却`, while the stored text was cut into `テ`, `゙`, `フレ`, `脱`, `却`; only the NFKD query gives the tokens of the passages. `normalize_query=False` embeds the query as typed; it is for a collection whose passages were embedded in another form. This is a parameter of `search`, not a setting.
 
-**Errors.** `SearchError` (a `ValueError` and a `RagEngineError`) for a bad argument or filter, raised before anything is embedded or sent. A refused API key is a `QdrantAuthError`. Everything else — an error of the embedder, a missing collection, an unreachable server — reaches the caller unchanged: see "Errors that are not `RagEngineError`" under [Public API](#public-api). A request waits at most the timeout of the store (`RAG_ENGINE_QDRANT_TIMEOUT`, 60 seconds by default; a search service usually wants less).
+**Errors.** `SearchError` (a `ValueError` and a `RagEngineError`) for a bad argument or filter, raised before anything is embedded or sent. A refused API key is a `QdrantAuthError`. Everything else — an error of the embedder, a missing collection, an unreachable server — reaches the caller unchanged: see "Errors that are not `RagEngineError`" under [Public API](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#public-api). A request waits at most the timeout of the store (`RAG_ENGINE_QDRANT_TIMEOUT`, 60 seconds by default; a search service usually wants less).
 
 **Versions.** Search uses Qdrant's query API: qdrant-client 1.10 or later, and a Qdrant server 1.10 or later.
 
@@ -468,13 +492,13 @@ rag-engine eval --questions eval/known_item_v1.jsonl --collection documents \
 
 The command is the one place of the engine that reads the settings by itself (`Settings.from_env()`; a `.env` file is not read). It prints the report on the standard output. Exit codes: **0** when the evaluation ran, **1** when `--fail-under-hit-at-k` is given and not met, **2** when the evaluation could not run to its end (bad arguments or settings, an unusable question file, an unreachable server or a refused key, a missing collection, a collection of another dimension, of another distance than cosine or with named vectors, a collection that holds none of the expected documents, a missing embedding backend, a failure midway). `rag-engine --version` prints the version.
 
-**Model files.** The first run with the `onnx` backend downloads about 1.1 GB (the pinned ONNX export and its tokenizer) from the Hugging Face Hub; the `torch` backend downloads the weights of the model, about as much, into the Hugging Face cache. Set `RAG_ENGINE_MODEL_CACHE` to a directory that stays: unset, the ONNX files go under the system's temporary directory and are downloaded again after a reboot. The later runs make no request to the Hub, and none to anyone else: the engine turns the telemetry of the ONNX runtime off by default (`ORT_DISABLE_TELEMETRY=1`, see [Embedding backends](#embedding-backends)). For a service, set `HF_HUB_OFFLINE=1` once the cache is filled.
+**Model files.** The first run with the `onnx` backend downloads about 1.1 GB (the pinned ONNX export and its tokenizer) from the Hugging Face Hub; the `torch` backend downloads the weights of the model, about as much, into the Hugging Face cache. Set `RAG_ENGINE_MODEL_CACHE` to a directory that stays: unset, the ONNX files go under the system's temporary directory and are downloaded again after a reboot. The later runs make no request to the Hub, and none to anyone else: the engine turns the telemetry of the ONNX runtime off by default (`ORT_DISABLE_TELEMETRY=1`, see [Embedding backends](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#embedding-backends)). For a service, set `HF_HUB_OFFLINE=1` once the cache is filled.
 
 What is cheap is checked before the embedding model is loaded: the question file, the server, the collection (`QdrantStore.check_collection`, which only reads: the dimension of its vectors against `RAG_ENGINE_DIM`, and their distance, which must be cosine — a Dot or Euclid collection is refused, its scores are not the cosines the report is about), then the presence of the expected documents. A collection in which none of them is found is almost always the wrong collection, so the command stops there instead of printing an empty report and exiting with 0; `--allow-empty` runs it all the same, with a warning.
 
-**The question file** is JSON Lines, one question per line: `id` (unique), `question`, `expected_doc_ids` (the `doc_id` of every document that answers it, at least one), and optionally `filters` (an object with the field names and the rules of `SearchFilters`), `kind` and `tags` (labels the report groups by), `language` and `rationale` (kept, not used). It is checked strictly when read: a duplicate id, an empty `expected_doc_ids`, an unknown field or filter (`SearchFilters.from_mapping` reads the filters), a bad date, a question that holds nothing to search for once put in NFKD raise an `EvalError` naming the line. One question file is kept under [`eval/`](eval/README.md):
+**The question file** is JSON Lines, one question per line: `id` (unique), `question`, `expected_doc_ids` (the `doc_id` of every document that answers it, at least one), and optionally `filters` (an object with the field names and the rules of `SearchFilters`), `kind` and `tags` (labels the report groups by), `language` and `rationale` (kept, not used). It is checked strictly when read: a duplicate id, an empty `expected_doc_ids`, an unknown field or filter (`SearchFilters.from_mapping` reads the filters), a bad date, a question that holds nothing to search for once put in NFKD raise an `EvalError` naming the line. One question file is kept under [`eval/`](https://github.com/MyOpenFund/rag-engine/blob/main/eval/README.md):
 
-- `eval/known_item_v1.jsonl`: 797 automatic questions that ask for a document by its title or its catalogue label, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`. The words follow what a doc type is at each bank, a date is never stated more precisely than the manifest knows it nor presented as a meeting date when it is a publication date, and a question expects every document that holds the text asked for (the ECB publishes its decision and its statement a second time as one combined document). [`eval/README.md`](eval/README.md) has the tables and the evidence.
+- `eval/known_item_v1.jsonl`: 797 automatic questions that ask for a document by its title or its catalogue label, or by its bank, type and date in English and in French, with and without filters. They are built from the corpus manifests by `eval/make_known_item.py`. The words follow what a doc type is at each bank, a date is never stated more precisely than the manifest knows it nor presented as a meeting date when it is a publication date, and a question expects every document that holds the text asked for (the ECB publishes its decision and its statement a second time as one combined document). [`eval/README.md`](https://github.com/MyOpenFund/rag-engine/blob/main/eval/README.md) has the tables and the evidence.
 
 A second file, `eval/analytical_v2.jsonl`, holds 91 questions on the content of the documents, written by hand and checked against them: chains over several meetings, comparisons between banks, buried details, false premises and 15 questions the corpus cannot answer. It uses the second version of the question format (essential and acceptable documents, either-of groups, expected behaviour, a second run without filters). `eval/README.md` says how the questions were checked and what was not, which numbers to read for this batch, and its measured limits (87 of the 91 questions name the bank, 65 pairs of scored questions share a required document).
 
@@ -496,7 +520,7 @@ What these add to the scoring, all on documents and cut at `k`:
 - **A question that abstains** is searched and left out of every mean, whether it lists documents or not. The documents it lists are context documents, which a system may show while it says that the corpus does not answer; none is essential (an essential document on such a question is refused when the file is read). The report lists the first document returned, its score, the number of documents at or above a few score levels and how many of the context documents are among the first `k`, next to the lowest, median and highest top score of the scored questions: material to study a threshold for abstention. No threshold is applied and nothing passes or fails.
 - One line **per expected behaviour**: `correct_premise` questions are scored on their documents like any question; the questions that abstain have a count and no metric.
 
-`rag-engine eval-check --questions FILE [--manifests GLOB ...] [--doc-types ...] [--mime ...] [--k N]` checks a question file without any collection, model or setting: it prints the counts per kind, tag, expected behaviour and language, the questions with filters, the questions that abstain, the distribution of requirements and of expected documents, the texts used twice, the questions with more requirements or more expected documents than `k`, and, with the manifests of the corpus, the documents named that are not in the catalogue (or not of the doc types and MIME types ingested). Exit code 0, or 2 when the file breaks a rule or names a document that is not found. [`eval/README.md`](eval/README.md) has a complete example line, every rule, and how to read the new parts of the report.
+`rag-engine eval-check --questions FILE [--manifests GLOB ...] [--doc-types ...] [--mime ...] [--k N]` checks a question file without any collection, model or setting: it prints the counts per kind, tag, expected behaviour and language, the questions with filters, the questions that abstain, the distribution of requirements and of expected documents, the texts used twice, the questions with more requirements or more expected documents than `k`, and, with the manifests of the corpus, the documents named that are not in the catalogue (or not of the doc types and MIME types ingested). Exit code 0, or 2 when the file breaks a rule or names a document that is not found. [`eval/README.md`](https://github.com/MyOpenFund/rag-engine/blob/main/eval/README.md) has a complete example line, every rule, and how to read the new parts of the report.
 
 How to read the numbers of the known-item batch: it is a stratified sample, 12 documents per (bank, doc type) cell, so its averages weigh the 18 cells equally and are not weighted like the corpus; and all the documents are English, so its French questions measure cross-lingual retrieval.
 
@@ -619,7 +643,7 @@ pytest -q
 
 The tests that parse real documents need the `ingest` extra (`pip install -e ".[dev,ingest]"`) and skip without it; the OCR test also needs Tesseract with the `eng` language data (`apt-get install tesseract-ocr`). CI installs both on the Python 3.12 and 3.13 jobs (3.13 is the version production runs on and the golden fixture was captured with); the 3.10 job keeps the light install.
 
-Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+Changes are recorded in [CHANGELOG.md](https://github.com/MyOpenFund/rag-engine/blob/main/CHANGELOG.md).
 
 The default suite also runs the evaluation harness end to end, in qdrant-client's local mode, on the fixture of `eval/fixtures/` (13 documents; 13 questions with known answers in the first version of the question format, 11 more that use every field of the second), and checks the committed question file `eval/known_item_v1.jsonl`.
 
@@ -640,4 +664,4 @@ The integration tests of ingestion parse real documents, so they also need the `
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE). Portions are derived from eigenmind (MIT); see [NOTICE](NOTICE).
+MIT, see [LICENSE](https://github.com/MyOpenFund/rag-engine/blob/main/LICENSE). Portions are derived from eigenmind (MIT); see [NOTICE](https://github.com/MyOpenFund/rag-engine/blob/main/NOTICE).

@@ -3,16 +3,23 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "rag-engine"
-version = "0.1.0"
+name = "myopenfund-rag-engine"
+dynamic = ["version"]
 description = "Ingest one document into Qdrant with deterministic point ids, search what was ingested, and measure the search."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 authors = [{ name = "Marc Jeulin" }]
+maintainers = [{ name = "Marc Jeulin" }]
+keywords = ["myopenfund", "rag", "qdrant", "embeddings", "search"]
 classifiers = [
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Typing :: Typed",
 ]
 # qdrant-client 1.10.0 is the first release with QdrantClient.query_points (the query API), which
@@ -51,10 +58,20 @@ torch = ["sentence-transformers>=6,<7"]
 # psutil: imported by chunknorris (1.5.0) without being declared in its dependencies.
 ingest = ["chunknorris>=1.3.7,<1.6", "markitdown[pptx]", "psutil"]
 # ruff is bounded: CI runs "ruff format --check", and a new ruff release may change its style.
-dev = ["pytest>=8.3", "ruff>=0.17,<0.18"]
+dev = ["pytest>=8.3", "ruff>=0.17,<0.18", "pyyaml>=6"]
+
+[project.urls]
+Homepage = "https://github.com/MyOpenFund/rag-engine"
+Source = "https://github.com/MyOpenFund/rag-engine"
+Issues = "https://github.com/MyOpenFund/rag-engine/issues"
+Organization = "https://github.com/MyOpenFund"
+Changelog = "https://github.com/MyOpenFund/rag-engine/blob/main/CHANGELOG.md"
 
 [project.scripts]
 rag-engine = "rag_engine.cli:main"
+
+[tool.hatch.version]
+path = "src/rag_engine/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rag_engine"]

@@ -16,7 +16,7 @@ say nothing about what production loads. So the files the embedder loaded are ha
 here, and a copy with one byte changed, in the ONNX file or in ``tokenizer.json``, must be
 refused before any inference.
 
-It needs both extras (``rag-engine[torch,onnx]``) and the model files, which are downloaded on
+It needs both extras (``myopenfund-rag-engine[torch,onnx]``) and the model files, which are downloaded on
 the first run. Run it with ``pytest -m models -s`` to see the measured numbers.
 """
 
