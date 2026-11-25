@@ -101,9 +101,11 @@ def import_problems(report: dict, engine: str = "rag_engine") -> list[str]:
 
 
 def test_version():
+    from packaging.version import Version
+
     import rag_engine
 
-    assert rag_engine.__version__ == "0.1.0"
+    assert str(Version(rag_engine.__version__)) == rag_engine.__version__
 
 
 @pytest.mark.parametrize("module", ENGINE_MODULES)
@@ -457,7 +459,7 @@ def test_name_and_dynamic_version(pyproject):
 def test_installed_version_matches_init():
     import rag_engine
 
-    assert importlib.metadata.version(DIST) == rag_engine.__version__ == "0.1.0"
+    assert importlib.metadata.version(DIST) == rag_engine.__version__
 
 
 def test_credit(pyproject):
@@ -720,3 +722,98 @@ def test_install_hints_name_the_published_distribution():
     ):
         assert f"'{DIST}[{extra}]'" in hint
         assert "'rag-engine[" not in hint
+
+
+# ---- fail-closed approval gate (release hardening) -------------------------
+
+
+def _gate_job():
+    job = _workflow(RELEASE)["jobs"]["build"]
+    gate = [i for i, s in enumerate(job["steps"]) if s.get("name") == "Check the approval gate"]
+    assert len(gate) == 1
+    return job, gate[0]
+
+
+def test_release_checks_the_approval_gate_before_building():
+    job, gate = _gate_job()
+    assert job["permissions"] == {"contents": "read", "actions": "read"}
+    step = job["steps"][gate]
+    run = step["run"]
+    assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "inputs.target == 'testpypi'" in step["env"]["ENV_NAME"]
+    assert "'testpypi'" in step["env"]["ENV_NAME"] and "'pypi'" in step["env"]["ENV_NAME"]
+    assert 'gh api "repos/$GITHUB_REPOSITORY/environments/$ENV_NAME"' in run
+    assert "if ! " in run  # an API failure (non-200) is tested, not ignored
+    assert "required_reviewers" in run and "exit 1" in run
+    for i, other in enumerate(job["steps"]):
+        uses = other.get("uses", "")
+        building = uses.startswith(
+            ("actions/checkout@", "actions/setup-python@", "actions/upload-artifact@")
+        ) or "build" in other.get("run", "")
+        if i != gate and (building or other.get("name", "").startswith("Build")):
+            assert gate < i, other
+
+
+def _run_gate(tmp_path, response, status):
+    """Run the gate step against a stub `gh` that prints `response` and exits `status`."""
+    import os
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("jq") is None or shutil.which("bash") is None:
+        pytest.skip("needs jq and bash")
+    job, gate = _gate_job()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "gh"
+    stub.write_text(f"#!/bin/sh\ncat <<'JSON'\n{response}\nJSON\nexit {status}\n")
+    stub.chmod(0o755)
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "GITHUB_REPOSITORY": "MyOpenFund/example",
+        "ENV_NAME": "pypi",
+    }
+    return subprocess.run(
+        ["bash", "-e", "-c", job["steps"][gate]["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def test_gate_passes_with_a_required_reviewer(tmp_path):
+    rules = (
+        '{"protection_rules": [{"type": "wait_timer"}, {"type": "required_reviewers",'
+        ' "reviewers": [{"type": "User", "reviewer": {"login": "release-approver"}}]}]}'
+    )
+    assert _run_gate(tmp_path, rules, 0).returncode == 0
+
+
+def test_gate_fails_without_a_required_reviewer(tmp_path):
+    for rules in (
+        '{"protection_rules": []}',
+        '{"protection_rules": [{"type": "required_reviewers", "reviewers": []}]}',
+        '{"protection_rules": [{"type": "branch_policy"}]}',
+        "{}",
+    ):
+        result = _run_gate(tmp_path, rules, 0)
+        assert result.returncode == 1, rules
+        assert "required reviewer" in result.stdout + result.stderr
+
+
+def test_gate_fails_closed_when_the_api_call_fails(tmp_path):
+    result = _run_gate(tmp_path, "gh: Not Found (HTTP 404)", 1)
+    assert result.returncode == 1
+    assert "HTTP 404" in result.stdout + result.stderr
+
+
+def test_how_to_release_names_the_version_source():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = text.split("**How to release**", 1)[1].split("\n\n", 3)[1]
+    assert "`__version__` in `src/rag_engine/__init__.py`" in section
+    assert "and `version`" not in section
+    assert "pip install -e" in section
