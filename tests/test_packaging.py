@@ -34,6 +34,7 @@ ENGINE_MODULES = [
     "rag_engine.ingest",
     "rag_engine.search",
     "rag_engine.local",
+    "rag_engine.select",
     "rag_engine.eval",
     "rag_engine.eval_check",
     "rag_engine.cli",
@@ -279,6 +280,7 @@ PUBLIC_NAMES = {
         "fts_query",
         "hybrid_search",
     },
+    "rag_engine.select": {"DEFAULT_THRESHOLD", "ROLES", "select_diverse"},
     "rag_engine.eval": {
         "BEHAVIORS",
         "BOOTSTRAP_SEED",
@@ -382,6 +384,11 @@ def test_the_onnx_extra_declares_what_the_backend_imports(pyproject):
 def test_the_local_extra_brings_the_onnx_backend_and_the_ingest_parsers(pyproject):
     # The local index embeds with onnx and parses filings with the ingest extra; it needs no server.
     assert pyproject["project"]["optional-dependencies"]["local"] == ["myopenfund-rag-engine[onnx,ingest]"]
+
+
+def test_the_graph_extra_bounds_eigenmind_to_0_2(pyproject):
+    # rag_engine.select runs eigenmind 0.2's Supported Diversity; 0.1 had another API.
+    assert pyproject["project"]["optional-dependencies"]["graph"] == ["eigenmind>=0.2,<0.3"]
 
 
 def test_the_installed_huggingface_hub_takes_the_arguments_the_backend_uses():
@@ -732,12 +739,13 @@ def test_ci_keeps_its_jobs_and_adds_package():
 
 def test_install_hints_name_the_published_distribution():
     # The PyPI name `rag-engine` belongs to another project: the hints must name ours.
-    from rag_engine import chunking, embedding
+    from rag_engine import chunking, embedding, select
 
     for hint, extra in (
         (embedding._TORCH_EXTRA, "torch"),
         (embedding._ONNX_EXTRA, "onnx"),
         (chunking._INSTALL_HINT, "ingest"),
+        (select._INSTALL_HINT, "graph"),
     ):
         assert f"'{DIST}[{extra}]'" in hint
         assert "'rag-engine[" not in hint
