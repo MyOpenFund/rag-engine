@@ -98,7 +98,7 @@ jobs:
         run: |
           python -c "from rag_engine.embedding import ONNX_MODELS; print('revision=' + ONNX_MODELS['intfloat/multilingual-e5-base'].revision)" >> "$GITHUB_OUTPUT"
       # About 2.2 GB: the weights for sentence-transformers and the ONNX file for fastembed.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .model-cache
           key: models-intfloat-multilingual-e5-base-${{ steps.pin.outputs.revision }}
