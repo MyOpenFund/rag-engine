@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import sqlite3
+import threading
 
 import numpy as np
 import pytest
@@ -324,3 +325,139 @@ def test_an_empty_batch_writes_nothing_and_close_twice_is_harmless(tmp_path):
     assert opened.doc_ids() == set()
     opened.close()
     opened.close()
+
+
+# --- threads, locking and partial failures (fix round 1) ------------------------------------------
+
+
+def test_add_from_another_thread_works_where_sqlite_checks_the_thread(tmp_path, embedder, monkeypatch):
+    # macOS builds SQLite THREADSAFE=2, and qdrant-client then opens its storage with
+    # check_same_thread=True. Simulate that on any platform: the flag must override it.
+    from qdrant_client.local.persistence import CollectionPersistence
+
+    monkeypatch.setattr(CollectionPersistence, "CHECK_SAME_THREAD", True)
+    with LocalIndex(tmp_path / "i", collection=COLLECTION, dim=SPEC.dim) as opened:
+        assert opened.store.client._client.force_disable_check_same_thread is True
+        assert CollectionPersistence.CHECK_SAME_THREAD is False
+        errors: list[BaseException] = []
+
+        def work():
+            try:
+                _add(opened, embedder, "a", ["capex from a worker"])
+                opened.delete("a")
+                _add(opened, embedder, "b", ["capex again"])
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        worker = threading.Thread(target=work)
+        worker.start()
+        worker.join()
+        assert errors == []
+        assert opened.doc_ids() == {"b"}
+
+
+def test_hybrid_search_embeds_first_then_searches_both_sides_under_the_index_lock(index, embedder):
+    _add(index, embedder, "a", ["capex"])
+    calls = len(embedder.calls)
+    done = threading.Event()
+    result: list = []
+
+    def run():
+        result.extend(hybrid_search("capex", index=index, embedder=embedder, filters=None, limit=5))
+        done.set()
+
+    with index._lock:
+        worker = threading.Thread(target=run)
+        worker.start()
+        assert not done.wait(0.5)  # blocked on the lock...
+        assert len(embedder.calls) == calls + 1  # ...after embedding the query
+    worker.join()
+    assert [hit.doc_id for hit in result] == ["a"]
+
+
+def test_a_large_doc_ids_filter_needs_one_sql_variable(index, embedder):
+    _add(index, embedder, "a", ["capex"])
+    _add(index, embedder, "b", ["capex"])
+    many = SearchFilters(doc_ids=[f"doc-{n}" for n in range(40_000)] + ["a"])
+    assert {row.doc_id for row in index._fts_rows(fts_query("capex"), many, 10)} == {"a"}
+    hits = hybrid_search("capex", index=index, embedder=embedder, filters=many, limit=10)
+    assert {hit.doc_id for hit in hits} == {"a"}
+
+
+class _FailingDb:
+    """A SQLite connection whose ``executemany`` fails; everything else is the real one."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, *exc):
+        return self._real.__exit__(*exc)
+
+    def executemany(self, *args):
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+def test_a_failed_sqlite_write_is_a_store_error_and_leaves_no_points(index, embedder, monkeypatch):
+    monkeypatch.setattr(index, "_db", _FailingDb(index._db))
+    with pytest.raises(StoreError, match="disk I/O error"):
+        _add(index, embedder, "a", ["capex", "debt"])
+    monkeypatch.undo()
+    assert index.store.count(COLLECTION) == 0
+    assert index.doc_ids() == set()
+
+
+def test_a_payload_that_is_not_json_writes_nothing(index):
+    vectors = np.ones((1, SPEC.dim), np.float32)
+    with pytest.raises((TypeError, ValueError)):
+        index.add("a", [Chunk("x", page=None)], vectors, {"tags": {"set"}}, first_index=0)
+    with pytest.raises(ValueError):
+        index.add("a", [Chunk("x", page=None)], vectors, {"score": float("nan")}, first_index=0)
+    assert index.store.count(COLLECTION) == 0
+
+
+def test_a_failed_qdrant_delete_leaves_nothing_served_and_a_retry_cleans_up(index, embedder, monkeypatch):
+    _add(index, embedder, "a", ["capex"])
+    _add(index, embedder, "b", ["capex"])
+
+    def broken(**_kwargs):
+        raise RuntimeError("qdrant down")
+
+    monkeypatch.setattr(index.store.client, "delete", broken)
+    with pytest.raises(RuntimeError):
+        index.delete("a")
+    monkeypatch.undo()
+    assert index.doc_ids() == {"b"}
+    assert index.store.count(COLLECTION) == 2  # the point of "a" is left behind...
+    hits = hybrid_search("capex", index=index, embedder=embedder, filters=None, limit=10)
+    assert {hit.doc_id for hit in hits} == {"b"}  # ...and not served
+    index.delete("a")
+    assert index.store.count(COLLECTION) == 1
+
+
+def test_sqlite_errors_are_store_errors(tmp_path):
+    opened = LocalIndex(tmp_path / "i", collection=COLLECTION, dim=SPEC.dim)
+    opened.close()
+    with pytest.raises(StoreError):
+        opened.doc_ids()
+
+
+def test_the_dense_search_runs_under_the_index_lock(index, embedder, monkeypatch):
+    import rag_engine.local as local_module
+
+    _add(index, embedder, "a", ["capex"])
+    owned: list[bool] = []
+    real = local_module.search
+
+    def spy(*args, **kwargs):
+        owned.append(index._lock._is_owned())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(local_module, "search", spy)
+    hybrid_search("capex", index=index, embedder=embedder, filters=None, limit=5)
+    assert owned == [True]

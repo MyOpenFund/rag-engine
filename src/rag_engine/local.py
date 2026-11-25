@@ -22,11 +22,13 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -37,8 +39,17 @@ from qdrant_client import models
 from .chunking import Chunk
 from .embedding import Embedder
 from .schema import date_interval, page_for_id, point_id
-from .search import _PAYLOAD_FIELDS, QUERY_NORMALIZATION, Hit, SearchError, SearchFilters, search
-from .store import QdrantStore
+from .search import (
+    _PAYLOAD_FIELDS,
+    QUERY_NORMALIZATION,
+    Hit,
+    SearchError,
+    SearchFilters,
+    _encodable,
+    is_searchable,
+    search,
+)
+from .store import QdrantStore, StoreError
 
 __all__ = [
     "DATE_FILTER_MODE",
@@ -50,6 +61,8 @@ __all__ = [
     "fts_query",
     "hybrid_search",
 ]
+
+logger = logging.getLogger(__name__)
 
 #: How the dense side applies date bounds. ``"interval"`` is explicit, so ``search`` reads no
 #: payload schema (``"auto"`` would ask the store, and local mode keeps no payload index, so it
@@ -211,11 +224,12 @@ def _filter_sql(filters: SearchFilters | None) -> tuple[str, list[Any]]:
         (filters.languages, "language"),
     ):
         if values is not None:
-            clauses.append(f"{_json(key)} IN ({', '.join('?' * len(values))})")
-            params.extend(values)
+            clauses.append(f"{_json(key)} IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(list(values)))
     if filters.doc_ids is not None:
-        clauses.append(f"doc_id IN ({', '.join('?' * len(filters.doc_ids))})")
-        params.extend(filters.doc_ids)
+        # One JSON parameter, not one per value: SQLite caps the number of variables of a query.
+        clauses.append("doc_id IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(list(filters.doc_ids)))
     if filters.date_from is not None or filters.date_to is not None:
         clause, date_params = _date_sql(filters)
         clauses.append(clause)
@@ -237,6 +251,15 @@ class _Row:
     payload: dict[str, Any]
 
 
+@contextmanager
+def _sqlite(action: str) -> Iterator[None]:
+    """Raise an error of SQLite as a :class:`StoreError` that says what was being done."""
+    try:
+        yield
+    except sqlite3.Error as exc:
+        raise StoreError(f"the local FTS index could not {action}: {type(exc).__name__}: {exc}") from exc
+
+
 class LocalIndex:
     """Qdrant local under ``root/qdrant`` and an FTS5 table in ``root/fts.sqlite3``, written together.
 
@@ -246,10 +269,19 @@ class LocalIndex:
     open, from this process or another, raises :class:`rag_engine.store.IndexLocked`.
     :meth:`close` (or leaving a ``with`` block) releases it.
 
-    Writes go to Qdrant first, then to SQLite in one transaction: SQLite is the record of what
-    is complete (:meth:`doc_ids`, :meth:`count`). A write cut between the two leaves points in
-    Qdrant that SQLite does not list; adding the same batch again, or deleting the document,
-    repairs it. The methods may be called from several threads.
+    **SQLite is the record of what the index holds and serves.** :meth:`doc_ids` and
+    :meth:`count` read it, and :func:`hybrid_search` drops a dense hit whose chunk has no row
+    in SQLite. The FTS rowid is the point id, so that check is an indexed lookup. Hence:
+
+    - :meth:`add` writes Qdrant, then SQLite in one transaction. When SQLite fails, the points
+      just written are deleted from Qdrant again (best effort); any that remain are not served.
+    - :meth:`delete` removes the SQLite rows first, then the Qdrant points. When Qdrant fails,
+      the document is no longer served nor listed; calling :meth:`delete` again (it is
+      idempotent) removes the points left behind.
+
+    Errors of SQLite are raised as :class:`StoreError`. Every method holds one lock, and so does
+    the search of :func:`hybrid_search` on both sides: the index may be used from several
+    threads (Qdrant local mode has no locking of its own).
     """
 
     def __init__(self, root: Path, *, collection: str, dim: int) -> None:
@@ -261,17 +293,21 @@ class LocalIndex:
         self.store = QdrantStore.local(self.root / _QDRANT_DIR)
         try:
             self.store.ensure_collection(collection, dim)
-            self._db = sqlite3.connect(self.root / _FTS_FILE, check_same_thread=False, isolation_level=None)
-            try:
-                self._db.execute("PRAGMA journal_mode=WAL")
-                self._db.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5("
-                    "doc_id UNINDEXED, chunk_id UNINDEXED, text, context, payload_json UNINDEXED, "
-                    "tokenize = 'unicode61 remove_diacritics 2')"
+            with _sqlite("open its database"):
+                self._db = sqlite3.connect(
+                    self.root / _FTS_FILE, check_same_thread=False, isolation_level=None
                 )
-            except Exception:
-                self._db.close()
-                raise
+                try:
+                    self._db.execute("PRAGMA journal_mode=WAL")
+                    # rowid = chunk_id, the point id: an indexed lookup from a dense hit to its row.
+                    self._db.execute(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5("
+                        "doc_id UNINDEXED, chunk_id UNINDEXED, text, context, payload_json UNINDEXED, "
+                        "tokenize = 'unicode61 remove_diacritics 2')"
+                    )
+                except Exception:
+                    self._db.close()
+                    raise
         except Exception:
             self.store.client.close()
             raise
@@ -313,7 +349,12 @@ class LocalIndex:
 
         ``ValueError``: ``doc_id`` not a non-blank string, ``first_index`` not an integer >= 0,
         ``vectors`` not of shape ``(len(chunks), dim)``, a ``payload`` that sets one of
-        :data:`LOCAL_KEYS` or a ``doc_id`` other than ``doc_id``. Nothing is written then.
+        :data:`LOCAL_KEYS` or a ``doc_id`` other than ``doc_id``, a ``payload`` that cannot be
+        written as JSON (``TypeError`` from ``json``). Nothing is written then: every row is
+        encoded before the first write. A SQLite failure is a :class:`StoreError`, after the
+        points just written to Qdrant have been deleted again. Should a batch that overwrote
+        chunks fail that way, those chunks keep their previous rows in SQLite and are served
+        by the FTS side only until the batch is added again.
         """
         if not isinstance(doc_id, str) or not doc_id.strip():
             raise ValueError(f"doc_id must be a non-blank string, got {doc_id!r}")
@@ -336,7 +377,7 @@ class LocalIndex:
             )
         interval = date_interval(payload.get("date"), payload.get("date_precision"))
         points: list[models.PointStruct] = []
-        rows: list[tuple[str, int, str, str | None, str]] = []
+        rows: list[tuple[int, str, int, str, str | None, str]] = []
         for offset, (chunk, vector) in enumerate(zip(chunks, array)):
             number = first_index + offset
             common: dict[str, Any] = {"doc_id": doc_id, **payload, "chunk_number": number}
@@ -348,43 +389,76 @@ class LocalIndex:
             if chunk.context is not None:
                 full["context"] = chunk.context
             ident = point_id(doc_id, page_for_id(chunk.page), number)
+            encoded = json.dumps(common, ensure_ascii=False, allow_nan=False)
             points.append(models.PointStruct(id=ident, vector=vector.tolist(), payload=full))
-            rows.append((doc_id, ident, chunk.text, chunk.context, json.dumps(common, ensure_ascii=False)))
+            rows.append((ident, doc_id, ident, chunk.text, chunk.context, encoded))
+        idents = [point.id for point in points]
         with self._lock:
             self.store.upsert(self.collection, points)
-            with self._db:
-                self._db.execute("BEGIN")
-                self._db.execute(
-                    "DELETE FROM chunks WHERE doc_id = ? AND chunk_id IN (SELECT value FROM json_each(?))",
-                    (doc_id, json.dumps([row[1] for row in rows])),
-                )
-                self._db.executemany(
-                    "INSERT INTO chunks (doc_id, chunk_id, text, context, payload_json) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    rows,
-                )
+            try:
+                with _sqlite("write the chunks"), self._db:
+                    self._db.execute("BEGIN")
+                    self._db.execute(
+                        "DELETE FROM chunks WHERE rowid IN (SELECT value FROM json_each(?))",
+                        (json.dumps(idents),),
+                    )
+                    self._db.executemany(
+                        "INSERT INTO chunks (rowid, doc_id, chunk_id, text, context, payload_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        rows,
+                    )
+            except StoreError:
+                try:
+                    self.store.client.delete(
+                        collection_name=self.collection,
+                        points_selector=models.PointIdsList(points=idents),
+                        wait=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - the SQLite error is the one to report
+                    logger.warning(
+                        "Could not delete %d points of %r from Qdrant after a failed SQLite write (%s: %s): "
+                        "they are not served, and adding the batch again overwrites them",
+                        len(idents),
+                        doc_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                raise
         return len(points)
 
     def delete(self, doc_id: str) -> None:
-        """Remove every chunk of ``doc_id`` from both sides (Qdrant first, then SQLite)."""
+        """Remove every chunk of ``doc_id``: the SQLite rows first, then the Qdrant points.
+
+        Once the rows are gone the document is neither listed nor served, whatever happens to
+        the points; a failure of Qdrant is raised, and calling ``delete`` again removes them.
+        """
         condition = models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))
         selector = models.FilterSelector(filter=models.Filter(must=[condition]))
         with self._lock:
-            self.store.client.delete(collection_name=self.collection, points_selector=selector, wait=True)
-            with self._db:
+            with _sqlite("delete a document"), self._db:
                 self._db.execute("BEGIN")
                 self._db.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            self.store.client.delete(collection_name=self.collection, points_selector=selector, wait=True)
 
     def doc_ids(self) -> set[str]:
         """The documents that have at least one chunk in the index."""
-        with self._lock:
+        with self._lock, _sqlite("list the documents"):
             return {row[0] for row in self._db.execute("SELECT DISTINCT doc_id FROM chunks")}
 
     def count(self, doc_id: str) -> int:
         """The number of chunks of ``doc_id`` in the index (0 for an unknown document)."""
-        with self._lock:
+        with self._lock, _sqlite("count the chunks of a document"):
             found = self._db.execute("SELECT count(*) FROM chunks WHERE doc_id = ?", (doc_id,)).fetchone()
         return int(found[0])
+
+    def _served(self, idents: Sequence[int]) -> set[int]:
+        """Which of the point ids ``idents`` have a row in SQLite: the chunks the index serves."""
+        with self._lock, _sqlite("look up chunks"):
+            found = self._db.execute(
+                "SELECT rowid FROM chunks WHERE rowid IN (SELECT value FROM json_each(?))",
+                (json.dumps(list(idents)),),
+            ).fetchall()
+        return {int(row[0]) for row in found}
 
     def _fts_rows(self, match: str, filters: SearchFilters | None, limit: int) -> list[_Row]:
         """The ``limit`` chunks that match ``match`` (an :func:`fts_query`) best by bm25, under filters."""
@@ -393,7 +467,7 @@ class LocalIndex:
             "SELECT doc_id, chunk_id, text, context, payload_json FROM chunks "
             f"WHERE chunks MATCH ? AND {where} ORDER BY bm25(chunks), chunk_id LIMIT ?"
         )
-        with self._lock:
+        with self._lock, _sqlite("search the chunks"):
             found = self._db.execute(sql, [match, *params, limit]).fetchall()
         return [_Row(row[0], int(row[1]), row[2], row[3], json.loads(row[4])) for row in found]
 
@@ -447,6 +521,9 @@ def hybrid_search(
       :func:`fts_query` of the query put in NFKD (the form chunks are stored in). A query
       without any word (``"???"``) is searched on the dense side alone.
     - ``filters`` (every field of :class:`SearchFilters`) restrict both sides alike.
+    - Both sides are searched under the lock of ``index`` (the query is embedded before), and
+      a dense hit whose chunk has no SQLite row is dropped before the fusion
+      (:class:`LocalIndex`: SQLite is the record of what is served).
     - Fusion: each chunk scores ``sum(1 / (rrf_k + rank))`` over the lists it is in (``rank``
       from 1); ``Hit.score`` is that fused score. Ties keep the dense order, then the FTS one.
       A chunk found by FTS alone is rebuilt from SQLite, which holds its whole payload.
@@ -463,22 +540,32 @@ def hybrid_search(
     _count("candidates", candidates)
     _count("rrf_k", rrf_k)
     once = _OnceQuery(embedder)
-    dense = search(
-        query,
-        collection=index.collection,
-        store=index.store,
-        embedder=once,  # type: ignore[arg-type]
-        filters=filters,
-        limit=candidates,
-        max_limit=candidates,
-        date_filter_mode=DATE_FILTER_MODE,
-    )
+    if isinstance(query, str) and query.strip() and _encodable(query) and is_searchable(query):
+        normalized = unicodedata.normalize(QUERY_NORMALIZATION, query)
+        if is_searchable(normalized):
+            # Embedded before the lock is taken: a slow model must not hold writers back.
+            # A query search() refuses is not embedded: search() raises before asking.
+            once.encode_query(normalized)
     try:
-        match = fts_query(unicodedata.normalize(QUERY_NORMALIZATION, query))
-    except ValueError:
-        lexical: list[_Row] = []
-    else:
-        lexical = index._fts_rows(match, filters, candidates)
+        match: str | None = fts_query(unicodedata.normalize(QUERY_NORMALIZATION, query))
+    except (TypeError, ValueError):
+        match = None
+    # Both sides under the index lock: they see the same state of the index.
+    with index._lock:
+        dense = search(
+            query,
+            collection=index.collection,
+            store=index.store,
+            embedder=once,  # type: ignore[arg-type]
+            filters=filters,
+            limit=candidates,
+            max_limit=candidates,
+            date_filter_mode=DATE_FILTER_MODE,
+        )
+        lexical = [] if match is None else index._fts_rows(match, filters, candidates)
+        # A dense hit without its SQLite row (a write cut half-way) is not served.
+        served = index._served([hit.point_id for hit in dense if isinstance(hit.point_id, int)])
+    dense = [hit for hit in dense if hit.point_id in served]
 
     scores: dict[int | str, float] = {}
     hits: dict[int | str, Hit] = {}
