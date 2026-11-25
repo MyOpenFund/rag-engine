@@ -476,7 +476,7 @@ class LocalIndex:
 
 
 class _OnceQuery:
-    """An embedder that embeds the query once and remembers the vector, for ``search`` and the selector."""
+    """An embedder that embeds the query once and remembers the vector (embedded before the lock)."""
 
     def __init__(self, embedder: Embedder) -> None:
         self._embedder = embedder
@@ -527,9 +527,15 @@ def hybrid_search(
     - Fusion: each chunk scores ``sum(1 / (rrf_k + rank))`` over the lists it is in (``rank``
       from 1); ``Hit.score`` is that fused score. Ties keep the dense order, then the FTS one.
       A chunk found by FTS alone is rebuilt from SQLite, which holds its whole payload.
-    - ``selector``: when given, it receives every fused candidate (best first), the query
-      vector and ``limit``, and returns the hits to give back (an MMR, say); otherwise the
-      first ``limit`` are returned. The query is embedded once either way.
+    - ``selector``: when given, it is called as ``selector(hits, vectors, limit)``: ``hits``
+      are the fused candidates (best first), ``vectors`` their stored vectors, one row per
+      hit in the same order (shape ``(len(hits), dim)``, read from the local Qdrant by point
+      id under the same lock as the search), and it returns the hits to give back
+      (:func:`rag_engine.select.select_diverse`, an MMR, ...). A candidate whose point is
+      missing (a write cut half-way left its SQLite row alone, so only FTS found it) has no
+      vector: it is left out of ``hits``, so out of the result, and the number left out is
+      logged as a warning. Without a selector the first ``limit`` fused candidates are
+      returned. The query is embedded once either way.
 
     ``limit``, ``candidates`` and ``rrf_k`` are integers >= 1, else :class:`SearchError`
     (``limit`` may exceed ``candidates``: the fusion holds up to ``2 * candidates`` chunks).
@@ -565,8 +571,18 @@ def hybrid_search(
         lexical = [] if match is None else index._fts_rows(match, filters, candidates)
         # A dense hit without its SQLite row (a write cut half-way) is not served.
         served = index._served([hit.point_id for hit in dense if isinstance(hit.point_id, int)])
-    dense = [hit for hit in dense if hit.point_id in served]
+        dense = [hit for hit in dense if hit.point_id in served]
+        fused = _fuse(dense, lexical, rrf_k)
+        if selector is None:
+            return fused[:limit]
+        # The vectors of the same state of the index as the candidates.
+        fused, vectors = _with_vectors(index, fused)
+    # The selector runs outside the lock: a slow selection must not hold writers back.
+    return selector(fused, vectors, limit)
 
+
+def _fuse(dense: list[Hit], lexical: list[_Row], rrf_k: int) -> list[Hit]:
+    """Reciprocal Rank Fusion of the dense hits and the FTS rows, best first."""
     scores: dict[int | str, float] = {}
     hits: dict[int | str, Hit] = {}
     for rank, hit in enumerate(dense, start=1):
@@ -578,11 +594,28 @@ def hybrid_search(
         rows.setdefault(row.chunk_id, row)
     # dict order is first-seen: dense order, then FTS-only order; sorted() is stable.
     ordered = sorted(scores, key=lambda ident: -scores[ident])
-    fused = [
+    return [
         replace(hits[ident], score=scores[ident]) if ident in hits else _row_hit(rows[ident], scores[ident])
         for ident in ordered
     ]
-    if selector is None:
-        return fused[:limit]
-    vector = once.vector if once.vector is not None else np.asarray(embedder.encode_query(query))
-    return selector(fused, vector, limit)
+
+
+def _with_vectors(index: LocalIndex, hits: list[Hit]) -> tuple[list[Hit], np.ndarray]:
+    """``hits`` that have a point in Qdrant, and their stored vectors in the same order."""
+    records = index.store.client.retrieve(
+        collection_name=index.collection,
+        ids=[hit.point_id for hit in hits],
+        with_payload=False,
+        with_vectors=True,
+    )
+    stored = {record.id: record.vector for record in records}
+    kept = [hit for hit in hits if hit.point_id in stored]
+    if len(kept) < len(hits):
+        logger.warning(
+            "%d of %d candidates have no point in %s and were left out of the selection",
+            len(hits) - len(kept),
+            len(hits),
+            index.collection,
+        )
+    vectors = np.array([stored[hit.point_id] for hit in kept], dtype=np.float32).reshape(len(kept), index.dim)
+    return kept, vectors

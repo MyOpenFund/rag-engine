@@ -13,12 +13,13 @@ import threading
 import numpy as np
 import pytest
 from date_corpus import DATE_DOCUMENTS, all_ranges, expected_documents
+from qdrant_client import models
 
 from rag_engine.chunking import Chunk
 from rag_engine.embedding import FakeEmbedder, ModelSpec
 from rag_engine.local import LocalIndex, collection_name, fts_query, hybrid_search
 from rag_engine.schema import page_for_id, point_id
-from rag_engine.search import SearchError, SearchFilters
+from rag_engine.search import SearchError, SearchFilters, search
 from rag_engine.store import IndexLocked, QdrantStore, StoreError
 
 SPEC = ModelSpec(name="fake", dim=8, passage_prefix="passage: ", query_prefix="query: ")
@@ -245,20 +246,80 @@ def test_filters_apply_to_both_sides(index, embedder):
     assert {hit.doc_id for hit in hits} == {"b"}
 
 
-def test_selector_receives_fused_candidates_and_the_query_vector(index, embedder):
-    _add(index, embedder, "a", ["capex one", "capex two", "capex three"])
+def _spy():
     seen = {}
 
-    def selector(hits, vector, limit):
-        seen["hits"], seen["vector"], seen["limit"] = hits, vector, limit
+    def selector(hits, vectors, limit):
+        seen["hits"], seen["vectors"], seen["limit"] = hits, vectors, limit
         return hits[::-1][:limit]
 
+    return seen, selector
+
+
+def test_selector_receives_one_stored_vector_per_candidate_in_order(index, embedder):
+    texts = ["capex one", "capex capex two", "capex three", "capex four"]
+    _add(index, embedder, "a", texts)
+    stored = dict(zip(texts, embedder.encode_passage(texts)))
+    # candidates=1: the dense side gives "capex four", FTS gives "capex capex two" (FTS only).
+    dense = search(
+        "capex",
+        collection=COLLECTION,
+        store=index.store,
+        embedder=embedder,
+        filters=None,
+        limit=1,
+        date_filter_mode="interval",
+    )
+    fts = index._fts_rows(fts_query("capex"), None, 1)
+    assert dense[0].point_id != fts[0].chunk_id
+    seen, selector = _spy()
     calls_before = len(embedder.calls)
-    hits = hybrid_search("capex", index=index, embedder=embedder, filters=None, limit=2, selector=selector)
+    hits = hybrid_search(
+        "capex", index=index, embedder=embedder, filters=None, limit=1, candidates=1, selector=selector
+    )
     assert len(embedder.calls) == calls_before + 1  # the query is embedded once
-    assert seen["limit"] == 2 and len(seen["hits"]) == 3
-    np.testing.assert_allclose(seen["vector"], embedder.encode_query("capex"))
-    assert hits == seen["hits"][::-1][:2]
+    assert [hit.point_id for hit in seen["hits"]] == [dense[0].point_id, fts[0].chunk_id]
+    assert seen["limit"] == 1
+    assert seen["vectors"].shape == (2, SPEC.dim)
+    for hit, vector in zip(seen["hits"], seen["vectors"]):
+        np.testing.assert_allclose(vector, stored[hit.text], atol=1e-6)
+    assert hits == seen["hits"][::-1][:1]
+
+
+def test_selector_input_leaves_out_a_candidate_without_its_point(index, embedder, caplog):
+    _add(index, embedder, "a", ["capex one", "capex two", "capex three"])
+    gone = index._fts_rows(fts_query("two"), None, 1)[0].chunk_id
+    # A write cut half-way: the SQLite row is there, the point is not.
+    index.store.client.delete(
+        collection_name=COLLECTION, points_selector=models.PointIdsList(points=[gone]), wait=True
+    )
+    plain = hybrid_search("capex two", index=index, embedder=embedder, filters=None, limit=5)
+    assert gone in {hit.point_id for hit in plain}  # found by FTS
+    seen, selector = _spy()
+    with caplog.at_level("WARNING", logger="rag_engine.local"):
+        hits = hybrid_search(
+            "capex two", index=index, embedder=embedder, filters=None, limit=5, selector=selector
+        )
+    assert gone not in {hit.point_id for hit in seen["hits"]}
+    assert gone not in {hit.point_id for hit in hits}
+    assert seen["vectors"].shape == (len(seen["hits"]), SPEC.dim) == (2, SPEC.dim)
+    assert "1 of 3 candidates have no point" in caplog.text
+
+
+def test_hybrid_search_with_select_diverse_returns_limit_hits(index, embedder):
+    pytest.importorskip("eigenmind")
+    from rag_engine.select import select_diverse
+
+    _add(index, embedder, "a", [f"capex note {i}" for i in range(8)])
+    _add(index, embedder, "b", [f"capex memo {i}" for i in range(8)])
+    arguments = {"index": index, "embedder": embedder, "filters": None, "limit": 4}
+    arguments["selector"] = select_diverse
+    first = hybrid_search("capex", **arguments)
+    again = hybrid_search("capex", **arguments)
+    assert len(first) == 4
+    assert [hit.point_id for hit in first] == [hit.point_id for hit in again]
+    scores = [hit.score for hit in first]
+    assert scores == sorted(scores, reverse=True)  # fused order, best first
 
 
 def test_a_query_without_words_searches_the_dense_side_alone(index, embedder):

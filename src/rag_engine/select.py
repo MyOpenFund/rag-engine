@@ -30,6 +30,17 @@ the same input: no randomness, and HiGHS returns the same optimum for the same p
 One exception: a MILP stopped by ``time_limit`` returns its best incumbent at that time,
 which depends on the machine (a 50-candidate problem is solved in milliseconds).
 
+It plugs into :func:`rag_engine.local.hybrid_search` as ``selector=select_diverse``: the
+search passes the stored vector of every candidate, one row per hit in the same order.
+
+To tune (evaluated in B5, on real collections): ``threshold``, since real embeddings are
+anisotropic (their cosines crowd in a narrow band, so at 0.65 most candidates may form one
+clique, the stable set holds one or two of them and the fill-up gives back the fused order);
+and mean-centring or removal of the top principal directions before the graph
+(``eigenmind.normalize_embeddings(center=..., remove_top=...)``, not exposed yet). Ties in
+the fused scores (a dense rank r and an FTS-only rank r) are broken by HiGHS: stable for one
+HiGHS version, not specified.
+
 eigenmind is an optional dependency (the ``graph`` extra); it is imported only when a
 selection is needed, so ``limit >= len(hits)`` works without it.
 """

@@ -391,6 +391,13 @@ def test_the_graph_extra_bounds_eigenmind_to_0_2(pyproject):
     assert pyproject["project"]["optional-dependencies"]["graph"] == ["eigenmind>=0.2,<0.3"]
 
 
+def test_the_test_job_installs_the_graph_extra():
+    # The eigenmind tests skip without it; the test job installs it on every Python version.
+    steps = _workflow(CI)["jobs"]["tests"]["steps"]
+    installs = [s["run"] for s in steps if s.get("run", "").startswith("pip install -e")]
+    assert len(installs) == 1 and '".[dev,graph' in installs[0]
+
+
 def test_the_installed_huggingface_hub_takes_the_arguments_the_backend_uses():
     # The arguments the backend passes (tests/test_embedding.py pins them with a stand-in of
     # this function); huggingface_hub 0.20.0, the declared lower bound, has them all.
