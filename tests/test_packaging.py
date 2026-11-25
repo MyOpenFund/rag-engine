@@ -33,6 +33,7 @@ ENGINE_MODULES = [
     "rag_engine.chunking",
     "rag_engine.ingest",
     "rag_engine.search",
+    "rag_engine.local",
     "rag_engine.eval",
     "rag_engine.eval_check",
     "rag_engine.cli",
@@ -216,6 +217,7 @@ PUBLIC_NAMES = {
         "CollectionMismatchError",
         "CollectionNotFoundError",
         "DateFieldsError",
+        "IndexLocked",
         "MissingIndexError",
         "QdrantAuthError",
         "QdrantStore",
@@ -266,6 +268,16 @@ PUBLIC_NAMES = {
         "SearchFilters",
         "is_searchable",
         "search",
+    },
+    "rag_engine.local": {
+        "DATE_FILTER_MODE",
+        "DEFAULT_CANDIDATES",
+        "DEFAULT_RRF_K",
+        "LOCAL_KEYS",
+        "LocalIndex",
+        "collection_name",
+        "fts_query",
+        "hybrid_search",
     },
     "rag_engine.eval": {
         "BEHAVIORS",
@@ -365,6 +377,11 @@ def test_the_onnx_extra_declares_what_the_backend_imports(pyproject):
     # fastembed, bounded to the minor version parity was measured on; and huggingface_hub, which
     # the backend imports itself (snapshot_download) and must not receive by chance.
     assert onnx == ["fastembed>=0.9,<0.10", "huggingface_hub>=0.20"]
+
+
+def test_the_local_extra_brings_the_onnx_backend_and_the_ingest_parsers(pyproject):
+    # The local index embeds with onnx and parses filings with the ingest extra; it needs no server.
+    assert pyproject["project"]["optional-dependencies"]["local"] == ["myopenfund-rag-engine[onnx,ingest]"]
 
 
 def test_the_installed_huggingface_hub_takes_the_arguments_the_backend_uses():
