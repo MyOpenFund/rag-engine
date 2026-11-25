@@ -287,3 +287,153 @@ def test_k_below_ten_is_refused_before_any_work():
 def test_an_empty_report_writes_null_not_nan():
     report = PassageReport(k=10, results=())
     assert json.loads(json.dumps(report.to_dict(), allow_nan=False))["hit_at_10"]["value"] is None
+
+
+# --- step 5-6: the per-section cut, the span checker, the committed set ---------------------------
+
+
+def _checker():
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "check_filings_eval.py"
+    spec = importlib.util.spec_from_file_location("check_filings_eval", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_section_pieces_cut_like_the_mcp():
+    script = _script()
+    text = "AAAA" + "1111" + "BB" + "2222" + "   " + "3333" + "CC"
+    sections = [("Item 2", 10, 14), ("Item 1", 4, 8), ("Item 3", 17, 21), ("Item 1A", 6, 9)]
+    sections.append(("Item 9", 40, 50))
+    pieces = script.section_pieces(text, sections)
+    # sorted by start; Item 1A clipped to start after Item 1 (8..9); blank gap and past-the-end dropped
+    assert pieces == [
+        (None, "AAAA"),
+        ("Item 1", "1111"),
+        ("Item 1A", "B"),
+        (None, "B"),
+        ("Item 2", "2222"),
+        ("Item 3", "3333"),
+        (None, "CC"),
+    ]
+    assert "".join(piece for _, piece in pieces) == text.replace("   ", "")
+    assert script.section_pieces("plain text", []) == [(None, "plain text")]
+
+
+def test_section_cut_never_spans_two_sections(tmp_path):
+    script = _script()
+    first = "# Item 7\n\n" + " ".join(f"alpha{i}" for i in range(60))
+    second = "\n\n# Item 8\n\n" + " ".join(f"omega{i}" for i in range(60))
+    text = first + second
+    filing = script.Filing("d", text, "T", "10-K", "2024-01-01", (("Item 7", 0, len(first)),))
+    options = script.PROFILES["v2"]()
+    whole = script.filing_chunks(filing, options=options, tokenizer=script._WordTokenizer(), cut="document")
+    split = script.filing_chunks(filing, options=options, tokenizer=script._WordTokenizer(), cut="section")
+    assert any("alpha" in c.text and "omega" in c.text for c in whole)
+    assert not any("alpha" in c.text and "omega" in c.text for c in split)
+    with pytest.raises(ValueError, match="sections"):
+        script.filing_chunks(
+            script.Filing("d", text, "T", "10-K", "2024-01-01"),
+            options=options,
+            tokenizer=script._WordTokenizer(),
+            cut="section",
+        )
+
+
+def test_load_filings_reads_and_checks_sections(tmp_path):
+    script = _script()
+    (tmp_path / "d.md").write_text("0123456789", encoding="utf-8")
+    meta = {"title": "T", "form": "10-K", "date": "2024-01-01"}
+    (tmp_path / "d.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert script.load_filings(tmp_path)[0].sections is None
+    meta["sections"] = [{"name": "Item 7", "start": 2, "end": 5}]
+    (tmp_path / "d.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert script.load_filings(tmp_path)[0].sections == (("Item 7", 2, 5),)
+    for bad in ([{"name": "Item 7", "start": 2, "end": 50}], [{"name": "Item 7", "start": 5, "end": 2}], "x"):
+        meta["sections"] = bad
+        (tmp_path / "d.json").write_text(json.dumps(meta), encoding="utf-8")
+        with pytest.raises(ValueError, match="section"):
+            script.load_filings(tmp_path)
+
+
+def test_filings_eval_section_cut_end_to_end(tmp_path, capsys):
+    script = _script()
+    qfile = _synthetic_corpus(tmp_path)
+    for sidecar in tmp_path.glob("*.json"):
+        meta = json.loads(sidecar.read_text())
+        text = sidecar.with_suffix(".md").read_text()
+        cut = text.index("## Operations")
+        meta["sections"] = [{"name": "Item 7", "start": 0, "end": cut}]
+        sidecar.write_text(json.dumps(meta))
+    out = tmp_path / "rows.json"
+    args = [str(tmp_path), str(qfile), "--backend", "fake", "--cuts", "document,section", "--resamples", "50"]
+    assert script.main([*args, "--json", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "v2/section" in printed
+    assert "v2 >= v1 on hit@10 (hybrid, section cut)" in printed
+    rows = json.loads(out.read_text())
+    assert {r["chunking"] for r in rows} == {"v1", "v2", "v1/section", "v2/section"}
+    assert {len(r["questions_sha256"]) for r in rows} == {64}
+    with pytest.raises(ValueError, match="cut"):
+        script.check_inputs([_question("q", ("x",))], ["v1"], 10, ["pages"])
+
+
+def test_section_cut_needs_sections_before_any_work(tmp_path):
+    script = _script()
+    qfile = _synthetic_corpus(tmp_path)  # sidecars without sections
+    with pytest.raises(ValueError, match="no 'sections'"):
+        script.main([str(tmp_path), str(qfile), "--backend", "fake", "--cuts", "section"])
+
+
+def test_span_checker_reports_each_rule(tmp_path, capsys):
+    checker = _checker()
+    (tmp_path / "a-2024.md").write_text(
+        "Cash totaled $4.2 billion at year end.\n\nThe board met.\n\nRepeated boilerplate sentence here.\n"
+        "Twice: capital expenditures of $9 billion; again capital expenditures of $9 billion;"
+        " thrice capital expenditures of $9 billion.",
+        encoding="utf-8",
+    )
+    (tmp_path / "a-2023.md").write_text("Repeated boilerplate sentence here.", encoding="utf-8")
+
+    def row(id_, doc, span):
+        return {"id": id_, "question": "q?", "expected_doc_ids": [doc], "expected_spans": [span]}
+
+    rows = [
+        row("ok", "a-2024", "cash  TOTALED $4.2 billion"),
+        row("missing", "a-2024", "never written anywhere"),
+        row("short", "a-2024", "----------------------"),
+        row("shared", "a-2024", "Repeated boilerplate sentence"),
+        row("thrice", "a-2024", "capital expenditures of $9 billion"),
+        row("nofile", "b-2024", "Cash totaled $4.2 billion"),
+        {"id": "abs", "question": "q?", "expected_behavior": "abstain", "expected_doc_ids": []},
+    ]
+    qfile = tmp_path / "q.jsonl"
+    qfile.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    assert checker.main([str(qfile), str(tmp_path)]) == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert not any(line.startswith(("ok", "abs")) for line in lines)
+    joined = "\n".join(lines)
+    assert "missing 'never written anywhere': not found in any expected filing" in joined
+    assert "short '" in joined and "too short or no letter" in joined
+    assert "also in filings not expected: a-2023" in joined
+    assert "found 3 times in a-2024" in joined
+    assert "expected filing 'b-2024' not in the directory" in joined
+    assert "7 questions (6 answering, 1 abstaining)" in joined
+    good = tmp_path / "good.jsonl"
+    good.write_text(json.dumps(rows[0]) + "\n" + json.dumps(rows[-1]) + "\n", encoding="utf-8")
+    assert checker.main([str(good), str(tmp_path)]) == 0
+
+
+def test_the_committed_filings_set_is_well_formed():
+    questions = load_questions(EVAL / "filings_v1.jsonl")
+    ids = [q.id for q in questions]
+    assert len(ids) == len(set(ids)) and len(ids) >= 40
+    abstaining = [q for q in questions if q.expected_behavior == "abstain"]
+    assert len(abstaining) >= 4
+    for question in questions:
+        if question.expected_behavior != "abstain":
+            assert 1 <= len(question.expected_spans) <= 3
+            assert question.expected_doc_ids

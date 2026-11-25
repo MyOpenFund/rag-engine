@@ -5,10 +5,21 @@ filing), and chunk ids differ from one chunker to the next. This evaluation ther
 **passages**: a question carries short verbatim `expected_spans`, and a retrieved passage is a hit
 when it contains one of them.
 
-The question set itself (`filings_v1.jsonl`, about 40 questions on the 10-Ks of five issuers,
-FY2022-FY2025, at least four of them abstentions) is not in this folder yet: it needs the filings as
-Markdown, which cannot be fetched from here. It is written and checked as described below, then
-validated by the owner before it decides the eigenmind default.
+The question set is `filings_v1.jsonl`: 48 questions (43 answering, 5 abstentions) on the 10-Ks
+of Microsoft, Alphabet, Amazon, Meta and Oracle for fiscal years 2022 to 2025 (20 filings), on capital
+expenditures, AI and data-centre investment, financing, debt, leases and liquidity. Every span was
+copied from the Markdown and passes `scripts/check_filings_eval.py` (below).
+
+> **Status: pending the owner's validation.** The set has not been read by the owner yet. Until it
+> is, the numbers it gives are provisional and it does not decide the eigenmind default.
+
+The filings are not in the repository (full 10-K texts). They are fetched with company-corpus's live
+code (`company_corpus.live.filings.fetch_submissions` / `list_filings`, form `10-K`, report dates
+2022-01-01 to 2025-12-31, then `company_corpus.live.documents.filing_document`) and written as
+`<doc_id>.md` (`FilingDocument.markdown`) with a `<doc_id>.json` sidecar: `title`, `form`, `date`
+(filing date), `doc_id`, `url`, `cik` and `sections` (`[{"name", "start", "end"}]`, the
+`FilingDocument.sections`). The doc ids are `<ticker>-10k-fy<YYYY>`, the fiscal year being the year
+of the report date (Microsoft's ends on 30 June, Oracle's on 31 May, the others' on 31 December).
 
 ## Question format
 
@@ -40,6 +51,18 @@ that appears in several filings (boilerplate) is refused: it would be a hit for 
 Spans are copied from the Markdown, not from the SEC web page: tables and line breaks differ. The
 whole set is then read once by the owner.
 
+```
+python scripts/check_filings_eval.py eval/filings_v1.jsonl FILINGS_DIR [--min-chars 20] [--max-per-filing 2]
+```
+
+prints one line per failed rule and exits 1 if there is any: an expected filing missing from the
+directory; a span shorter than `--min-chars` once normalised or without a letter (no dash-only or
+tiny span); a span found in none of the question's filings, or more than `--max-per-filing` times
+in one; a span also found in a filing the question does not expect. Spans are taken from prose
+sentences, not from tables (whose cells the chunker may split), and name a figure or a fact that
+only that year's filing states (a 10-K repeats the previous year's figures, so a span such as
+"$75.5 billion" alone would also be in the next filing).
+
 ## Scoring
 
 `span_hit(text, spans)`: both sides are case-folded and every run of white space becomes one space;
@@ -59,14 +82,21 @@ python scripts/filings_eval.py FILINGS_DIR eval/filings_v1.jsonl --backend onnx 
     --sweep-threshold 0.5,0.65,0.8 --sweep-keep-top 0,1,2 --sweep-solver milp,lp_greedy --json out.json
 ```
 
-`FILINGS_DIR` holds `<doc_id>.md` and `<doc_id>.json` (`{"title", "form", "date"}`). The script
-builds one local index per chunking profile in a temporary directory and scores the matrix
+`FILINGS_DIR` holds `<doc_id>.md` and `<doc_id>.json` (`{"title", "form", "date"}`, plus
+`sections` for the per-section cut). The script builds one local index per chunking profile and cut
+in a temporary directory and scores the matrix
 
 | chunking | retrieval |
 |---|---|
 | v1, v2 | dense; hybrid (dense + BM25, RRF); hybrid + eigenmind (`select_diverse`) |
 
-and prints hit@5, hit@10 and MRR@10 with intervals, the **seconds per 10-K** (chunk, embed and write one
+`--cuts document,section` adds the cut: `document` chunks the whole Markdown at once; `section`
+cuts it at the Item sections of the sidecar first and chunks each piece alone (the text outside the
+sections being pieces too), as the no-vault MCP indexes (`document_chunks` of
+`myopenfund_mcp.filings.indexer`, ruling R35). Its rows are labelled `v1/section`, `v2/section`;
+**`v2/section` is the configuration the MCP ships** (its default `MOF_CHUNK_MAX_TOKENS=480`,
+`MOF_CHUNK_OVERLAP_TOKENS=32` give exactly the v2 profile). The script
+prints hit@5, hit@10 and MRR@10 with intervals, the **seconds per 10-K** (chunk, embed and write one
 filing, averaged) and the milliseconds per search. `--backend fake` runs the same code with
 meaningless vectors: a smoke test only.
 

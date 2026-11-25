@@ -16,6 +16,14 @@ Run it::
 
     python scripts/filings_eval.py FILINGS_DIR eval/filings_v1.jsonl --backend onnx
     python scripts/filings_eval.py FILINGS_DIR QUESTIONS --backend fake      # smoke test, no model
+    python scripts/filings_eval.py FILINGS_DIR QUESTIONS --cuts document,section
+
+``--cuts section`` chunks each Item section of a filing on its own, as the no-vault MCP indexes
+(``myopenfund_mcp.filings.indexer.document_chunks``): the Markdown is cut at the boundaries the
+sidecar's ``sections`` gives (``[{"name", "start", "end"}]``, character offsets into the Markdown,
+the ``FilingDocument.sections`` of company-corpus), the text outside every section is cut at them
+too, and each piece is chunked alone, so no chunk spans two sections. Its rows are labelled
+``<profile>/section``; ``--cuts document`` (the default) chunks the whole Markdown at once.
 
 ``--backend fake`` embeds with a hash-based ``FakeEmbedder`` and counts tokens by words: it checks
 the plumbing, its numbers mean nothing. Every threshold is an option; the sweeps
@@ -26,6 +34,7 @@ combination.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import sys
@@ -54,6 +63,8 @@ from rag_engine.select import DEFAULT_THRESHOLD, select_diverse
 
 #: The chunking profiles compared, by label.
 PROFILES: dict[str, Callable[[], ChunkingOptions]] = {"v1": ChunkingOptions, "v2": ChunkingOptions.v2}
+#: How a filing is cut before chunking: whole (``document``) or one Item section at a time (``section``).
+CUTS = ("document", "section")
 #: The depth of the passages scored (hit@5 and hit@10 are read from it).
 DEFAULT_K = 10
 #: The smallest ``k`` the table can be printed with: it reads hit@10.
@@ -79,6 +90,8 @@ class Filing:
     title: str
     form: str
     date: str
+    #: ``(name, start, end)`` of each Item section (sidecar ``sections``), ``None`` when not given.
+    sections: tuple[tuple[str, int, int], ...] | None = None
 
 
 @dataclass
@@ -97,8 +110,10 @@ class Row:
 def load_filings(directory: str | Path) -> list[Filing]:
     """Every ``<doc_id>.md`` of ``directory`` with its ``<doc_id>.json`` sidecar, sorted by id.
 
-    The sidecar holds ``title``, ``form`` and ``date`` (``YYYY-MM-DD``), all required.
-    ``ValueError`` names the file when one is missing or the directory holds no filing.
+    The sidecar holds ``title``, ``form`` and ``date`` (``YYYY-MM-DD``), all required, and may
+    hold ``sections`` (a list of ``{"name", "start", "end"}``, character offsets into the
+    Markdown) for ``--cuts section``. ``ValueError`` names the file when one is missing or
+    malformed, or the directory holds no filing.
     """
     root = Path(directory)
     filings = []
@@ -110,12 +125,70 @@ def load_filings(directory: str | Path) -> list[Filing]:
         missing = [key for key in ("title", "form", "date") if not isinstance(meta.get(key), str)]
         if missing:
             raise ValueError(f"{sidecar}: missing or not a string: {', '.join(missing)}")
-        filings.append(
-            Filing(path.stem, path.read_text(encoding="utf-8"), meta["title"], meta["form"], meta["date"])
-        )
+        text = path.read_text(encoding="utf-8")
+        sections = _sections(sidecar, meta, len(text))
+        filings.append(Filing(path.stem, text, meta["title"], meta["form"], meta["date"], sections))
     if not filings:
         raise ValueError(f"{root}: no Markdown filing")
     return filings
+
+
+def _sections(sidecar: Path, meta: dict[str, Any], length: int) -> tuple[tuple[str, int, int], ...] | None:
+    raw = meta.get("sections")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError(f"{sidecar}: 'sections' must be a list of {{name, start, end}}")  # noqa: TRY004
+    out = []
+    for item in raw:
+        ok = (
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and all(type(item.get(key)) is int for key in ("start", "end"))
+        )
+        if not ok or not 0 <= item["start"] <= item["end"] <= length:
+            raise ValueError(f"{sidecar}: bad section {item!r} (name, 0 <= start <= end <= {length})")
+        out.append((item["name"], item["start"], item["end"]))
+    return tuple(out)
+
+
+def section_pieces(text: str, sections: Sequence[tuple[str, int, int]]) -> list[tuple[str | None, str]]:
+    """``text`` cut at the boundaries of ``sections``, as the no-vault MCP cuts a filing.
+
+    The same rule as ``myopenfund_mcp.filings.indexer.document_chunks``: sections in order of
+    start, each clipped to start after the previous one, the text before, between and after them
+    kept as pieces without a name, blank pieces dropped.
+    """
+    pieces: list[tuple[str | None, int, int]] = []
+    cursor = 0
+    for name, start, end in sorted(sections, key=lambda s: s[1]):
+        start, end = max(start, cursor), min(end, len(text))
+        if start >= end:
+            continue
+        if start > cursor:
+            pieces.append((None, cursor, start))
+        pieces.append((name, start, end))
+        cursor = end
+    if cursor < len(text):
+        pieces.append((None, cursor, len(text)))
+    return [(name, text[start:end]) for name, start, end in pieces if text[start:end].strip()]
+
+
+def filing_chunks(filing: Filing, *, options: ChunkingOptions, tokenizer: Any, cut: str) -> list[Chunk]:
+    """The chunks of ``filing``: the whole Markdown at once (``document``) or section by section."""
+    if cut == "document":
+        return chunk_markdown(filing.text, options=options, title=filing.title, tokenizer=tokenizer)
+    if filing.sections is None:
+        raise ValueError(f"{filing.doc_id}: --cuts section needs 'sections' in the sidecar")
+    chunks: list[Chunk] = []
+    for _, piece in section_pieces(filing.text, filing.sections):
+        chunks.extend(chunk_markdown(piece, options=options, title=filing.title, tokenizer=tokenizer))
+    return chunks
+
+
+def label_of(profile: str, cut: str) -> str:
+    """The chunking label of a row: the profile, with ``/section`` for the per-section cut."""
+    return profile if cut == "document" else f"{profile}/{cut}"
 
 
 def build_index(
@@ -126,18 +199,17 @@ def build_index(
     embedder: Embedder,
     tokenizer: Any,
     model_name: str,
+    cut: str = "document",
 ) -> tuple[LocalIndex, float, int]:
-    """Chunk, embed and write ``filings`` with the profile ``label``; returns the index, the
-    mean seconds per filing and the number of chunks."""
+    """Chunk, embed and write ``filings`` with the profile ``label`` and the ``cut``; returns the
+    index, the mean seconds per filing and the number of chunks."""
     options = PROFILES[label]()
-    name = collection_name(model_name, "eval", label, "cpu")
-    index = LocalIndex(root / label, collection=name, dim=embedder.spec.dim)
+    name = collection_name(model_name, "eval", f"{label}-{cut}", "cpu")
+    index = LocalIndex(root / f"{label}-{cut}", collection=name, dim=embedder.spec.dim)
     chunks_total = 0
     started = time.perf_counter()
     for filing in filings:
-        chunks: list[Chunk] = chunk_markdown(
-            filing.text, options=options, title=filing.title, tokenizer=tokenizer
-        )
+        chunks = filing_chunks(filing, options=options, tokenizer=tokenizer, cut=cut)
         if not chunks:
             continue
         vectors = embedder.encode_passage([chunk.embedded_text for chunk in chunks])
@@ -203,15 +275,29 @@ def retrievals(
     return result
 
 
-def check_inputs(questions: Sequence[Question], profiles: Sequence[str], k: int) -> None:
+def check_inputs(
+    questions: Sequence[Question],
+    profiles: Sequence[str],
+    k: int,
+    cuts: Sequence[str] = ("document",),
+    filings: Sequence[Filing] | None = None,
+) -> None:
     """``ValueError`` before any work when the run could not finish or would be meaningless.
 
-    Every profile is known, ``k`` is at least :data:`MIN_K` (the table reads hit@5, hit@10 and
-    MRR@10), and every question that does not abstain has ``expected_spans``.
+    Every profile and cut is known, ``k`` is at least :data:`MIN_K` (the table reads hit@5,
+    hit@10 and MRR@10), every question that does not abstain has ``expected_spans``, and with
+    the ``section`` cut every filing (when given) has its sections.
     """
     unknown = [p for p in profiles if p not in PROFILES]
     if unknown:
         raise ValueError(f"unknown chunking profile {', '.join(unknown)} (known: {', '.join(PROFILES)})")
+    bad_cuts = [c for c in cuts if c not in CUTS]
+    if bad_cuts or not cuts:
+        raise ValueError(f"unknown or no cut {', '.join(bad_cuts)} (known: {', '.join(CUTS)})")
+    if "section" in cuts and filings is not None:
+        bare_filings = [f.doc_id for f in filings if f.sections is None]
+        if bare_filings:
+            raise ValueError(f"--cuts section: no 'sections' in the sidecar of {', '.join(bare_filings[:5])}")
     if not isinstance(k, int) or k < MIN_K:
         raise ValueError(f"k must be an integer >= {MIN_K} (the table reads hit@10), got {k!r}")
     bare = [q.id for q in questions if q.expected_behavior != "abstain" and not q.expected_spans]
@@ -229,6 +315,7 @@ def run_matrix(
     *,
     model_name: str,
     profiles: Sequence[str] = ("v1", "v2"),
+    cuts: Sequence[str] = ("document",),
     k: int = DEFAULT_K,
     candidates: int = DEFAULT_CANDIDATES,
     rrf_k: int = DEFAULT_RRF_K,
@@ -239,16 +326,22 @@ def run_matrix(
     bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
     interval_min_questions: int = DEFAULT_INTERVAL_MIN_QUESTIONS,
 ) -> list[Row]:
-    """Build one index per profile in a temporary directory and score every retrieval on it."""
-    check_inputs(questions, profiles, k)
+    """Build one index per cut x profile in a temporary directory and score every retrieval on it."""
+    check_inputs(questions, profiles, k, cuts, filings)
     # One encode before any timer: the first call of a model loads and warms it.
     embedder.encode_passage(["warm-up"])
     embedder.encode_query("warm-up")
     rows: list[Row] = []
     with tempfile.TemporaryDirectory(prefix="filings_eval_") as tmp:
-        for label in profiles:
+        for cut, label in itertools.product(cuts, profiles):
             index, seconds, chunks = build_index(
-                Path(tmp), filings, label=label, embedder=embedder, tokenizer=tokenizer, model_name=model_name
+                Path(tmp),
+                filings,
+                label=label,
+                embedder=embedder,
+                tokenizer=tokenizer,
+                model_name=model_name,
+                cut=cut,
             )
             try:
                 for name, (run, params) in retrievals(
@@ -272,7 +365,7 @@ def run_matrix(
                         bootstrap_resamples=bootstrap_resamples,
                         interval_min_questions=interval_min_questions,
                     )
-                    rows.append(Row(label, name, report, seconds, ms, chunks, params))
+                    rows.append(Row(label_of(label, cut), name, report, seconds, ms, chunks, params))
             finally:
                 index.close()
     return rows
@@ -330,13 +423,17 @@ def eigenmind_verdict(
 
 
 def decisions(rows: Sequence[Row]) -> list[str]:
-    """The two rules of the plan, applied to ``rows``."""
+    """The two rules of the plan, applied to ``rows`` (the first once per cut)."""
     lines = []
     by = {(r.chunking, r.retrieval): r for r in rows}
-    if ("v1", "hybrid") in by and ("v2", "hybrid") in by:
-        v1 = by[("v1", "hybrid")].report.value(DECISION_METRIC)
-        v2 = by[("v2", "hybrid")].report.value(DECISION_METRIC)
-        lines.append(f"v2 >= v1 on hit@10 (hybrid): {'PASS' if v2 >= v1 else 'FAIL'} ({v1:.3f} -> {v2:.3f})")
+    for cut in CUTS:
+        a, b = label_of("v1", cut), label_of("v2", cut)
+        if (a, "hybrid") in by and (b, "hybrid") in by:
+            v1 = by[(a, "hybrid")].report.value(DECISION_METRIC)
+            v2 = by[(b, "hybrid")].report.value(DECISION_METRIC)
+            where = "" if cut == "document" else f", {cut} cut"
+            verdict = "PASS" if v2 >= v1 else "FAIL"
+            lines.append(f"v2 >= v1 on hit@10 (hybrid{where}): {verdict} ({v1:.3f} -> {v2:.3f})")
     for chunking in dict.fromkeys(r.chunking for r in rows):
         hybrid = by.get((chunking, "hybrid"))
         for row in rows:
@@ -362,6 +459,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=Settings().model_name, help="embedding model (default: the engine's)")
     p.add_argument("--model-cache", default=None, help="directory of the model files")
     p.add_argument("--profiles", default="v1,v2", help="chunking profiles to compare (default: v1,v2)")
+    p.add_argument(
+        "--cuts",
+        default="document",
+        help="how filings are cut before chunking: document, section, or both (default: document)",
+    )
     p.add_argument("--k", type=int, default=DEFAULT_K, help="passages read per question (default: 10)")
     p.add_argument(
         "--candidates", type=int, default=DEFAULT_CANDIDATES, help="candidates per side of the fusion"
@@ -394,7 +496,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     filings = load_filings(args.filings)
     questions = load_questions(args.questions)
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
-    check_inputs(questions, profiles, args.k)
+    cuts = [c.strip() for c in args.cuts.split(",") if c.strip()]
+    check_inputs(questions, profiles, args.k, cuts, filings)
     if args.backend == "fake":
         embedder: Embedder = FakeEmbedder(_FAKE_SPEC)
         tokenizer: Any = _WordTokenizer()
@@ -411,6 +514,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokenizer,
         model_name=model_name,
         profiles=profiles,
+        cuts=cuts,
         k=args.k,
         candidates=args.candidates,
         rrf_k=args.rrf_k,
@@ -421,7 +525,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         bootstrap_resamples=args.resamples,
         interval_min_questions=args.min_questions,
     )
-    print(f"{len(filings)} filings, {len(questions)} questions ({args.questions}), backend {args.backend}\n")
+    questions_sha256 = hashlib.sha256(args.questions.read_bytes()).hexdigest()
+    print(
+        f"{len(filings)} filings, {len(questions)} questions ({args.questions}, "
+        f"sha256 {questions_sha256[:12]}), backend {args.backend}\n"
+    )
     print(format_table(rows))
     print()
     print("\n".join(decisions(rows)))
@@ -429,7 +537,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = [
             {"chunking": r.chunking, "retrieval": r.retrieval, "params": r.params, "chunks": r.chunks,
              "seconds_per_filing": r.seconds_per_filing, "ms_per_search": r.ms_per_search,
-             "report": r.report.to_dict()}
+             "questions_sha256": questions_sha256, "report": r.report.to_dict()}
             for r in rows
         ]  # fmt: skip
         args.json.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
