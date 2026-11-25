@@ -47,6 +47,13 @@ Clone the repos side by side and install this package editable over the PyPI ver
 consumer's environment: `pip install -e ../rag-engine`. A consumer change that needs an
 unreleased version waits for this package's release before the consumer's PR merges.
 
+**How to release**
+
+Bump `__version__` and `version` in a PR. After it merges, go to Actions, then release, then Run workflow: pick the `main` branch and target `pypi`. Approve the `pypi` deployment. The workflow builds the package, checks it, publishes it, then creates the tag `v<version>` and the GitHub Release itself.
+It fails before publishing if it is not run on the default branch or if that tag already exists. Target `testpypi` is a rehearsal: it publishes to TestPyPI and creates no tag and no release.
+Pushing a tag `v<version>` by hand still works: the workflow checks that the tag equals the package version and is on the default branch, then publishes and attaches the files to the Release.
+If PyPI got the package but the tag or the Release is missing, re-run the failed `github-release` job from Actions; do not push the tag by hand (the re-run would fail at the PyPI upload).
+
 The modules of the engine import no embedding backend and no document parser at import time: each is imported when it is used, and `torch` is never imported unless the torch backend is built. One import is not the engine's to decide: `qdrant-client`, which the store, the search, the evaluation and the command import, itself loads `fastembed` when that package is installed — so with the `onnx` extra, `import rag_engine.store` loads fastembed, the ONNX runtime, `huggingface_hub` and `tokenizers`. Without that extra none of them is loaded. Because of that import, `import rag_engine` itself sets `ORT_DISABLE_TELEMETRY=1` in the environment of the process, unless the variable is already set: the ONNX runtime reads it when it is imported (see [Embedding backends](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#embedding-backends), *No telemetry*).
 
 `sentence-transformers` is bounded to the major version parity was measured on (`>=6,<7`: 6.0.0 to 6.3.0 today, not 5.x), for the reason `fastembed` is bounded: the vectors depend on it. Raise a bound only after `pytest -m models` has passed on the new version.
