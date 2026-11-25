@@ -159,7 +159,9 @@ class ChunkingOptions:
       heading lines at the top of its text are dropped (the context says the same).
     - ``context_max_tokens``: most tokens a context may take. A longer one loses its middle
       heading levels, then words of its last label and of its title, then characters, until it
-      fits. ``None``: no limit of its own (it still has to leave room for text under the cap:
+      fits. At most half of ``max_chunk_token_count`` (so at least half of the cap is left for the
+      text), and only with ``context_header``; both are refused otherwise.
+      ``None``: no limit of its own (it still has to leave room for text under the cap:
       ``ValueError`` at chunking time when not even one character fits).
     - ``overlap_tokens``: when one over-long block (a paragraph, a line, a table row) is cut in
       windows of words, the end of a window is repeated at the start of the next, up to this
@@ -191,8 +193,8 @@ class ChunkingOptions:
           separator line repeated in every piece.
         - ``context_header=True``: the title and headings above a chunk are embedded with it.
         - ``overlap_tokens=32``: overlap between the windows of an over-long block.
-        - ``context_max_tokens=120``: a quarter of the cap, so that the context never crowds the
-          text out.
+        - ``context_max_tokens=120``: a quarter of the cap (the most allowed is half), so that the
+          context never crowds the text out.
 
         A collection ingested with v1 needs a clean re-ingestion to move to v2.
         """
@@ -243,12 +245,15 @@ class ChunkingOptions:
         if (
             self.max_chunk_token_count is not None
             and self.context_max_tokens is not None
-            and self.context_max_tokens >= self.max_chunk_token_count
+            and self.context_max_tokens > self.max_chunk_token_count // 2
         ):
             raise ValueError(
-                f"context_max_tokens ({self.context_max_tokens}) must be below max_chunk_token_count "
-                f"({self.max_chunk_token_count})"
+                f"context_max_tokens ({self.context_max_tokens}) must be at most half of "
+                f"max_chunk_token_count ({self.max_chunk_token_count}), so that at least half of the "
+                "cap is left for the text"
             )
+        if self.context_max_tokens is not None and not self.context_header:
+            raise ValueError("context_max_tokens limits the context: it needs context_header=True")
         if not isinstance(self.context_header, bool):
             raise ValueError(f"context_header must be a bool, got {self.context_header!r}")  # noqa: TRY004
         if not isinstance(self.version, str) or not self.version.strip():
@@ -637,7 +642,7 @@ def _context_path(headers: Sequence[str], title: str | None, limit: int | None, 
                     low = middle
                 else:
                     high = middle - 1
-            joined = joined[:low]
+            joined = joined[:low].rstrip(" ›")  # no dangling separator
         return joined or None
     return _CONTEXT_SEPARATOR.join(parts)
 
@@ -742,11 +747,14 @@ def _split_table(header: list[str], rows: list[str], fits, count, options: Chunk
     pieces: list[str] = []
     group: list[str] = []
     per_chunk = options.table_rows_per_chunk
+    header_written = False
 
     def emit() -> None:
+        nonlocal header_written
         if group:
             pieces.append(head + "\n" + "\n".join(group))
             group.clear()
+            header_written = True
 
     for row in rows:
         if not fits(head + "\n" + row):
@@ -760,6 +768,9 @@ def _split_table(header: list[str], rows: list[str], fits, count, options: Chunk
             emit()
         group.append(row)
     emit()
+    if not header_written:
+        # Every row was too wide to sit beside the header: the header is still part of the text.
+        pieces.insert(0, head)
     return pieces
 
 

@@ -163,7 +163,8 @@ def test_options_validation():
         {"max_chunk_token_count": 50, "overlap_tokens": 50},
         {"version": ""},
         {"context_max_tokens": 0},
-        {"max_chunk_token_count": 50, "context_max_tokens": 50, "version": "v2"},
+        {"max_chunk_token_count": 50, "context_max_tokens": 26, "context_header": True, "version": "v2"},
+        {"context_max_tokens": 10, "version": "v2"},  # no context_header
         {"max_chunk_token_count": 480},  # version "v1" with a v2 field
         {"context_header": True},
         {"overlap_tokens": 5},
@@ -185,6 +186,8 @@ class CharTokenizer:
 
 
 def adversarial(text, cap, *, title=None, context_max_tokens=None, overlap_tokens=0):
+    # min_chunk_word_count=0: ChunkNorris drops chunks under 15 words before the post-pass, and the
+    # documents of these tests are tiny; the post-pass is what is under test.
     options = ChunkingOptions(
         max_chunk_token_count=cap,
         context_header=True,
@@ -242,6 +245,24 @@ def test_adversarial_header_wider_than_cap_with_rows():
     table = f"{header}\n{separator}\n{rows}"
     chunks = adversarial(table + "\n", 60)
     assert_nothing_lost(chunks, table)
+
+
+def test_adversarial_every_row_wider_than_cap_keeps_header():
+    table = "| alpha beta gamma | delta epsilon zeta |\n|---|---|\n" + "\n".join(
+        "| " + " ".join(f"r{r}w{i}" for i in range(45)) + " | x |" for r in range(3)
+    )
+    chunks = adversarial(table + "\n", 40 * 6)
+    assert any("alpha" in c.text for c in chunks)
+    assert_nothing_lost(chunks, table)
+
+
+def test_context_cut_leaves_no_dangling_separator():
+    body = " ".join(f"body{i}" for i in range(120))
+    chunks = adversarial(f"# Aaaa\n\n## Bbbb\n\n{body}\n", 100, title="Title", context_max_tokens=8)
+    assert chunks
+    for chunk in chunks:
+        assert len(chunk.context) <= 8
+        assert not chunk.context.endswith((" ", "›"))
 
 
 def test_adversarial_single_overlong_word():
