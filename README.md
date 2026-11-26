@@ -22,6 +22,8 @@ pip install "myopenfund-rag-engine"            # base: settings, schema, store, 
 pip install "myopenfund-rag-engine[onnx]"      # search service: ONNX embedding backend, no PyTorch
 pip install "myopenfund-rag-engine[torch]"     # ingestion: PyTorch embedding backend
 pip install "myopenfund-rag-engine[ingest]"    # document parsing and chunking
+pip install "myopenfund-rag-engine[local]"     # local index on the user's disk: onnx + ingest, no server
+pip install "myopenfund-rag-engine[graph]"     # diversity selection of the hybrid candidates (eigenmind)
 ```
 
 | Install | Adds | For |
@@ -30,6 +32,8 @@ pip install "myopenfund-rag-engine[ingest]"    # document parsing and chunking
 | `myopenfund-rag-engine[torch]` | `sentence-transformers` 6.x | PyTorch embedding backend |
 | `myopenfund-rag-engine[onnx]` | `fastembed` 0.9.x (ONNX runtime), `huggingface_hub` (0.20 or later) | ONNX embedding backend, without PyTorch: for a service that embeds search queries |
 | `myopenfund-rag-engine[ingest]` | `chunknorris`, `markitdown[pptx]`, `psutil` | document parsing and chunking |
+| `myopenfund-rag-engine[local]` | the `onnx` and `ingest` extras | the local index and its hybrid search (`rag_engine.local`), without a Qdrant server |
+| `myopenfund-rag-engine[graph]` | `eigenmind` 0.2.x | the diversity selection `rag_engine.select.select_diverse` (off by default) |
 | `myopenfund-rag-engine[dev]` | `pytest`, `ruff`, `pyyaml` | development |
 
 If this environment installed the old distribution (`rag-engine`, from a git URL), run
@@ -68,12 +72,14 @@ The package root exposes only `__version__`. Everything else is imported from it
 |---|---|
 | `rag_engine.config` | `Settings`, `ConfigError`, `valid_ocr_languages`, `DATE_FILTER_MODES` |
 | `rag_engine.schema` | `point_id`, `page_for_id`, `build_payload`, `date_interval`, `date_interval_fields`, `date_fields`, `RESERVED_KEYS`, `DERIVED_KEYS`, `DATE_KEYS`, `DATE_PRECISIONS`, `PAYLOAD_INDEXES`, `PAYLOAD_SCHEMA_VERSION` |
-| `rag_engine.store` | `QdrantStore`, `StoreError`, `QdrantAuthError`, `CollectionMismatchError`, `CollectionNotFoundError`, `ReservedKeyError`, `DateFieldsError`, `MissingIndexError`, `DEFAULT_TIMEOUT` |
+| `rag_engine.store` | `QdrantStore` (and `QdrantStore.local`), `StoreError`, `QdrantAuthError`, `CollectionMismatchError`, `CollectionNotFoundError`, `ReservedKeyError`, `DateFieldsError`, `MissingIndexError`, `IndexLocked`, `DEFAULT_TIMEOUT` |
 | `rag_engine.embedding` | `ModelSpec`, `Embedder`, `make_embedder`, `TorchEmbedder`, `OnnxEmbedder`, `FakeEmbedder`, `BaseEmbedder`, `detect_device`, `cosine_parity`, `ONNX_MODELS`, `OnnxModel`, `ONNX_BATCH_SIZE`, `ModelIntegrityError`, `ModelDownloadError` |
-| `rag_engine.chunking` | `chunk_file`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
+| `rag_engine.chunking` | `chunk_file`, `chunk_markdown`, `load_tokenizer`, `Chunk`, `ChunkingOptions`, `UnsupportedFormatError`, `ocr_available`, `check_ocr_languages`, `SUPPORTED_EXTENSIONS`, `OCR_MODES` |
 | `rag_engine.ingest` | `ingest_document`, `IngestResult` |
 | `rag_engine.search` | `search`, `SearchFilters`, `Hit`, `SearchError`, `is_searchable`, `QUERY_NORMALIZATION`, `DATE_FILTER_MODES` |
-| `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `Means`, `EssentialAggregate`, `EssentialMeans`, `FilterEffect`, `Abstention`, `TopScores`, `EvalError`, `DEFAULT_K`, `DEFAULT_CHUNK_LIMIT`, `DEFAULT_BOOTSTRAP_RESAMPLES`, `DEFAULT_INTERVAL_MIN_DOCUMENTS`, `DEFAULT_SCORE_LEVELS`, `BOOTSTRAP_SEED`, `INTERVAL_LEVEL`, `BEHAVIORS`, `DEFAULT_BEHAVIOR`, `UNFILTERED_SUFFIX`, `UNFILTERED_TAG`, `QUESTION_FIELDS`, `FILTER_FIELDS` |
+| `rag_engine.local` | `LocalIndex`, `hybrid_search`, `fts_query`, `collection_name`, `DEFAULT_CANDIDATES`, `DEFAULT_RRF_K`, `DEFAULT_MAX_TERMS`, `DATE_FILTER_MODE`, `LOCAL_KEYS` |
+| `rag_engine.select` | `select_diverse`, `DEFAULT_THRESHOLD`, `ROLES` |
+| `rag_engine.eval` | `load_questions`, `evaluate`, `format_report`, `Question`, `QuestionSet`, `EvalReport`, `QuestionResult`, `RankedDocument`, `NotInCollection`, `Aggregate`, `Means`, `EssentialAggregate`, `EssentialMeans`, `FilterEffect`, `Abstention`, `TopScores`, `EvalError`, `DEFAULT_K`, `DEFAULT_CHUNK_LIMIT`, `DEFAULT_BOOTSTRAP_RESAMPLES`, `DEFAULT_INTERVAL_MIN_DOCUMENTS`, `DEFAULT_SCORE_LEVELS`, `BOOTSTRAP_SEED`, `INTERVAL_LEVEL`, `BEHAVIORS`, `DEFAULT_BEHAVIOR`, `UNFILTERED_SUFFIX`, `UNFILTERED_TAG`, `QUESTION_FIELDS`, `FILTER_FIELDS`, `evaluate_passages`, `span_hit`, `PassageReport`, `PassageResult`, `PassageAbstention` |
 | `rag_engine.eval_check` | `check_questions`, `load_catalogue`, `format_check`, `QuestionCheck`, `CatalogueEntry`, `DocumentReference` |
 | `rag_engine.cli` | `main` (the `rag-engine` command) |
 | `rag_engine.errors` | `RagEngineError` |
@@ -83,13 +89,14 @@ The package root exposes only `__version__`. Everything else is imported from it
 | Class | Module | Raised when |
 |---|---|---|
 | `ConfigError` (also a `ValueError`) | `rag_engine.config` | a setting has an invalid value |
-| `StoreError` | `rag_engine.store` | base of the six below |
+| `StoreError` | `rag_engine.store` | base of the seven below; also raised by `rag_engine.local` for an SQLite failure or a string that cannot be encoded as UTF-8 |
 | `QdrantAuthError` | `rag_engine.store` | Qdrant refuses the API key (HTTP 401 or 403) |
 | `CollectionMismatchError` | `rag_engine.store` | a collection is not one unnamed cosine vector of the expected dimension, or a payload field is indexed with another kind of index |
 | `CollectionNotFoundError` | `rag_engine.store` | `check_collection` is asked about a collection that does not exist |
 | `ReservedKeyError` (also a `ValueError`) | `rag_engine.store` | `set_payload` is asked to set a payload key the engine owns (`doc_id`, `filename`, `chunk_number`, `ingestion_date`, `text`, `page`) |
 | `DateFieldsError` (also a `ValueError`) | `rag_engine.store` | `set_payload` is given one of `date`, `date_precision`, `date_start`, `date_end` without the others, or an interval that is not the one of the date: build them with `date_fields` |
 | `MissingIndexError` | `rag_engine.store` | a collection in strict mode refuses a filter on a payload field that has no index (HTTP 400): create the indexes with `ensure_payload_indexes` |
+| `IndexLocked` | `rag_engine.store` | `QdrantStore.local` (or `LocalIndex`) opens a folder another process or client already holds open |
 | `UnsupportedFormatError` (also a `ValueError`) | `rag_engine.chunking` | a file has an extension the engine does not read |
 | `SearchError` (also a `ValueError`) | `rag_engine.search` | a search argument or a filter cannot be used as it is |
 | `EvalError` (also a `ValueError`) | `rag_engine.eval` | a question file, a question or an evaluation parameter is unusable |
@@ -193,7 +200,7 @@ What the `onnx` backend does, and why it matches:
 - **No telemetry, and no outbound connection once the cache is filled.** The official builds of the ONNX runtime send telemetry by default (onnxruntime 1.32.0, Linux wheel; its `Privacy.md` says so): importing `onnxruntime` creates a device identifier and an event store under `$HOME/.cache/Microsoft/DeveloperTools/.onnxruntime/` and starts an uploader that connects to `mobile.events.data.microsoft.com:443`. The runtime turns all of it off when the environment variable `ORT_DISABLE_TELEMETRY` is `1` **at the time it is imported**; setting it later, before a session is created, changes nothing (measured: the files are written by the import alone). The engine does not send telemetry on behalf of its users: `import rag_engine` sets `ORT_DISABLE_TELEMETRY=1` when the variable is not set, before any module of the engine can import the runtime (`rag_engine.store` does, through `qdrant-client`, when `fastembed` is installed), and the `onnx` backend sets the same default again before it imports fastembed. It is a default: set the variable yourself, to `0`, to allow the telemetry. Two limits. **The order of the imports**: a program that imports `qdrant_client` (which imports `fastembed` when it is installed), `fastembed` or `onnxruntime` **before** `rag_engine` loads the runtime before the default exists, and the telemetry is on for that process. It happens without anyone choosing it: tools that sort imports alphabetically put `qdrant_client` before `rag_engine`. `import rag_engine` then warns once (a `RuntimeWarning`, when `onnxruntime` is already loaded and the variable was not set), but cannot undo it. So a service should export `ORT_DISABLE_TELEMETRY=1` in its environment itself rather than rely on the order of its imports (the tests of this repository do: `tests/conftest.py` and the CI workflow set it). And the variable is the runtime's, so another version of it may read it differently (check its `Privacy.md` when upgrading).
 
   Measured behind a proxy that refuses and records every request, with a complete model cache, an `OnnxEmbedder` built, one query embedded and 75 seconds of waiting: with `ORT_DISABLE_TELEMETRY=0` forced, four `CONNECT mobile.events.data.microsoft.com:443` in that time, the first within a few seconds of the start, and the two files written under `$HOME/.cache/Microsoft/`; with the default of the engine, **no request at all and nothing written**. With a complete model cache the engine then makes no outbound connection: the model files are used without any request to the Hugging Face Hub. A service should still set **`HF_HUB_OFFLINE=1`**, so that a cache that is incomplete (a file removed, another model name) fails at once instead of reaching for the Hub.
-- **CPU only.** The session is created with the CPU execution provider alone, also where the GPU build of onnxruntime is installed: parity was measured on CPU.
+- **CPU by default; CoreML on request, for local indexes only.** By default (`provider="cpu"`) the session is created with the CPU execution provider alone, also where the GPU build of onnxruntime is installed: parity was measured on CPU. `OnnxEmbedder(..., provider="coreml")` opts into Apple's CoreML execution provider, with the CPU provider as the fallback for the operators CoreML cannot run; where CoreML is not available (another platform, a build without it) the session falls back to the CPU without a word. **The parity of CoreML vectors with the CPU ones was not measured**: use it for a local index only (whose collection name records the provider, see [Local index and hybrid search](https://github.com/MyOpenFund/rag-engine/blob/main/README.md#local-index-and-hybrid-search)), never for a collection searched with CPU vectors. `make_embedder` always builds the CPU provider.
 - **Threads.** By default the ONNX runtime sizes its thread pool from the cores of the host. It does not see the CPU limit of a container (`docker run --cpus=2`, a Kubernetes CPU limit): with more threads than CPUs, inference gets slower, not faster. In a CPU-limited container set `RAG_ENGINE_ONNX_THREADS` to the limit (`OnnxEmbedder(..., threads=...)` does the same).
 - **Prefixes.** The engine adds the prefix once and calls fastembed's plain `embed`; fastembed adds none of its own.
 - **Long texts.** The tokenizer cuts at the limit declared by the model (512 tokens), as sentence-transformers does: both backends see the same tokens.
@@ -588,9 +595,31 @@ report.by_behavior  # an Aggregate per expected_behavior
 report.to_json()  # everything, as JSON
 ```
 
+### Passage-level evaluation
+
+Document-level scores saturate on a small corpus of long documents, and chunk ids differ from one chunker to the next. A question may therefore carry `expected_spans`, one to three short verbatim texts of the answer (ignored by `rag-engine eval`), and be scored on passages:
+
+```python
+from rag_engine.eval import evaluate_passages, load_questions, span_hit
+
+questions = load_questions("eval/filings_v1.jsonl")
+
+
+def run(question):
+    return hybrid_search(question.question, index=index, embedder=embedder, filters=None, limit=10)
+
+
+report = evaluate_passages(questions, run, k=10)
+report.hit_at(5), report.hit_at(10), report.mrr_at(10)
+report.interval("hit_at_10")  # 95% interval over the questions, or None below 20 questions
+print(report.format())  # report.to_dict() for JSON
+```
+
+`run(question)` returns the passages best first, from any retrieval. A passage is a hit when `span_hit` finds a span in it (NFKD, case, white space and typography folded) and it comes from one of the question's `expected_doc_ids`. Intervals resample the questions (`bootstrap_resamples`, default 1000) and are given from `interval_min_questions` (default 20) questions up. A question that abstains is searched and reported apart (`PassageAbstention`), never scored. The filings set (`eval/filings_v1.jsonl`), its checker, its measurement script, its provisional results and their caveats are described in [eval/filings_README.md](https://github.com/MyOpenFund/rag-engine/blob/main/eval/filings_README.md).
+
 ## Supported formats and OCR
 
-`chunk_file(path, *, ocr="auto", ocr_languages="eng", options=None)` (in `rag_engine.chunking`, extra `ingest`) reads one file and returns its chunks in document order, each with its `text` and its `page`. The format is chosen by the file extension, whatever its case; `SUPPORTED_EXTENSIONS` lists them.
+`chunk_file(path, *, ocr="auto", ocr_languages="eng", options=None, tokenizer=None)` (in `rag_engine.chunking`, extra `ingest`) reads one file and returns its chunks in document order, each with its `text` and its `page`. The format is chosen by the file extension, whatever its case; `SUPPORTED_EXTENSIONS` lists them.
 
 | Extension | Read by | `page` |
 |---|---|---|
@@ -638,6 +667,58 @@ Differences from the old engine:
 - **OCR switches read at each call.** `ENABLE_OCR` and `TESSDATA_PREFIX` are both read each time a file is chunked. The old engine read `ENABLE_OCR` once, when it was imported, so a value set afterwards was ignored; it now takes effect on the next document.
 - **`ocr="always"` and `TESSDATA_PREFIX`.** The old engine corrected a `TESSDATA_PREFIX` set to the parent folder only when `ENABLE_OCR=true`; it is now also corrected for a forced `always`.
 - **Reserved payload keys.** Metadata that sets a key the engine writes itself (`filename`, `chunk_number`, `ingestion_date`, `text`, `page`, or a `doc_id` other than the document's) is refused with a `ValueError`; the old pipeline accepted it silently.
+
+## Chunking v2 (opt-in)
+
+`ChunkingOptions()` is the **v1 profile**, the one production collections were ingested with; its output is unchanged (byte-identical to 0.1.0). `ChunkingOptions.v2()` is a second profile, for chunks that fit the 512-token window of `intfloat/multilingual-e5-base` and carry their headings:
+
+| Field | v1 | `v2()` | Meaning |
+|---|---|---|---|
+| `max_chunk_token_count` | `None` | `480` | Hard maximum of tokens of an embedded chunk, its context included: 512 minus the special tokens and a margin for the `"passage: "` prefix. Needs a tokenizer. |
+| `table_rows_per_chunk` | `None` | `None` | Rows per piece of a long table; `None`: as many as fit under the cap. Only with `max_chunk_token_count`. |
+| `context_header` | `False` | `True` | Each chunk carries `context`, its path of headings, and the heading lines at the top of its text are dropped. |
+| `overlap_tokens` | `0` | `32` | Overlap between the windows of one over-long block (a paragraph, a line, a table row). |
+| `context_max_tokens` | `None` | `120` | Most tokens a context may take; at most half of the cap, only with `context_header`. |
+| `version` | `"v1"` | `"v2"` | A label for a collection to record; `"v1"` is refused when any field above is set. |
+
+Over the cap, a table is cut into pieces that each repeat its header row and separator line, other text by paragraphs, a paragraph longer than the cap by windows of words. A chunk has `context` (`"<title> › <h1> › <h2> …"`, `None` without `context_header`) and `embedded_text` (the context, a blank line and the text): embed and count tokens on `embedded_text`.
+
+```python
+from rag_engine.chunking import ChunkingOptions, chunk_file, chunk_markdown, load_tokenizer
+
+# tokenizer.json only, pinned and verified
+tokenizer = load_tokenizer(cache_dir, "intfloat/multilingual-e5-base")
+chunks = chunk_markdown(text, options=ChunkingOptions.v2(), title="Report title", tokenizer=tokenizer)
+# from a file, the title is the file name without its extension
+chunks = chunk_file("report.pdf", options=ChunkingOptions.v2(), tokenizer=tokenizer)
+vectors = embedder.encode_passage([chunk.embedded_text for chunk in chunks])
+```
+
+`load_tokenizer` fetches the `tokenizer.json` of a pinned model alone, at the pinned revision, and checks it as `OnnxEmbedder` does (`ModelIntegrityError`). A token cap without a tokenizer is a `ValueError`.
+
+**v2 is for local indexes for now.** `ingest_document` refuses a profile other than v1 (`ValueError`): its payload has no place for the context, so a v2 chunk would lose its headings. Moving a server collection to v2 needs a clean re-ingestion of its document set, which this release does not provide.
+
+## Local index and hybrid search
+
+`rag_engine.local` (extra `local`) keeps an index on the user's own disk, without a Qdrant server, and searches it with dense and lexical retrieval together.
+
+```python
+from rag_engine.local import LocalIndex, collection_name, hybrid_search
+
+name = collection_name("intfloat/multilingual-e5-base", revision, "v2", "cpu")
+with LocalIndex(root, collection=name, dim=768) as index:
+    index.delete(doc_id)  # to replace a document: re-adding with fewer chunks would leave the surplus
+    vectors = embedder.encode_passage([chunk.embedded_text for chunk in chunks])
+    index.add(doc_id, chunks, vectors, {"title": title}, first_index=0)
+    hits = hybrid_search("capital expenditures 2024", index=index, embedder=embedder, filters=None, limit=10)
+```
+
+- **Storage.** `root/qdrant` is a collection of qdrant-client's local mode (`QdrantStore.local(path)`), searched by the production `search`; `root/fts.sqlite3` is an SQLite FTS5 table over the same chunks (WAL mode), ranked by `bm25()`. SQLite is the record of what is served: a dense hit without its row is dropped. `add` stores the text as given (the chunker gives it in NFKD, the form the query is put in) and writes the point ids an ingestion into a server would give; a string that cannot be encoded as UTF-8 is a `StoreError` before anything is written.
+- **One client per folder.** The folder is locked while it is open: a second open, from this process or another, raises `IndexLocked`. Within one process, a `LocalIndex` may be shared between threads (it holds a lock).
+- **Scale.** qdrant-client advises against local mode above about **20,000 points**: that is the practical ceiling of a local index (about twenty 10-Ks under v2). Beyond it, use a Qdrant server.
+- **One collection per embedding setup.** `collection_name(model_name, model_revision, chunker_version, provider)` gives each combination its own collection, so vectors of another model, revision, chunker or execution provider are never mixed.
+- **Hybrid search.** Each side returns `candidates` chunks (default 50, `DEFAULT_CANDIDATES`) under the same `SearchFilters`; they are fused by Reciprocal Rank Fusion, `1 / (rrf_k + rank)` with `rrf_k = 60` (`DEFAULT_RRF_K`). The FTS side searches the first `max_terms` distinct words of the query (default 64, `DEFAULT_MAX_TERMS`) joined by `OR`, quoted so that no FTS5 operator is read (`fts_query`); a query without a word is searched on the dense side alone. Date bounds use the interval mode on both sides.
+- **Diversity selection, off by default.** `hybrid_search(..., selector=select_diverse)` (extra `graph`) runs eigenmind 0.2's Supported Diversity on the cosine graph of the fused candidates (`threshold` default 0.65), then fills up by fused rank. On the filings evaluation it returned the hybrid ranks at 0.65 and did worse whenever a higher threshold made it select; it stays off until a held-out evaluation says otherwise.
 
 ## Development
 
