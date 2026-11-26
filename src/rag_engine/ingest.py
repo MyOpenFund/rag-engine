@@ -105,7 +105,10 @@ def ingest_document(
       create or check it**: the caller calls ``store.ensure_collection(collection,
       embedder.dim)`` once per run, not once per document.
     - ``ocr`` and ``ocr_languages`` (PDF only) and ``chunking_options`` are those of
-      :func:`rag_engine.chunking.chunk_file`. ``ocr_languages`` follows the rule of the
+      :func:`rag_engine.chunking.chunk_file`. ``chunking_options`` must be a v1 profile
+      (``version == "v1"``, the default ``ChunkingOptions()``): a v2 profile is refused with a
+      ``ValueError`` before the file is read, since the chunk's ``context`` (its headings)
+      would not be written. ``ocr_languages`` follows the rule of the
       settings (language codes joined by ``+``), for every format.
     - ``batch_size`` is the number of points per write; ``None`` leaves the store's own. It
       sizes the writes only, not the embedding.
@@ -140,6 +143,16 @@ def ingest_document(
     if ingestion_date is not None and (not isinstance(ingestion_date, str) or not ingestion_date.strip()):
         raise ValueError(
             f"ingestion_date must be a non-blank ISO 8601 string or None, got {ingestion_date!r}"
+        )
+    if chunking_options is not None and chunking_options.version != "v1":
+        # A v2 chunk's headings are in chunk.context, not in its text, and the payload of this
+        # function has no place for it: they would be lost. v2 ingestion into a server comes
+        # with the clean re-ingestion of a collection, not with this function.
+        raise ValueError(
+            f'chunking_options.version must be "v1" for ingest_document, got '
+            f"{chunking_options.version!r} (document {doc_id!r}): a v2 chunk would lose its "
+            "headings, which it carries in chunk.context; a collection moves to v2 by a clean "
+            "re-ingestion, not supported by this function yet"
         )
     check_ocr_languages(ocr_languages)
     filename = Path(path).name

@@ -784,3 +784,18 @@ def test_the_golden_default_ocr_mode_gives_the_same_points_on_a_host_without_ocr
     assert [point.payload for point in client.written] == [
         golden_payload(document, point["payload"]) for point in document["points"]
     ]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [ChunkingOptions.v2(), ChunkingOptions(context_header=True, version="v2"), ChunkingOptions(version="v3")],
+    ids=["v2", "v2-context", "other-label"],
+)
+def test_a_chunking_profile_other_than_v1_is_refused_before_anything_is_read(setup, monkeypatch, options):
+    # ingest_document writes chunk.text only: a v2 chunk would lose its context (the headings
+    # its own text no longer carries). v2 ingestion comes with the re-ingestion of a collection.
+    stub_chunker(monkeypatch, THREE, setup.chunk_calls)
+    with pytest.raises(ValueError, match=r'chunking_options.version must be "v1"'):
+        setup.ingest(chunking_options=options)
+    assert setup.chunk_calls == []
+    assert setup.untouched
