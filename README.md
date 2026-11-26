@@ -597,7 +597,7 @@ report.to_json()  # everything, as JSON
 
 ### Passage-level evaluation
 
-Document-level scores saturate on a small corpus of long documents, and chunk ids differ from one chunker to the next. A question may therefore carry `expected_spans`, one to three short verbatim texts of the answer (ignored by `rag-engine eval`), and be scored on passages:
+Document-level scores saturate on a small corpus of long documents, and chunk ids differ from one chunker to the next. A question may therefore carry `expected_spans`, short verbatim texts of the answer (ignored by `rag-engine eval`; with `span_match: "all"`, an item may be a list of alternatives for one fact), and be scored on passages:
 
 ```python
 from rag_engine.eval import evaluate_passages, load_questions, span_hit

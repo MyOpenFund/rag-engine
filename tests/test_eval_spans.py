@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -649,24 +650,36 @@ def test_span_checker_new_rules(tmp_path, capsys):
 def test_the_committed_v2_set_is_well_formed():
     questions = load_questions(EVAL / "filings_v2.jsonl")
     ids = [q.id for q in questions]
-    assert len(ids) == len(set(ids)) and 60 <= len(ids) <= 90
+    assert len(ids) == len(set(ids)) and 80 <= len(ids) <= 90
     assert all(q.difficulty in ("easy", "medium", "hard") for q in questions)
     abstaining = [q for q in questions if q.expected_behavior == "abstain"]
     assert 0.07 <= len(abstaining) / len(questions) <= 0.13
     assert {q.difficulty for q in abstaining} == {"easy", "medium", "hard"}
     french = [q for q in questions if q.language == "fr"]
     assert len(french) >= 6 and {q.difficulty for q in french} == {"easy", "medium", "hard"}
-    for difficulty, low, high in (("easy", 0.2, 0.4), ("medium", 0.35, 0.55), ("hard", 0.18, 0.32)):
+    for difficulty, low, high in (("easy", 0.18, 0.35), ("medium", 0.45, 0.62), ("hard", 0.19, 0.3)):
         assert low <= sum(q.difficulty == difficulty for q in questions) / len(questions) <= high
-    tables = [s for q in questions for s in q.expected_spans if s.startswith("|")]
+    tables = [q for q in questions if "table" in q.tags]
     assert len(tables) >= 8
+    for question in tables:  # a table span carries its year header row (v2.1), except a later group of "all"
+        heads = question.span_groups if question.span_match != "all" else question.span_groups[:1]
+        assert all(re.match(r"(20\d\d|Thereafter)\b", span) for group in heads for span in group)
     for question in questions:
         if question.expected_behavior == "abstain":
             assert not question.expected_spans and any(t.startswith("absent") for t in question.tags)
             continue
-        assert 1 <= len(question.expected_spans) <= 3 and question.expected_doc_ids
-        if question.span_match == "all":
-            assert question.difficulty == "hard"
+        assert 1 <= len(question.expected_spans) <= 8 and question.expected_doc_ids
+        if question.span_match == "all":  # two or three facts, each with its alternatives
+            assert question.difficulty == "hard" and 2 <= len(question.span_groups) <= 3
+    twins = [q for q in questions if "twin" in q.tags]
+    for twin in twins:  # the same fact asked in both languages: same filings, same spans
+        partners = [
+            q for q in twins if q.language != twin.language and q.expected_spans == twin.expected_spans
+        ]
+        assert len(partners) == 1 and partners[0].expected_doc_ids == twin.expected_doc_ids
+    assert len(twins) >= 6
+    lost = [q for q in questions if "chunk-loss" in q.tags]
+    assert len(lost) == 2 and all("chunk-loss" in (q.rationale or "") for q in lost)
     issuers_years = {
         (t1, t2)
         for q in questions
@@ -676,3 +689,190 @@ def test_the_committed_v2_set_is_well_formed():
         if t2.startswith("fy:")
     }
     assert len(issuers_years) == 20  # every filing is asked about
+
+
+# --- filings v2.1: span groups, the reachability check -------------------------------------------
+
+
+def test_span_groups_are_read_checked_and_written_back(tmp_path):
+    path = tmp_path / "q.jsonl"
+    line = {
+        "id": "a",
+        "question": "q?",
+        "expected_doc_ids": ["d"],
+        "expected_spans": [["one", "uno"], "two"],
+        "span_match": "all",
+    }
+    path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    question = load_questions(path)[0]
+    assert question.expected_spans == ("one", "uno", "two")  # flat, groups unrolled in order
+    assert question.span_groups == (("one", "uno"), ("two",))
+    assert question.to_dict()["expected_spans"] == [["one", "uno"], "two"]
+    plain = _question("p", ("x", "y"))
+    assert plain.span_groups == (("x",), ("y",)) and plain.to_dict()["expected_spans"] == ["x", "y"]
+    rebuilt = Question(
+        id="r", question="q?", expected_doc_ids=("d",), span_groups=(("a", "b"), ("c",)), span_match="all"
+    )
+    assert rebuilt.expected_spans == ("a", "b", "c")
+    bads = (
+        {"span_match": "any"},  # a group of alternatives means nothing with "any"
+        {"expected_spans": [["one", "uno"]]},  # "all" with a single group
+        {"expected_spans": [[], "two"]},
+        {"expected_spans": [["one", ""], "two"]},
+        {"expected_spans": [["one", "two"], "two"]},  # a span twice, across groups
+        {"expected_spans": [["one", 3], "two"]},
+    )
+    for bad in bads:
+        path.write_text(json.dumps({**line, **bad}) + "\n", encoding="utf-8")
+        with pytest.raises(EvalError):
+            load_questions(path)
+    with pytest.raises(EvalError, match="same spans"):
+        Question(
+            id="m", question="q?", expected_doc_ids=("d",), expected_spans=("a", "x"),
+            span_groups=(("a",), ("b",)), span_match="all",
+        )  # fmt: skip
+
+
+def test_span_match_all_needs_one_span_of_each_group():
+    question = Question(
+        id="g",
+        question="q?",
+        expected_doc_ids=("d",),
+        expected_spans=(("alpha fact", "alpha restated"), ("omega fact",)),
+        span_match="all",
+    )
+    hits = [
+        _hit("noise"),
+        _hit("the alpha restated here"),
+        _hit("x"),
+        _hit("an omega fact"),
+        _hit("alpha fact"),
+    ]
+    assert evaluate_passages(QuestionSet((question,)), lambda q: hits, k=10).results[0].rank == 4
+    only_alpha = [_hit("alpha fact"), _hit("alpha restated")]  # two alternatives of one group: still a miss
+    assert evaluate_passages(QuestionSet((question,)), lambda q: only_alpha, k=10).results[0].rank is None
+
+
+def test_groups_of_one_score_exactly_as_plain_spans():
+    import random
+
+    texts = ["alpha", "beta", "gamma", "alpha beta", "noise", "gamma noise"]
+    flat = _question("f", ("alpha", "beta", "gamma"), span_match="all")
+    grouped = Question(
+        id="g", question="q?", expected_doc_ids=("d",), expected_spans=(("alpha",), ("beta",), ("gamma",)),
+        span_match="all",
+    )  # fmt: skip
+    rng = random.Random(7)
+    for _ in range(200):
+        hits = [_hit(rng.choice(texts)) for _ in range(rng.randint(0, 8))]
+        ranks = [
+            evaluate_passages(QuestionSet((q,)), lambda q, hits=hits: hits, k=10).results[0].rank
+            for q in (flat, grouped)
+        ]
+        assert ranks[0] == ranks[1]
+
+
+def test_reachable_reads_spans_and_groups_against_chunks():
+    checker = _checker()
+    any_q = Question(
+        id="a", question="q?", expected_doc_ids=("d",), expected_spans=("held span", "lost span")
+    )
+    assert checker.reachable(any_q, {"d": ["a held  SPAN here"]}) == (True, ["lost span"])
+    assert checker.reachable(any_q, {"other": ["held span"]}) == (False, ["held span", "lost span"])
+    all_q = Question(
+        id="b", question="q?", expected_doc_ids=("d", "e"),
+        expected_spans=(("first", "first again"), ("second",)), span_match="all",
+    )  # fmt: skip
+    assert checker.reachable(all_q, {"d": ["first again"], "e": ["the second one"]})[0] is True
+    assert checker.reachable(all_q, {"d": ["first again", "first"]})[0] is False  # no chunk holds group 2
+    lost = Question(
+        id="c", question="q?", expected_doc_ids=("d",), expected_spans=("gone",), tags=("chunk-loss",)
+    )
+    problems, notes = checker.check_reachable([any_q, lost], {"d": ["nothing here"]}, "v2/section")
+    assert [p.question_id for p in problems] == ["a"]  # the chunk-loss question is unreachable by design
+    assert "a 'held span': held by no v2/section chunk" in notes
+    problems, notes = checker.check_reachable([lost], {"d": ["gone"]}, "v2/section")
+    assert not problems and notes == ["c: tagged chunk-loss but reachable with v2/section chunks"]
+
+
+def test_span_checker_reachability_option(tmp_path, capsys):
+    pytest.importorskip("chunknorris")  # the ingest extra (not installed on Python 3.10 in CI)
+    checker = _checker()
+    words = " ".join(f"filler{i}" for i in range(1200))  # longer than a v2 chunk
+    for doc_id, text in (
+        ("a-2024", f"# Item 7\n\nCash totaled $4.2 billion at year end. {words}\n"),
+        ("b-2024", f"# Item 7\n\nThe board approved a dividend program. {words}\n"),
+    ):
+        (tmp_path / f"{doc_id}.md").write_text(text, encoding="utf-8")
+        meta = {"company": "X CORP", "form": "10-K", "date": "2024-02-01", "sections": []}
+        meta["sections"] = [{"name": "Item 7", "start": 0, "end": len(text)}]
+        (tmp_path / f"{doc_id}.json").write_text(json.dumps(meta), encoding="utf-8")
+    rows = [
+        {
+            "id": "ok",
+            "question": "q?",
+            "expected_doc_ids": ["a-2024"],
+            "expected_spans": ["Cash totaled $4.2 billion"],
+        },
+        {
+            "id": "split",  # a span across the chunk boundary: no chunk holds it whole
+            "question": "q?",
+            "expected_doc_ids": ["b-2024"],
+            "expected_spans": [f"approved a dividend program. {words}"],
+        },
+    ]
+    qfile = tmp_path / "q.jsonl"
+    qfile.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    args = [str(qfile), str(tmp_path), "--reachable", "v2", "--word-tokenizer"]
+    assert checker.main(args) == 1
+    out = capsys.readouterr().out
+    assert "split: no v2/section chunk holds a span (unreachable)" in out
+    assert not any(line.startswith("ok:") for line in out.splitlines())
+    rows[1]["tags"] = ["chunk-loss"]
+    qfile.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    assert checker.main(args) == 0
+
+
+def test_span_checker_measures_difficulty(tmp_path, capsys):
+    checker = _checker()
+    (tmp_path / "acme-2024.md").write_text(
+        "Filler. Capital expenditures were $9.1 billion in 2024, mostly for data centers. More filler.",
+        encoding="utf-8",
+    )
+    (tmp_path / "acme-2023.md").write_text(
+        "Capital expenditures were $7.4 billion in 2023, mostly for data centers.", encoding="utf-8"
+    )
+    (tmp_path / "beta-2024.md").write_text(
+        "The Widget Labs stake was sold for $3.0 billion.", encoding="utf-8"
+    )
+    texts = checker.load_markdown(tmp_path)
+    year = Question(
+        id="y", question="What were Acme's capital expenditures in 2024?", expected_doc_ids=("acme-2024",),
+        expected_spans=("Capital expenditures were $9.1 billion in 2024",), difficulty="medium",
+    )  # fmt: skip
+    rated = checker.difficulty(year, texts)
+    assert rated.exposure == 1 and rated.factors == ["year template x1"] and rated.label == "medium"
+    unique = Question(
+        id="u", question="What was the Widget Labs stake sold for?", expected_doc_ids=("beta-2024",),
+        expected_spans=("The Widget Labs stake was sold",), difficulty="hard",
+    )  # fmt: skip
+    rated = checker.difficulty(unique, texts)
+    assert rated.overlap >= checker.OVERLAP_HIGH and rated.factors == [] and rated.label == "easy"
+    paraphrase = Question(
+        id="p", question="How much did Acme pour into server farms?", expected_doc_ids=("acme-2024",),
+        expected_spans=("Capital expenditures were $9.1 billion in 2024",),
+    )  # fmt: skip
+    assert checker.difficulty(paraphrase, texts).label == "hard"  # low overlap and a year template
+    both = Question(
+        id="b", question="q?", expected_doc_ids=("acme-2024", "beta-2024"),
+        expected_spans=("Capital expenditures were $9.1 billion", "Widget Labs stake was sold"),
+        span_match="all",
+    )  # fmt: skip
+    assert checker.difficulty(both, texts).label == "hard"
+    rows = [unique.to_dict(), year.to_dict()]
+    qfile = tmp_path / "q.jsonl"
+    qfile.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    assert checker.main([str(qfile), str(tmp_path), "--difficulty"]) == 1
+    out = capsys.readouterr().out
+    assert "u: difficulty 'hard', the factors give 'easy'" in out
+    assert "y: overlap" in out and not any(line.startswith("y: difficulty") for line in out.splitlines())
