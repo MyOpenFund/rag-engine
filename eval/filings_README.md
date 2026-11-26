@@ -34,7 +34,9 @@ chunks (no context header), so its rows do not depend on it.
 
 | chunking | retrieval | hit@5 | hit@10 | MRR@10 | s/10-K |
 |---|---|---|---|---|---|
+| v1 | dense | 0.209 [0.09,0.33] | 0.256 [0.14,0.40] | 0.125 [0.05,0.21] | 46.7 |
 | v1 | hybrid | 0.326 [0.19,0.47] | 0.419 [0.28,0.56] | 0.241 [0.13,0.34] | 46.7 |
+| v1/section | dense | 0.186 [0.07,0.30] | 0.209 [0.09,0.33] | 0.120 [0.05,0.21] | 34.4 |
 | v1/section | hybrid | 0.279 [0.16,0.42] | 0.349 [0.21,0.49] | 0.238 [0.13,0.35] | 34.4 |
 | v2 | dense | 0.558 [0.40,0.70] | 0.698 [0.56,0.81] | 0.397 [0.27,0.52] | 126.2 |
 | v2 | hybrid | 0.651 [0.51,0.79] | 0.767 [0.63,0.88] | 0.474 [0.35,0.59] | 126.2 |
@@ -49,6 +51,26 @@ chunks (no context header), so its rows do not depend on it.
 - Most of the 10 misses of v2/section hybrid are year confusions: adjacent 10-Ks carry near-identical
   sentences with other figures. The five abstentions' top fused scores (0.029 to 0.033) are not
   calibrated: no abstention threshold follows from them.
+
+### Caveats: what these numbers do not show
+
+- **The v2 context is the title only.** The company-corpus Markdown of a filing has no `#` headings,
+  so the context of a v2 chunk is the filing title alone: the section path of the context (title ›
+  h1 › h2 …) is not exercised by this set. The no-vault MCP passes the title only as well, so the
+  rows match what ships, not what v2 does on a document with headings.
+- **The intervals are optimistic.** They resample the 43 questions as if independent, but the
+  questions cluster on 19 to 20 filings of 5 issuers: questions on one filing or one issuer are
+  correlated, and an interval that resampled filings or issuers would be wider. Only large
+  differences are decidable.
+- **Spans come from prose only.** No span is a table cell, so how v1 and v2 split tables (v2 repeats
+  the header row in every piece) is not measured.
+- **The v2 gain is not split between its causes.** v2 changes two things at once, the token cap
+  (480 tokens, so no chunk is truncated by the 512-token window of e5-base) and the title in the
+  context (embedded and indexed for BM25). No run isolates one from the other.
+- **Year confusion penalises v1 by construction.** The questions carry no `filters`, so the issuer
+  and the fiscal year must be found from the text. A v1 chunk carries neither (no context), while a
+  v2 chunk carries the title, which names the company and the period. Part of the v1 -> v2 gap is
+  therefore this, not the quality of the cut.
 
 ## Question format
 
