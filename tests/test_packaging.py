@@ -295,6 +295,7 @@ PUBLIC_NAMES = {
         "FILTER_FIELDS",
         "INTERVAL_LEVEL",
         "QUESTION_FIELDS",
+        "SPAN_GAP",
         "UNFILTERED_SUFFIX",
         "UNFILTERED_TAG",
         "Abstention",
@@ -318,7 +319,9 @@ PUBLIC_NAMES = {
         "evaluate_passages",
         "format_report",
         "load_questions",
+        "span_held",
         "span_hit",
+        "span_parts",
     },
     "rag_engine.eval_check": {
         "CatalogueEntry",

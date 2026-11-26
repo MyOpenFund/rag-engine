@@ -1,4 +1,4 @@
-# Audit of `filings_v1.jsonl` for `filings_v2.jsonl`, and the v2.1 fixes
+# Audit of `filings_v1.jsonl` for `filings_v2.jsonl`, and the v2.1 and v2.2 fixes
 
 Every v1 question was read against its filing and checked mechanically (`scripts/check_filings_eval.py
 --report`, and a chunking pass that confirms each span is held whole by at least one v1 and one v2
@@ -219,3 +219,86 @@ Per question. "Alternatives" counts spans added by C1/C2 (not the table spans re
 | amzn-fy24-server-retire | **dropped** | - | easy → - | - | I6 server useful-life cluster (5): third Amazon question of the cluster. |
 | msft-fy25-capex-table-fr | **dropped** | - | hard → - | - | I1: the cash-flow row is cut from its year header in every v2 chunk (the header-carrying span is unreachable in v2), and no prose gives the total: no v2 passage can answer. |
 | amzn-fy25-leases-not-commenced | **dropped** | - | hard → - | - | I1: the commitments row is cut from its year header in every v2 chunk (header span unreachable in v2), and no prose gives the total. |
+
+## v2.2: fixes of the second review
+
+A second review (Fable; probes against every filing of each question's issuer, prose and table rows,
+and the chunks of both profiles and cuts) asked for changes. **v2.1 90 questions -> v2.2 92: 2 restored,
+37 changed (spans, filings, wording or label), 53 kept untouched.** Codes in the per-question table: C
+critical, I important, T table span rewritten as a gap span, m minor, D difficulty as measured.
+
+| Review item | What v2.2 does |
+|---|---|
+| C unlisted answering passages | `googl-fy24-dividend` and its French twin: + "first paid in June 2024" (Item 7 bullet; one span for the Item 5 dividend program and the equity note). `googl-fy24-capex`: + the Executive Overview sentence "We also expect to increase, relative to 2024, ...". `meta-fy22-restructuring`: the precise answer, $1.34 billion of abandonment charges for data center assets, is now the primary span (Item 7 cost of revenue; two note sentences; the cash-flow row, restated by the FY2023 and FY2024 statements); the combined $3.56 billion is **dropped**: it adds office lease and leasehold impairments, so it does not answer "data center charges". `amzn-capex-2023-2025-fr`: the 2023 group takes the FY2023 sentence ("$58.3 billion, and $48.1 billion in 2022 and 2023") and the free-cash-flow rows; amzn-10k-fy2023 added; rationale fixed. `amzn-fy22-notes`: the debt-table rows "April 2022 Notes issuance of $12.8 billion" / "December 2022 Notes issuance of $8.3 billion" (one gap span, both rows in one passage), all four Amazon 10-Ks expected. |
+| I self-labelled table rows | Rule (README): a table row whose own label names what is asked, dated by the table's year row (or by its label, or the filing's balance date), answers a prose question and counts as an alternative; a `Total` row, a column, or a row that merely includes the figure does not. Applied to every answering question by a search of each span figure (in the units of a table: $31.5 billion as 31,4xx-31,5xx) in every table row of the issuer's filings, then by reading each hit: 18 questions gained rows (tag `table-alt`, per question below), including `meta-fy22-first-notes` ("August 2022 Notes ... $10,000" in FY2024 and FY2025) and `orcl-fy25-capex` (free-cash-flow and cash-flow statement rows). A later 10-K whose three-year statement still shows the year asked is expected. In all, 14 expected filings were added to 10 questions. |
+| I robust table spans | Scorer: a span may hold `[...]` (`rag_engine.eval.SPAN_GAP`): one passage must hold every fragment, in order, whatever lies between (`span_held`, `span_hit`; about 20 lines with the validation). Every table span is now `year row [...] answer row` instead of the verbatim run of up to five rows that encoded today's cut. The checker finds a gap span in a filing when the answer row follows the year row within `--gap-window` characters (3000), and in a chunk when one chunk holds both. Tests added; the reviewer's `diff3.py`, re-run as `diff4.py` (v1 file against the pre-v2 and the v2-HEAD scorers, 25 random runs each; the v2.2 rows without a group or a gap span against the v2-HEAD scorer; every v2.2 question against a brute-force reference, 60 runs, 1377 gap-span hits exercised): identical, 0 mismatches. |
+| I table selection bias | The ten v2.1 table questions were chosen among rows a v2 chunk holds with their years; the README now says so. `msft-fy25-capex-table-fr` and `amzn-fy25-leases-not-commenced` are restored, tag `chunk-split` (exempt from `--reachable` like `chunk-loss`; a note says when they become reachable): v1 holds their rows with the years, no v2 chunk does. The added table rows show the same at scale: of 56 table-row spans, v1 holds all 56 with their year rows, v2 holds 32 (24 cut from their years: most rows of the long cash-flow and equity statements); those questions stay reachable in v2 through their prose spans. |
+| I chunk-loss in easy | Labels stay as measured (both easy). `scripts/filings_eval.py --exclude-tag chunk-loss,chunk-split` prints the headline table and the decisions a second time without the tagged questions (JSON `excluding`), so every row is read with and without them; tested. |
+| I amzn-fy25-anthropic | The long passage only v1 held is replaced by its two short sentences (Q2 and Q4 2025 notes). |
+| m amzn-fy23-credit | Amazon entered into two facilities in November 2023 (the $15.0 billion five-year one and a $5.0 billion 364-day one): the question names the five-year one replacing the March 2022 agreement. |
+| m googl-fy24-dividend | Section tag `item1a` (where its first span sits), like its twin. |
+| m meta-capex-outlook-compare | Rationale no longer names the dropped `meta-fy25-guidance`. |
+| m year-template exposure | `--difficulty` reads every span and the filings of every expected issuer (v2.1: the first span and the first issuer). Six labels moved as measured: `orcl-fy25-notes`, `googl-fy23-useful-life`, `amzn-fy23-anthropic`, `amzn-fy25-anthropic` easy -> medium; `googl-fy24-dividend` and its twin medium -> hard (no year, and the FY2025 10-K repeats the dividend-program wording). `amzn-fy25-leases-not-commenced` is restored as medium (measured; v2 had it hard). Test bounds unchanged (easy 18-35 %: 18.5 %). |
+| m abstention labels | Not measurable by the script; checked by hand against the README rule: `abs-02` (Nvidia), `abs-03` (Apple) easy, the company is not in the corpus; `abs-01` (Oracle fiscal 2031), `abs-05` (Microsoft fiscal 2030 capex) medium, a plausible period that no filing covers; `abs-googl-anthropic`, `abs-orcl-stargate`, `abs-amzn-dividend` hard, a real-world fact with an in-corpus distractor. All seven match. |
+| m meta-fy24-buyback | Reviewed, kept hard as measured: overlap 0.33 (the question's content words are "stock", "buy", "back"; the filing says "repurchased") and a year template in two other Meta 10-Ks. The overlap sits on the band edge of a three-word question: a dense retriever reads "buy back" as "repurchase" easily, BM25 does not; the label rates the passage for both. |
+
+Partial table rows, not added (the row only includes or approaches the figure asked, or is not
+self-labelled): `meta-fy22-capex` (Meta's capex includes finance-lease principal, $32.04 billion; its
+`Purchases of property and equipment` row is $31.43 billion); `meta-fy23-notes` and `meta-fy25-notes`
+(`Proceeds from issuance of long-term debt, net` names no issuance); `orcl-fy23-cerner` (`Acquisitions, net
+of cash acquired`, $27.7 billion, names no target); `orcl-fy23-fcf` (the statement's operating cash flow and
+capital expenditures rows need two rows and a subtraction; the free-cash-flow table answers);
+`msft-fy23-buyback` (`Total` rows of the repurchase table; the cash-flow `Common stock repurchased` row is
+another measure); `meta-dividends-2024-2025` (`Distributed earnings` of the EPS note); Meta's restructuring
+summary (a `Data Center Assets` column, not a row); `msft-fy23-depreciation-fr` (`Depreciation,
+amortization, and other` includes amortization).
+
+Checks run on the final file: `check_filings_eval.py --require-difficulty --difficulty` 0 problems;
+`--reachable v1,v2 --reach-cuts section,document` (e5 tokenizer) 0 problems: the two `chunk-loss`
+questions unreachable with the section cut and reachable with the document cut; the two `chunk-split`
+questions unreachable in v2 (both cuts) and reachable in v1; 24 table-row spans held by no v2 chunk with
+their years (notes, listed by `--report`).
+
+Per question (changed or restored in v2.2; factors as in the v2.1 table):
+
+| id | spans v2.1 → v2.2 | filings added | difficulty v2.1 → v2.2 | factors | change |
+|---|---|---|---|---|---|
+| msft-fy24-cash | 2 → 4 | - | medium → medium | OV 0.83 high, YT 2 | I: + balance-sheet subtotal rows of FY2024 and FY2025 (75,543) |
+| msft-fy24-cfo | 1 → 3 | msft-10k-fy2025 | medium → medium | OV 0.50 mid, YT 2 | I: + cash-flow statement rows of FY2024 and FY2025 (118,548 vs 87,582), FY2025 added |
+| googl-fy22-capex | 3 → 6 | googl-10k-fy2024 | medium → medium | OV 0.67 high, YT 1 | I: + cash-flow statement rows of FY2022, FY2023 and FY2024 (31,485; the three-year statement of FY2024 still shows 2022), FY2024 added |
+| googl-fy24-capex | 1 → 2 | - | medium → medium | OV 0.50 mid, YT 2 | C: + Executive Overview sentence 'We also expect to increase, relative to 2024, ...' |
+| googl-fy25-capex | 2 → 3 | - | medium → medium | OV 0.67 high, YT 3 | I: + cash-flow statement row (91,447) |
+| googl-fy25-notes | 2 → 3 | - | easy → easy | OV 0.80 high | I: + debt-table row '2025 US dollar notes ... 22,500' (as partial as the US dollar sentence already listed) |
+| googl-fy23-cash | 1 → 3 | googl-10k-fy2024 | medium → medium | OV 0.60 high, YT 2 | I: + balance-sheet subtotal rows of FY2023 and FY2024 (110,916), FY2024 added |
+| amzn-fy23-capex | 1 → 3 | - | medium → medium | OV 0.60 high, YT 3 | I: + free-cash-flow table rows (58,321 / 48,133; three tables, two spans) |
+| amzn-fy25-anthropic | 2 → 3 | - | easy → medium | OV 1.00 high, YT 2 | I: the long v1-only alternative replaced by its two short sentences (Q2 and Q4 notes) |
+| amzn-fy22-notes | 1 → 2 | amzn-10k-fy2023, amzn-10k-fy2024, amzn-10k-fy2025 | easy → easy | OV 1.00 high | C: + debt-table rows (both in one passage, gap span), all four Amazon 10-Ks expected |
+| amzn-fy23-credit | 1 → 1 | - | medium → medium | OV 0.89 high, YT 3 | m: question names which facility (the five-year one replacing the March 2022 agreement, not the 364-day one) |
+| amzn-fy24-liquidity | 2 → 3 | - | medium → medium | OV 1.00 high, YT 2 | I: + fair-value table total rows under 'December 31, 2024' (one span, the same row in FY2024 and FY2025) |
+| amzn-fy25-finance-leases | 1 → 2 | - | medium → medium | OV 1.00 high, YT 3 | I: + supplemental cash-flow row (2,911) |
+| meta-fy22-restructuring | 1 → 6 | meta-10k-fy2023, meta-10k-fy2024 | easy → easy | OV 1.00 high | C: primary span $1.34 billion abandonment charges (Item 7) + two note sentences + three cash-flow rows (FY2022; FY2023 and FY2024 restate it, both added); $3.56 billion dropped (it includes office lease impairments) |
+| orcl-fy25-capex | 1 → 3 | - | medium → medium | OV 0.75 high, YT 3 | I: + free-cash-flow table row and cash-flow statement row |
+| orcl-fy25-notes | 3 → 3 | - | easy → medium | OV 1.00 high, YT 3 | m: year template now read on every span; label as measured. |
+| meta-fy24-buyback | 2 → 3 | meta-10k-fy2025 | hard → hard | OV 0.33 low, YT 2 | I: + equity-statement row after the 2023 balance (FY2024 and FY2025), FY2025 added |
+| googl-fy24-dividend-fr | 1 → 3 | - | medium → hard | OV 0.20 low, YT 1, NY | C: + 'which were first paid in June 2024' (Item 7 bullet; Item 5 dividend program and the equity note share one span) |
+| meta-fy22-first-notes | 3 → 5 | meta-10k-fy2024, meta-10k-fy2025 | medium → medium | OV 0.50 mid | I: + 'August 2022 Notes ... $10,000' rows of FY2024 and FY2025, filings added |
+| msft-fy23-computer-equipment | 2 → 2 | - | medium → medium | OV 0.62 high, TB | T: table spans as gap spans (year row [...] answer row) |
+| googl-fy23-cip | 1 → 1 | - | medium → medium | OV 0.67 high, TB | T: table spans as gap spans (year row [...] answer row) |
+| googl-fy25-tech-infra | 1 → 1 | - | medium → medium | OV 0.60 high, TB | T: table spans as gap spans (year row [...] answer row) |
+| orcl-fy24-capex-change | 1 → 3 | orcl-10k-fy2025 | medium → medium | OV 0.75 high, TB | T+I: table span as a gap span; + statement rows of FY2024 and FY2025, FY2025 added |
+| orcl-fy25-cip | 1 → 1 | - | medium → medium | OV 0.62 high, TB | T: table spans as gap spans (year row [...] answer row) |
+| meta-fy23-servers | 2 → 2 | - | medium → medium | OV 0.60 high, TB | T: table spans as gap spans (year row [...] answer row) |
+| googl-fy23-useful-life | 2 → 2 | - | easy → medium | OV 0.67 high, YT 2 | m: year template now read on every span; label as measured. |
+| amzn-fy25-aws-share | 2 → 3 | - | hard → hard | OV 0.33 low, TB, MF | T: AWS group as a gap span; the Consolidated group takes the gap span (year row [...] row) and keeps the lone row, which v2 cuts from its years (v2.1 exception, kept) |
+| meta-fy25-capex-growth | 1 → 1 | - | medium → medium | OV 0.50 mid, TB | T: table spans as gap spans (year row [...] answer row) |
+| meta-capex-outlook-compare | 2 → 2 | - | hard → hard | OV 0.33 low, MF | m: rationale no longer names the dropped meta-fy25-guidance |
+| amzn-capex-2023-2025-fr | 2 → 8 | amzn-10k-fy2023 | hard → hard | OV 0.00 low, YT 1, MF | C: group 2023 + FY2023 sentence and the free-cash-flow rows of FY2023/FY2024; group 2025 + FY2025 row; amzn-10k-fy2023 added; rationale fixed (2023 is not only in the FY2024 10-K) |
+| amzn-fy23-anthropic | 3 → 3 | - | easy → medium | OV 1.00 high, YT 1 | m: year template now read on every span; label as measured. |
+| googl-fy24-dividend | 1 → 3 | - | medium → hard | OV 0.50 mid, YT 1, NY | C: + 'which were first paid in June 2024' (Item 7 bullet; Item 5 dividend program and the equity note share one span) m: section tag item5 -> item1a (where the first span sits) |
+| meta-fy23-servers-fr | 2 → 2 | - | hard → hard | OV 0.00 low, TB | T: table spans as gap spans (year row [...] answer row) |
+| orcl-fy23-fcf | 2 → 2 | - | hard → hard | OV 0.33 low, TB | T: table spans as gap spans (year row [...] answer row) |
+| googl-vs-meta-fy24-capex | 5 → 9 | meta-10k-fy2025 | hard → hard | OV 0.75 high, YT 4, MF | I: + cash-flow statement rows in both groups (FY2024 and restating FY2025 10-Ks), meta-10k-fy2025 added |
+| meta-dividends-2024-2025 | 7 → 10 | - | hard → hard | OV 0.40 mid, MF | I: + cash-flow statement rows (FY2024 in group 2024; FY2025 in both groups) |
+| msft-fy22-construction-commitments | 1 → 2 | - | hard → hard | OV 0.29 low, YT 3 | I: + contractual-obligations row 'Construction commitments(b) ... 8,518' (self-labelled; a balance of the filing's date, no year row) |
+| msft-fy25-capex-table-fr | - → 1 | restored | - (dropped) → hard | OV 0.20 low, TB | I: restored (dropped in v2.1), tagged chunk-split, gap span |
+| amzn-fy25-leases-not-commenced | - → 1 | restored | - (dropped) → medium | OV 0.57 mid, TB | I: restored (dropped in v2.1), tagged chunk-split, gap span |

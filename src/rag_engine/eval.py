@@ -94,6 +94,7 @@ __all__ = [
     "FILTER_FIELDS",
     "INTERVAL_LEVEL",
     "QUESTION_FIELDS",
+    "SPAN_GAP",
     "UNFILTERED_SUFFIX",
     "UNFILTERED_TAG",
     "Abstention",
@@ -117,7 +118,9 @@ __all__ = [
     "evaluate_passages",
     "format_report",
     "load_questions",
+    "span_held",
     "span_hit",
+    "span_parts",
 ]
 
 #: Number of documents the metrics look at, unless ``k`` is given.
@@ -182,6 +185,9 @@ DEFAULT_SPAN_MATCH = "any"
 #: The difficulty labels a question may carry (``eval/filings_README.md`` defines them); a label only,
 #: the report groups by it.
 DIFFICULTIES: tuple[str, ...] = ("easy", "medium", "hard")
+#: The marker that splits one span into fragments one passage must hold in this order, whatever lies
+#: between them (a table's year row and its answer row): ``"2024 | | 2025 [...] | Capex | 1 | 2"``.
+SPAN_GAP = "[...]"
 
 _REQUIRED = ("id", "question")
 _NO_KIND = "(none)"
@@ -337,7 +343,9 @@ class Question:
         empty on a question that abstains. :func:`evaluate` does not read them. An item may be
         a list of strings instead of a string: a *group* of alternative spans (the same fact in
         another sentence or another filing), allowed with ``span_match="all"`` only. Once built,
-        ``expected_spans`` is the flat tuple of every span, groups unrolled in order.
+        ``expected_spans`` is the flat tuple of every span, groups unrolled in order. A span may
+        hold :data:`SPAN_GAP`: its fragments must then all be held, in order, by one passage
+        (a table's year row and its answer row), none of them blank.
     ``span_groups``
         The spans as groups: one tuple per item of ``expected_spans`` as given (a lone string is
         a group of one). Derived when left out (``None``); given, it must hold the same spans as
@@ -403,6 +411,9 @@ class Question:
         for name in ("tags", "must_include", "must_not_include"):
             object.__setattr__(self, name, _strings(name, getattr(self, name)))
         self._check_spans()
+        gapped = [span for span in self.expected_spans if any(not part.strip() for part in span_parts(span))]
+        if gapped:
+            raise EvalError(f"a span has a blank fragment around {SPAN_GAP!r}: {gapped[0]!r}")
         if self.expected_spans and self.expected_behavior == "abstain":
             raise EvalError("'expected_spans' is given on a question whose 'expected_behavior' is 'abstain'")
         if not isinstance(self.span_match, str) or self.span_match not in SPAN_MATCHES:
@@ -723,7 +734,8 @@ def load_questions(path: str | os.PathLike[str]) -> QuestionSet:
     - ``expected_spans`` (optional): a list of non-blank strings, none twice, the verbatim
       passages that answer the question, scored by :func:`evaluate_passages`; not allowed on
       a question that abstains. With ``span_match: "all"`` an item may be a non-empty list of
-      strings, a group of alternatives (one of them is enough for that group);
+      strings, a group of alternatives (one of them is enough for that group). A span may hold
+      ``[...]`` (:data:`SPAN_GAP`): one passage must hold its fragments in order;
     - ``span_match`` (optional): ``"any"`` (the default) or ``"all"`` (every span, or every
       group, is needed; at least two);
     - ``difficulty`` (optional): ``"easy"``, ``"medium"`` or ``"hard"``, a label;
@@ -2658,6 +2670,25 @@ def _squash(text: str) -> str:
     return " ".join(unicodedata.normalize(QUERY_NORMALIZATION, text.casefold()).split())
 
 
+def span_parts(span: str) -> tuple[str, ...]:
+    """The fragments of ``span`` split at :data:`SPAN_GAP`, as given (one fragment without a gap)."""
+    return tuple(span.split(SPAN_GAP))
+
+
+def span_held(haystack: str, needle: str) -> bool:
+    """Whether the squashed ``haystack`` holds the squashed ``needle``: every fragment of it
+    (:func:`span_parts`), in order and without overlap; a needle without a gap is a plain
+    containment. A blank needle or fragment is never held."""
+    at = 0
+    for part in span_parts(needle):
+        part = part.strip()
+        found = haystack.find(part, at) if part else -1
+        if found < 0:
+            return False
+        at = found + len(part)
+    return True
+
+
 def span_hit(hit_text: str | None, spans: Sequence[str]) -> bool:
     """Whether the passage ``hit_text`` holds one of ``spans``, ignoring case, white space and typography.
 
@@ -2665,13 +2696,15 @@ def span_hit(hit_text: str | None, spans: Sequence[str]) -> bool:
     quotes and apostrophes become ASCII ones, en and em dashes become ``-``, zero-width characters
     and soft hyphens are dropped, text is case-folded and every run of white space (line breaks of
     a table or of a hard-wrapped paragraph included) becomes one space before the containment is
-    tested. A
-    passage without text, no span, and a blank span give ``False``.
+    tested. A span holding :data:`SPAN_GAP` is held when the passage holds each of its fragments,
+    in order, whatever lies between them (a table's year row, then the answer row a few rows
+    below): one passage must hold them all. A passage without text, no span, and a blank span
+    give ``False``.
     """
     if not hit_text:
         return False
     haystack = _squash(hit_text)
-    return any(needle and needle in haystack for needle in map(_squash, spans))
+    return any(span_held(haystack, needle) for needle in map(_squash, spans))
 
 
 @dataclass(frozen=True)

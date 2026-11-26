@@ -62,9 +62,9 @@ chunks (no context header), so its rows do not depend on it.
   questions cluster on 19 to 20 filings of 5 issuers: questions on one filing or one issuer are
   correlated, and an interval that resampled filings or issuers would be wider. Only large
   differences are decidable.
-- **Spans come from prose only.** No span is a table cell, so how v1 and v2 split tables is not
-  measured (v2 repeats the header row of a table in every piece, but in company-corpus Markdown that row
-  is blank: the years are in a data row only the first piece carries; see v2 below).
+- **Spans come from prose only.** No v1 span is a table cell, so how v1 and v2 split tables is not
+  measured by v1 (v2 repeats the header row of a table in every piece, but in company-corpus Markdown that
+  row is blank: the years are in a data row only the first piece carries; see v2 below).
 - **The v2 gain is not split between its causes.** v2 changes two things at once, the token cap
   (480 tokens, so no chunk is truncated by the 512-token window of e5-base) and the title in the
   context (embedded and indexed for BM25). No run isolates one from the other.
@@ -81,8 +81,8 @@ chunks (no context header), so its rows do not depend on it.
 > been scored twice).
 
 v1 was challenged question by question (`filings_v2_AUDIT.md`: 36 kept, 9 rewritten, 3 dropped) and
-extended with harder and more varied questions; an adversarial review of that first v2 led to v2.1
-(the changes table of the audit). **90 questions: 83 answering, 7 abstentions.**
+extended with harder and more varied questions; an adversarial review of that first v2 led to v2.1, and a
+second review to v2.2 (the changes tables of the audit). **92 questions: 85 answering, 7 abstentions.**
 
 ### Why a second set
 
@@ -102,6 +102,19 @@ restated by another year's 10-K), and those that answer were added as spans, wit
 alternative spans (3 of them bringing a filing that was missing); a question with none added has no other
 answering passage in the 20 filings, or only partial ones (the audit names those).
 
+v2.2 ran the search again with the table rows in it, under one rule: **a self-labelled table row that
+answers a prose question counts as an alternative**. A row is self-labelled when its own label names
+what is asked (`Purchases of property and equipment`, `Payments for dividends and dividend equivalents`,
+`April 2022 Notes issuance of $12.8 billion`) and its year comes from the table's year row (or from the
+label itself, or from the filing's balance date); a `Total` row, a column of a table, or a row that only
+includes the figure asked (Meta's `Proceeds from issuance of long-term debt, net` for its May 2023 notes)
+does not count. A later 10-K whose three-year statement still shows the year asked answers too, and is
+expected. 18 questions gained table rows this way (tag `table-alt`; `amzn-fy22-notes` among them, whose
+debt-table rows name the 2022 issuances in all four Amazon 10-Ks), and the prose passages the second
+review found were added (Alphabet's first dividend "first paid in June 2024", in both twins; its 2025
+infrastructure expectation in the Executive Overview; Meta's $1.34 billion data center charge, now the
+primary span; Amazon's 2023 capex in its FY2023 10-K).
+
 ### Difficulty: retrieval difficulty
 
 Each question carries `difficulty`: `easy`, `medium` or `hard`. It rates how hard the **passage is to
@@ -115,12 +128,15 @@ contradict):
   high >= 0.6, mid 0.35 to 0.6, **low < 0.35**. A French question is read the same way, on the words it
   shares with the English text (names, figures, cognates): cross-lingual difficulty shows as low
   overlap, unless a shared name carries the match (*Scale AI*, *OpenAI*).
-- **Year-template exposure** (`YT`): the number of other filings of the issuer (not expected) that
-  repeat the wording of the question's first span with other figures: at least half of its four-word
-  shingles, figures masked. `YT >= 1` is a factor: a neighbouring year's 10-K says the same thing with
-  other numbers.
-- **Table** (`TB`): the answer is a table row. Every 10-K repeats its tables year after year, so a table
-  counts as one factor and its year-template exposure is not counted again.
+- **Year-template exposure** (`YT`): the number of other filings of the issuers of the expected filings
+  (not expected themselves) that repeat the wording of one of the question's spans with other figures: at
+  least half of that span's four-word shingles, figures masked. `YT >= 1` is a factor: a neighbouring
+  year's 10-K says the same thing with other numbers. (v2.1 read the first span only; v2.2 reads every
+  span, which moved six labels, listed in the audit.)
+- **Table** (`TB`): the answer is a table row only (tag `table`). Every 10-K repeats its tables year
+  after year, so a table counts as one factor and its year-template exposure is not counted again. A
+  question whose prose answers too and whose table rows are alternatives (tag `table-alt`) is not a
+  table question.
 - **No year** (`NY`): the question names no year ("latest") while the issuer's other 10-Ks carry the
   same template.
 - **Multi-filing "all"** (`MF`): `span_match: "all"`, two facts that two filings (or two issuers) give.
@@ -131,7 +147,8 @@ contradict):
 overlap. **easy**: none, and high overlap. Abstentions are rated apart: easy when the company is not in
 the corpus, medium when the period or figure is plausible but absent, hard when a real-world fact has
 an in-corpus distractor (Amazon's Anthropic notes for Alphabet; SoftBank in Oracle's 10-K for Stargate;
-other issuers' dividends for Amazon).
+other issuers' dividends for Amazon). The script does not rate abstentions: their seven labels were
+checked by hand against that rule (the audit lists them).
 
 v2 labels mixed retrieval with answer difficulty (negation, numeric reasoning, notes); v2.1 re-checked
 every label against the criteria above (the audit lists each change and each question's factors).
@@ -140,30 +157,34 @@ every label against the criteria above (the audit lists each change and each que
 
 | | easy | medium | hard | all |
 |---|---|---|---|---|
-| answering | 19 | 49 | 15 | 83 |
+| answering | 15 | 52 | 18 | 85 |
 | abstention | 2 | 2 | 3 | 7 |
-| **all** | **21 (23 %)** | **51 (57 %)** | **18 (20 %)** | **90** |
-| of which French | 1 | 4 | 4 | 9 |
-| of which a table answer | 0 | 7 | 3 | 10 (15 spans) |
+| **all** | **17 (18 %)** | **54 (59 %)** | **21 (23 %)** | **92** |
+| of which French | 1 | 3 | 6 | 10 |
+| of which a table answer (`table`) | 0 | 8 | 4 | 12 |
+| of which table rows as alternatives (`table-alt`) | 3 | 10 | 5 | 18 |
 | of which `span_match: "all"` | 0 | 0 | 7 | 7 |
-| of which a French/English twin | 2 | 5 | 1 | 8 (4 pairs) |
+| of which a French/English twin | 1 | 4 | 3 | 8 (4 pairs) |
 | of which `chunk-loss` | 2 | 0 | 0 | 2 |
+| of which `chunk-split` | 0 | 1 | 1 | 2 |
 
 Medium is above the 45 % aimed at: the v1 questions kept as they are (the owner's rule: keep what is not
-defective) are mostly year-template questions, one factor each.
+defective) are mostly year-template questions, one factor each; reading every span for the year template
+(v2.2) moved four more from easy to medium. The labels are as measured, `chunk-loss` and `chunk-split`
+questions included (their difficulty is that of retrieving the passage, were it whole).
 
-- **Kinds**: ai-capex 19, capex 13, financing 10, debt 10, liquidity 9, leases 8, buybacks-dividends 6,
+- **Kinds**: ai-capex 19, capex 14, financing 10, debt 10, liquidity 9, leases 9, buybacks-dividends 6,
   accounting-policy 5 (useful lives and depreciation of servers), risk 2, segment-capex 1, abstention 7.
-- **Issuers** (a question may name two): Meta 19, Alphabet 18, Amazon 17, Microsoft 16, Oracle 15.
-- **Fiscal years** (tags; a question may name several): 2022: 12, 2023: 24, 2024: 30, 2025: 44. Every
-  one of the 20 filings is asked about. FY2025 still weighs most (40 % of the year tags, 46 % in v2): it
-  is what users ask about first and no later 10-K restates it; v2.1 dropped three FY2025 questions and
-  added mostly 2022 to 2024 ones.
-- **Tags** for slicing the results by hand: `year-confusion` 43, `restated` 12, `note` 12, `table` 10,
-  `paraphrase` 9, `french` 9, `twin` 8, `numeric` 7, `multi-span` 7, `negation` 3, `multi-filing` 3,
-  `risk-factor` 2, `chunk-loss` 2, `no-year` 1, and `section:item1a|item5|item7|item8|outside` from where
-  the first span sits in the sidecar sections (`outside`: Oracle's statements and notes, in Item 15,
-  past the sidecar's Item 8 stub).
+- **Issuers** (a question may name two): Meta 19, Alphabet 18, Amazon 18, Microsoft 17, Oracle 15.
+- **Fiscal years** (tags: the years asked, not the filings that restate them; a question may name
+  several): 2022: 12, 2023: 25, 2024: 30, 2025: 46. Every one of the 20 filings is asked about. FY2025
+  still weighs most (41 % of the year tags, 46 % in v2): it is what users ask about first and no later
+  10-K restates it; v2.1 dropped three FY2025 questions and added mostly 2022 to 2024 ones.
+- **Tags** for slicing the results by hand: `year-confusion` 44, `restated` 19, `table-alt` 18, `note` 13,
+  `table` 12, `paraphrase` 10, `french` 10, `twin` 8, `numeric` 7, `multi-span` 7, `multi-filing` 4,
+  `negation` 3, `risk-factor` 2, `chunk-loss` 2, `chunk-split` 2, `no-year` 1, and
+  `section:item1a|item7|item8|outside` from where the first span sits in the sidecar sections
+  (`outside`: Oracle's statements and notes, in Item 15, past the sidecar's Item 8 stub).
 
 ### Twins: the same fact in both languages
 
@@ -175,7 +196,7 @@ only the language differs, so comparing a twin's two ranks says what the languag
 
 ### Several filings, several spans
 
-- **`expected_doc_ids` lists every filing that answers** (24 answering questions): a restated figure
+- **`expected_doc_ids` lists every filing that answers** (30 answering questions): a restated figure
   (the next 10-K's sentence or table row, each with its own span), an event several 10-Ks describe, a
   risk factor repeated from one year to the next. A passage of another filing is still no hit.
 - **Several spans are alternatives** (`span_match: "any"`, the default and v1's behaviour): any one
@@ -194,15 +215,27 @@ only the language differs, so comparing a twin's two ranks says what the languag
   free-cash-flow, segment and cash-flow tables); **two-filing** retrieval within the first `k`; risk
   factors and notes; negations; French questions and their English twins; and, through the tags and the
   breakdown, which kind of question fails.
-- **A table span carries its column header.** In company-corpus Markdown the header row of a table is
-  blank (`|  |  |  |`): the years sit in a data row below it. v2 repeats the (blank) header row in every
-  piece of a split table, so a piece cut below the year row holds figures without years and cannot
-  answer "in 2025". Each table span therefore runs, verbatim, **from the year row to the answer row**,
-  and is checked to be held whole by a chunk of both profiles (section cut). Two v2 questions whose row
-  is cut from its years in every v2 chunk were dropped (Microsoft's 2025 additions to property and
-  equipment, Amazon's leases not yet commenced), since no v2 passage could answer them. The one
-  exception is the second group of `amzn-fy25-aws-share`: the lone Consolidated row, which v2 cuts from
-  its header; the first group (the AWS row with the years) gives its column order.
+- **A table span carries its years: `year row [...] answer row`.** In company-corpus Markdown the header
+  row of a table is blank (`|  |  |  |`): the years sit in a data row below it. v2 repeats the (blank)
+  header row in every piece of a split table, so a piece cut below the year row holds figures without
+  years and cannot answer "in 2025". A table span is therefore written as two fragments, the year row
+  and the answer row, joined by `[...]`: **one passage must hold both, in this order**, whatever rows lie
+  between them (v2.1 spelled out every row in between, verbatim, so a span encoded today's cut; the gap
+  span does not). A self-labelled row whose label carries its date (`August 2022 Notes`, `April 2022 Notes
+  issuance of $12.8 billion`) or a balance of the filing's date (`Construction commitments`) needs no
+  year row. The one row kept without its years is the lone Consolidated row of `amzn-fy25-aws-share`, an
+  alternative in the second group next to its gap span: v2 cuts that row from its years, and the first
+  group (the AWS row with the years) gives the column order.
+- **Which table questions, and what v2 cannot answer.** The ten table questions of v2.1 were chosen among
+  rows a v2 chunk holds with their year row: by themselves they would hide how v2 cuts tables. v2.2
+  therefore restores the two v2.1 had dropped, tagged `chunk-split` (`msft-fy25-capex-table-fr`, the
+  cash-flow statement's additions to property and equipment, and `amzn-fy25-leases-not-commenced`, the
+  commitments table): no prose gives their figure and no v2 chunk holds their row with its years, so
+  they miss under v2 by construction, as the `chunk-loss` ones do. The table rows added as alternatives
+  show the same thing at scale: of the 56 table-row spans of the set, every one is held with its year
+  row by a v1 chunk (whose text is longer, though e5 embeds only its first 512 tokens), and 24 by no v2
+  chunk, section or document cut (19 of the 36 `table-alt` rows: most rows of the long cash-flow and
+  equity statements). Those questions stay reachable in v2 through their prose spans.
 - It does not measure the answer: a span in the passages is necessary, not sufficient (the numeric
   questions also need the arithmetic; a negation needs the reader to read it).
 - **Abstentions are reported apart, without a metric.** The runner searches the 7 abstention questions
@@ -210,7 +243,7 @@ only the language differs, so comparing a twin's two ranks says what the languag
   `abstentions`); the printed table has no abstention column, and no hit rate or threshold is computed,
   since the fused scores are not calibrated (v1's five spanned 0.029 to 0.033). An abstention metric
   needs a threshold policy first; until then the abstentions only show what a system would be shown.
-- **Groups are small** (18 hard, 9 French): the runner prints them without an interval; read them as
+- **Groups are small** (21 hard, 10 French): the runner prints them without an interval; read them as
   indications, and only large differences as signals. The questions still cluster on 20 filings of 5
   issuers (see the v1 caveats).
 - Several questions reuse spans of others (`meta-capex-outlook-compare` and `meta-fy24-guidance`, the
@@ -220,21 +253,26 @@ only the language differs, so comparing a twin's two ranks says what the languag
   piece is parsed as YAML front matter and dropped, up to the next `---`. Amazon's Item 7 opening (in all
   four Amazon 10-Ks) and Alphabet's FY2025 Item 7 trends and Item 1A leasing risk are lost that way.
   `amzn-fcf-drivers` and `googl-fy25-ai-infra-costs` ask about that text: they miss with the section cut
-  until the parsing is fixed, and are reachable with the document cut. Read the section-cut rows with
-  and without them (`chunk-loss` tag). Every other answering question has a span held whole by a chunk
-  of each profile and cut (`--reachable`, below).
+  until the parsing is fixed, and are reachable with the document cut. Their labels say how hard the
+  passage would be to retrieve were it whole (both easy), so they sit in the easy group:
+  **`--exclude-tag chunk-loss,chunk-split`** makes the runner print the headline table a second time
+  without these four questions (and write it as `excluding` in the JSON), so every row is read with and
+  without them. Every other answering question has a span held whole by a chunk of each profile and cut
+  (`--reachable`, below).
 
 ### Checking and running v2
 
 ```
 python scripts/check_filings_eval.py eval/filings_v2.jsonl FILINGS_DIR --require-difficulty --difficulty --report
 python scripts/check_filings_eval.py eval/filings_v2.jsonl FILINGS_DIR --reachable v1,v2 --reach-cuts section,document --model-cache MODELS
-python scripts/filings_eval.py FILINGS_DIR eval/filings_v2.jsonl --backend onnx --cuts document,section --json out.json
+python scripts/filings_eval.py FILINGS_DIR eval/filings_v2.jsonl --backend onnx --cuts document,section \
+    --exclude-tag chunk-loss,chunk-split --json out.json
 ```
 
 `--reachable` chunks the expected filings with each profile and cut, as the runner does, and reports a
-question none of whose spans (with `"all"`: none of one group's spans) is held whole by a chunk; a
-`chunk-loss` question is exempt, and a note says when it has become reachable. The runner prints, under
+question none of whose spans (with `"all"`: none of one group's spans) is held whole by a chunk (a
+`[...]` span: all its fragments by one chunk); a `chunk-loss` or `chunk-split` question is exempt, and a
+note says when it has become reachable. The runner prints, under
 the main table, the same metrics **by difficulty** and **by language** for every row, and writes them as
 `by_difficulty` / `by_language` in the JSON.
 
@@ -244,7 +282,7 @@ JSON Lines, the format of `README.md` (version 2) plus three optional fields:
 
 | Field | Meaning |
 |---|---|
-| `expected_spans` | A list of short, distinct, verbatim texts of the filings that answer the question (v1: 1 to 3; v2.1: up to 8, alternatives included). With `"all"`, an item may be a list of strings: a group of alternatives for one fact. |
+| `expected_spans` | A list of short, distinct, verbatim texts of the filings that answer the question (v1: 1 to 3; v2.2: up to 10, alternatives included). With `"all"`, an item may be a list of strings: a group of alternatives for one fact. A span may hold `[...]`: its fragments (a table's year row, then its answer row) must all be held by one passage, in order. |
 | `span_match` | `"any"` (default: one span is enough, several spans are alternatives) or `"all"` (every item, span or group, is needed, at least two; a group is found by any one of its spans). |
 | `difficulty` | `"easy"`, `"medium"` or `"hard"` (defined in the v2 section); a label the runner groups by. |
 
@@ -283,8 +321,10 @@ tiny span); a span found in none of the question's filings, or more than `--max-
 in one; a span also found in a filing the question does not expect; with `--reachable`, a question no
 chunk can answer (below). In v1, spans are taken from prose sentences, not from tables (whose cells the
 chunker may split); v2 adds table spans, which since v2.1 run verbatim from the table's year row to the
-answer row (the header row is blank in this Markdown), each checked to be held whole by a chunk of both
-profiles. A span names a
+answer row (the header row is blank in this Markdown); since v2.2 they are gap spans, `year row [...]
+answer row`, found in a filing where the answer row follows the year row within `--gap-window`
+characters (3000 by default, about a v2 chunk), and held by a chunk when one chunk holds both. A span
+names a
 figure or a fact that only its filing states (a 10-K repeats the previous year's figures, so a span such
 as "$75.5 billion" alone would also be in the next filing); when the next filing restates the answer in
 its own words or row, that filing is expected too, with its own span (v2).
@@ -292,7 +332,8 @@ its own words or row, that filing is expected too, with its own span (v2).
 ## Scoring
 
 `span_hit(text, spans)`: both sides are case-folded and every run of white space becomes one space;
-the passage is a hit if it contains any span. For each question the *rank* is the position of the
+the passage is a hit if it contains any span (a span holding `[...]`: if it contains each fragment, in
+order). For each question the *rank* is the position of the
 first hit among the `k` passages returned (`k = 10`). Then:
 
 - hit@5, hit@10: share of questions with a hit within the first 5 / 10 passages;

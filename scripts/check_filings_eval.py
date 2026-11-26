@@ -6,6 +6,8 @@ The rules of ``eval/filings_README.md`` ("How a question is checked"), applied m
 - every ``expected_doc_ids`` of a question names a ``<doc_id>.md`` of ``FILINGS_DIR``;
 - every span is at least ``--min-chars`` long once normalised and holds a letter (no dash-only or
   tiny span);
+- a span holding ``[...]`` (a table's year row, then its answer row) is found where its last
+  fragment is preceded by the others, in order, within ``--gap-window`` characters;
 - every span is found in one of the question's expected filings, at most ``--max-per-filing``
   times in each, with the comparison of ``rag_engine.eval.span_hit`` (NFKD, typography folded,
   case-folded, white space collapsed);
@@ -22,8 +24,10 @@ The rules of ``eval/filings_README.md`` ("How a question is checked"), applied m
 ``scripts/filings_eval.py`` (cut ``--reach-cuts``, ``section`` by default, as the MCP ships) and
 reports a question none of whose spans (with ``span_match: "all"``: none of the spans of one
 group) is held whole by one chunk of its expected filings: no retrieval could score it. A
-question tagged ``chunk-loss`` is expected to be unreachable (its answer sits in text the
-chunking loses): it is never a problem, and a note says when it has become reachable. The
+question tagged ``chunk-loss`` (its answer sits in text the chunking loses) or ``chunk-split`` (its
+table row is cut from the row of its years) is expected to be unreachable: it is never a problem,
+and a note says when it has become reachable. A span holding ``[...]`` is held when one chunk holds
+all its fragments, in order. The
 chunks need the model tokenizer (``--model-cache``, ``--model``); ``--word-tokenizer`` counts a
 word as a token instead (tests, a quick look: chunk boundaries then differ from the real ones).
 
@@ -53,7 +57,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from rag_engine.eval import Question, _squash, load_questions
+from rag_engine.eval import SPAN_GAP, Question, _squash, load_questions, span_held, span_parts
 
 #: The shortest span accepted, in characters once normalised.
 DEFAULT_MIN_CHARS = 20
@@ -63,6 +67,14 @@ DEFAULT_MAX_PER_FILING = 2
 WORDING_MIN_CHARS = 15
 #: The tag of a question whose answer sits in text the chunking loses (unreachable by design).
 CHUNK_LOSS_TAG = "chunk-loss"
+#: The tag of a question whose table row the chunking cuts from its year row (unreachable by design).
+CHUNK_SPLIT_TAG = "chunk-split"
+#: The tags of the questions expected to be unreachable: the check reports them only when reachable.
+UNREACHABLE_TAGS = (CHUNK_LOSS_TAG, CHUNK_SPLIT_TAG)
+#: How far before its last fragment (squashed characters, about a v2 chunk) the other fragments of a
+#: span holding ``[...]`` must sit for the span to count as found in a filing. A filing check only:
+#: the scorer and ``--reachable`` ask for every fragment in one passage, whatever its length.
+DEFAULT_GAP_WINDOW = 3000
 #: The cut the reachability check uses unless told otherwise: the per-section cut the MCP ships.
 DEFAULT_REACH_CUTS = ("section",)
 #: A figure of a span: digits with their separators, an optional dollar sign and scale word.
@@ -91,12 +103,38 @@ def load_markdown(directory: str | Path) -> dict[str, str]:
     return texts
 
 
+def locate(text: str, span: str, window: int = DEFAULT_GAP_WINDOW) -> list[tuple[int, int]]:
+    """Where ``span`` occurs in the normalised ``text``: ``(start, end)`` of each occurrence.
+
+    A span without :data:`~rag_engine.eval.SPAN_GAP` occurs where its text does. A span with one
+    occurs at each occurrence of its last fragment preceded, within ``window`` characters, by its
+    other fragments in order (the nearest ones: ``start`` is that of the first fragment).
+    """
+    parts = [part.strip() for part in span_parts(_squash(span))]
+    if not all(parts):
+        return []
+    found: list[tuple[int, int]] = []
+    last = parts[-1]
+    at = text.find(last)
+    while at >= 0:
+        start, low = at, max(0, at - window)
+        for part in reversed(parts[:-1]):
+            start = text.rfind(part, low, start)
+            if start < 0:
+                break
+        if start >= 0:
+            found.append((start, at + len(last)))
+        at = text.find(last, at + len(last))
+    return found
+
+
 def check_question(
     question: Question,
     texts: Mapping[str, str],
     *,
     min_chars: int = DEFAULT_MIN_CHARS,
     max_per_filing: int = DEFAULT_MAX_PER_FILING,
+    window: int = DEFAULT_GAP_WINDOW,
 ) -> list[Problem]:
     """The problems of one question (empty when it passes)."""
     if question.expected_behavior == "abstain":
@@ -116,7 +154,7 @@ def check_question(
         if len(needle) < min_chars or not any(ch.isalpha() for ch in needle):
             problems.append(Problem(question.id, span, f"too short or no letter (< {min_chars} characters)"))
             continue
-        counts = {doc_id: texts[doc_id].count(needle) for doc_id in expected}
+        counts = {doc_id: len(locate(texts[doc_id], span, window)) for doc_id in expected}
         if not any(counts.values()):
             problems.append(Problem(question.id, span, "not found in any expected filing"))
         problems.extend(
@@ -124,15 +162,16 @@ def check_question(
             for doc_id, n in counts.items()
             if n > max_per_filing
         )
-        elsewhere = [doc_id for doc_id, text in texts.items() if doc_id not in counts and needle in text]
+        elsewhere = [
+            doc_id for doc_id, text in texts.items() if doc_id not in counts and locate(text, span, window)
+        ]
         if elsewhere:
             others = ", ".join(elsewhere)
             problems.append(Problem(question.id, span, f"also in filings not expected: {others}"))
-    needles = [_squash(span) for span in question.expected_spans]
     problems.extend(
         Problem(question.id, None, f"expected filing {doc_id!r} holds none of the spans")
         for doc_id in expected
-        if not any(needle and needle in texts[doc_id] for needle in needles)
+        if not any(locate(texts[doc_id], span, window) for span in question.expected_spans)
     )
     return problems
 
@@ -173,7 +212,7 @@ def check_absent(question: Question, texts: Mapping[str, str]) -> list[Problem]:
 
 def wording(span: str) -> str:
     """The longest stretch of ``span`` between figures, normalised; empty when every stretch is short."""
-    parts = [part.strip(" ,.;") for part in _FIGURE.split(_squash(span))]
+    parts = [part.strip(" ,.;") for part in _FIGURE.split(_squash(span).replace(SPAN_GAP, " 0 "))]
     longest = max(parts, key=len, default="")
     return longest if len(longest) >= WORDING_MIN_CHARS else ""
 
@@ -198,7 +237,9 @@ class SpanOccurrence:
         )
 
 
-def occurrences(questions: Sequence[Question], texts: Mapping[str, str]) -> list[SpanOccurrence]:
+def occurrences(
+    questions: Sequence[Question], texts: Mapping[str, str], window: int = DEFAULT_GAP_WINDOW
+) -> list[SpanOccurrence]:
     """Every span of every answering question with where it, and its wording, occur."""
     result = []
     for question in questions:
@@ -206,13 +247,17 @@ def occurrences(questions: Sequence[Question], texts: Mapping[str, str]) -> list
             continue
         expected = set(question.expected_doc_ids or ())
         for span in question.expected_spans:
-            needle, words = _squash(span), wording(span)
+            words = wording(span)
             result.append(
                 SpanOccurrence(
                     question.id,
                     span,
-                    {doc_id: texts[doc_id].count(needle) for doc_id in sorted(expected) if doc_id in texts},
-                    tuple(d for d, t in texts.items() if d not in expected and needle in t),
+                    {
+                        doc_id: len(locate(texts[doc_id], span, window))
+                        for doc_id in sorted(expected)
+                        if doc_id in texts
+                    },
+                    tuple(d for d, t in texts.items() if d not in expected and locate(t, span, window)),
                     tuple(d for d, t in texts.items() if d not in expected and words and words in t),
                 )
             )
@@ -227,7 +272,7 @@ def reachable(question: Question, chunks: Mapping[str, Sequence[str]]) -> tuple[
     needs one of its spans held by one chunk (not necessarily the same chunk for two groups).
     """
     texts = [_squash(text) for doc_id in question.expected_doc_ids or () for text in chunks.get(doc_id, ())]
-    held = {span: any(_squash(span) in text for text in texts) for span in question.expected_spans}
+    held = {span: any(span_held(text, _squash(span)) for text in texts) for span in question.expected_spans}
     missing = [span for span, ok in held.items() if not ok]
     if question.span_match == "all":
         groups = question.span_groups or tuple((span,) for span in question.expected_spans)
@@ -239,19 +284,19 @@ def check_reachable(
     questions: Sequence[Question], chunks: Mapping[str, Sequence[str]], label: str
 ) -> tuple[list[Problem], list[str]]:
     """The unreachable questions of one chunking ``label`` as problems, and the notes: spans no chunk
-    holds (one line each) and ``chunk-loss`` questions that have become reachable."""
+    holds (one line each) and the questions tagged ``chunk-loss`` or ``chunk-split`` now reachable."""
     problems: list[Problem] = []
     notes: list[str] = []
     for question in questions:
         if question.expected_behavior == "abstain":
             continue
         ok, missing = reachable(question, chunks)
-        lost = CHUNK_LOSS_TAG in question.tags
+        lost = next((tag for tag in UNREACHABLE_TAGS if tag in question.tags), None)
         notes.extend(f"{question.id} {span[:60]!r}: held by no {label} chunk" for span in missing)
-        if not ok and not lost:
+        if not ok and lost is None:
             problems.append(Problem(question.id, None, f"no {label} chunk holds a span (unreachable)"))
-        elif ok and lost:
-            notes.append(f"{question.id}: tagged {CHUNK_LOSS_TAG} but reachable with {label} chunks")
+        elif ok and lost is not None:
+            notes.append(f"{question.id}: tagged {lost} but reachable with {label} chunks")
     return problems, notes
 
 
@@ -354,15 +399,19 @@ class Difficulty:
 
 
 def difficulty(
-    question: Question, texts: Mapping[str, str], shingles: Mapping[str, set] | None = None
+    question: Question,
+    texts: Mapping[str, str],
+    shingles: Mapping[str, set] | None = None,
+    window: int = DEFAULT_GAP_WINDOW,
 ) -> Difficulty:
     """The factors of an answering ``question``: the criteria of ``eval/filings_README.md``.
 
     Overlap: the share of the question's content words (stop words, issuer names and years left out,
     light stemming) within :data:`OVERLAP_WINDOW` characters of its best span. Exposure: how many
-    filings of the issuer, not expected, repeat the wording of its first span (:data:`SHINGLE_SHARE`
-    of its shingles, figures masked). Table: tagged ``table``. No year: no year in the question while
-    the template recurs, or "latest". Multi: ``span_match`` is ``all``.
+    filings of the issuers of its expected filings, not expected themselves, repeat the wording of
+    one of its spans (:data:`SHINGLE_SHARE` of that span's shingles, figures masked). Table: tagged
+    ``table``. No year: no year in the question while the template recurs, or "latest". Multi:
+    ``span_match`` is ``all``.
     """
     if shingles is None:
         shingles = {doc_id: _shingles(text) for doc_id, text in texts.items()}
@@ -370,21 +419,20 @@ def difficulty(
     expected = set(question.expected_doc_ids or ())
     overlap = 0.0
     for span in question.expected_spans:
-        needle = _squash(span)
         for doc_id in expected & texts.keys():
-            at = texts[doc_id].find(needle)
-            if at >= 0 and wanted:
-                window = texts[doc_id][max(0, at - OVERLAP_WINDOW) : at + len(needle) + OVERLAP_WINDOW]
-                overlap = max(overlap, len(wanted & _content_words(window)) / len(wanted))
-    first = _shingles(_squash(question.expected_spans[0])) if question.expected_spans else set()
-    issuer = (question.expected_doc_ids or ("",))[0].split("-")[0]
+            found = locate(texts[doc_id], span, window)
+            if found and wanted:
+                start, end = found[0]
+                around = texts[doc_id][max(0, start - OVERLAP_WINDOW) : end + OVERLAP_WINDOW]
+                overlap = max(overlap, len(wanted & _content_words(around)) / len(wanted))
+    spans = [grams for grams in (_shingles(_squash(span)) for span in question.expected_spans) if grams]
+    issuers = {doc_id.split("-")[0] for doc_id in expected}
     exposure = sum(
         1
         for doc_id in texts
-        if first
-        and doc_id not in expected
-        and doc_id.startswith(f"{issuer}-")
-        and len(first & shingles[doc_id]) / len(first) >= SHINGLE_SHARE
+        if doc_id not in expected
+        and doc_id.split("-")[0] in issuers
+        and any(len(grams & shingles[doc_id]) / len(grams) >= SHINGLE_SHARE for grams in spans)
     )
     no_year = not re.search(r"20\d\d", question.question) and (
         exposure >= 1 or "latest" in question.question.lower()
@@ -400,12 +448,15 @@ def check(
     *,
     min_chars: int = DEFAULT_MIN_CHARS,
     max_per_filing: int = DEFAULT_MAX_PER_FILING,
+    window: int = DEFAULT_GAP_WINDOW,
 ) -> list[Problem]:
     """The problems of every question, in file order."""
     return [
         problem
         for question in questions
-        for problem in check_question(question, texts, min_chars=min_chars, max_per_filing=max_per_filing)
+        for problem in check_question(
+            question, texts, min_chars=min_chars, max_per_filing=max_per_filing, window=window
+        )
     ]
 
 
@@ -416,6 +467,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--min-chars", type=int, default=DEFAULT_MIN_CHARS, help="shortest span accepted")
     p.add_argument(
         "--max-per-filing", type=int, default=DEFAULT_MAX_PER_FILING, help="most occurrences in one filing"
+    )
+    p.add_argument(
+        "--gap-window",
+        type=int,
+        default=DEFAULT_GAP_WINDOW,
+        help="characters before its last fragment within which a '[...]' span's other fragments must sit",
     )
     p.add_argument("--require-difficulty", action="store_true", help="every question must carry a difficulty")
     p.add_argument("--report", action="store_true", help="also print where every span and its wording occur")
@@ -446,18 +503,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     questions = load_questions(args.questions)
     texts = load_markdown(args.filings)
-    problems = check(questions, texts, min_chars=args.min_chars, max_per_filing=args.max_per_filing)
+    problems = check(
+        questions, texts, min_chars=args.min_chars, max_per_filing=args.max_per_filing, window=args.gap_window
+    )
     if args.require_difficulty:
         problems.extend(Problem(q.id, None, "no difficulty") for q in questions if q.difficulty is None)
     if args.report:
-        for occurrence in occurrences(questions, texts):
+        for occurrence in occurrences(questions, texts, args.gap_window):
             print(occurrence.format())
     if args.difficulty:
         shingles = {doc_id: _shingles(text) for doc_id, text in texts.items()}
         for question in questions:
             if question.expected_behavior == "abstain":
                 continue
-            rated = difficulty(question, texts, shingles)
+            rated = difficulty(question, texts, shingles, args.gap_window)
             print(
                 f"{question.id}: overlap {rated.overlap:.2f}, {', '.join(rated.factors) or 'no factor'}"
                 f"{', all' if rated.multi else ''} -> {rated.label}"
@@ -492,7 +551,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         print(note)
                 else:
                     for note in notes:
-                        if CHUNK_LOSS_TAG in note:
+                        if any(f"tagged {tag} " in note for tag in UNREACHABLE_TAGS):
                             print(note)
     for problem in problems:
         print(problem.format())

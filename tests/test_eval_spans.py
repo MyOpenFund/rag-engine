@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from rag_engine.eval import (
+    SPAN_GAP,
     EvalError,
     PassageReport,
     PassageResult,
@@ -17,6 +18,7 @@ from rag_engine.eval import (
     QuestionSet,
     evaluate_passages,
     load_questions,
+    span_held,
     span_hit,
 )
 from rag_engine.search import Hit
@@ -650,7 +652,7 @@ def test_span_checker_new_rules(tmp_path, capsys):
 def test_the_committed_v2_set_is_well_formed():
     questions = load_questions(EVAL / "filings_v2.jsonl")
     ids = [q.id for q in questions]
-    assert len(ids) == len(set(ids)) and 80 <= len(ids) <= 90
+    assert len(ids) == len(set(ids)) and 80 <= len(ids) <= 95
     assert all(q.difficulty in ("easy", "medium", "hard") for q in questions)
     abstaining = [q for q in questions if q.expected_behavior == "abstain"]
     assert 0.07 <= len(abstaining) / len(questions) <= 0.13
@@ -661,14 +663,19 @@ def test_the_committed_v2_set_is_well_formed():
         assert low <= sum(q.difficulty == difficulty for q in questions) / len(questions) <= high
     tables = [q for q in questions if "table" in q.tags]
     assert len(tables) >= 8
-    for question in tables:  # a table span carries its year header row (v2.1), except a later group of "all"
-        heads = question.span_groups if question.span_match != "all" else question.span_groups[:1]
-        assert all(re.match(r"(20\d\d|Thereafter)\b", span) for group in heads for span in group)
+    for question in tables:  # every fact has a span "year row [...] answer row" (v2.2)
+        for group in question.span_groups:
+            assert any(re.match(r"20\d\d\b", span) and SPAN_GAP in span for span in group)
+    for question in questions:
+        if "table-alt" in question.tags:  # table rows are alternatives: a prose span answers too
+            assert "table" not in question.tags and any("|" not in span for span in question.expected_spans)
+        elif "table" not in question.tags:
+            assert not any(SPAN_GAP in span for span in question.expected_spans)
     for question in questions:
         if question.expected_behavior == "abstain":
             assert not question.expected_spans and any(t.startswith("absent") for t in question.tags)
             continue
-        assert 1 <= len(question.expected_spans) <= 8 and question.expected_doc_ids
+        assert 1 <= len(question.expected_spans) <= 10 and question.expected_doc_ids
         if question.span_match == "all":  # two or three facts, each with its alternatives
             assert question.difficulty == "hard" and 2 <= len(question.span_groups) <= 3
     twins = [q for q in questions if "twin" in q.tags]
@@ -680,6 +687,8 @@ def test_the_committed_v2_set_is_well_formed():
     assert len(twins) >= 6
     lost = [q for q in questions if "chunk-loss" in q.tags]
     assert len(lost) == 2 and all("chunk-loss" in (q.rationale or "") for q in lost)
+    split = [q for q in questions if "chunk-split" in q.tags]
+    assert len(split) == 2 and all("chunk-split" in (q.rationale or "") and "table" in q.tags for q in split)
     issuers_years = {
         (t1, t2)
         for q in questions
@@ -876,3 +885,130 @@ def test_span_checker_measures_difficulty(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "u: difficulty 'hard', the factors give 'easy'" in out
     assert "y: overlap" in out and not any(line.startswith("y: difficulty") for line in out.splitlines())
+
+
+def test_span_gap_needs_every_fragment_in_one_passage_in_order():
+    table = "|  | 2024 | | 2025 |\n| Land | 1 | | 2 |\n| Buildings | 3 | | 4 |\n| Capex | (5) | | (6) |"
+    span = "2024 | | 2025 [...] | Capex | (5) | | (6)"
+    assert span_hit(table, [span])
+    assert span_hit(table.replace("Buildings", "Leasehold improvements"), [span])  # rows between: any
+    assert not span_hit("| Capex | (5) | | (6) |\n| 2024 | | 2025 |", [span])  # order matters
+    assert not span_hit("| Capex | (5) | | (6) |", [span])  # cut from its years
+    assert span_held("a b c", "a [...] c") and not span_held("a b c", "c [...] a")
+    assert not span_held("a b", "a [...] a")  # fragments do not overlap
+    assert span_hit("x [...] y", ["x [...] y"]) and not span_hit("abc", [""])
+    with pytest.raises(EvalError, match="blank fragment"):
+        _question("q", ("2024 [...] ",))
+    q = _question("q", (span,))
+    years, row = _hit("| 2024 | | 2025 |"), _hit("| Capex | (5) | | (6) |")
+    assert evaluate_passages([q], lambda _q: [years, row]).results[0].rank is None  # two passages: no hit
+    assert evaluate_passages([q], lambda _q: [years, _hit(table)]).results[0].rank == 2
+
+
+def test_span_checker_locates_gap_spans_within_a_window(tmp_path):
+    checker = _checker()
+    filler = " ".join(f"w{i}" for i in range(400))
+    text = checker._squash(
+        f"| 2024 | 2025 |\n| Land | 1 | 2 |\n| Capex | 5 | 6 |\n{filler}\n| Capex | 5 | 6 |"
+    )
+    span = "2024 | 2025 [...] | Capex | 5 | 6 |"
+    assert len(checker.locate(text, span)) == 2
+    assert len(checker.locate(text, span, window=100)) == 1  # the second row is far from any year row
+    start, end = checker.locate(text, span)[0]
+    assert text[start:].startswith("2024 | 2025") and text[:end].endswith("| capex | 5 | 6 |")
+    assert checker.locate(text, "| Land | 1 | 2 |") == [(text.index("| land"), text.index("| land") + 16)]
+    (tmp_path / "a-2024.md").write_text(f"| 2024 | 2025 |\n| Capex | 5 | 6 |\n{filler}", encoding="utf-8")
+    (tmp_path / "a-2023.md").write_text("| 2023 | 2024 |\n| Capex | 5 | 6 |", encoding="utf-8")
+    texts = checker.load_markdown(tmp_path)
+    q = Question(
+        id="g",
+        question="q?",
+        expected_doc_ids=("a-2024",),
+        expected_spans=("2024 | 2025 [...] | Capex | 5 | 6",),
+    )
+    assert checker.check_question(q, texts) == []  # the other filing has the row, not the years
+    q2 = Question(id="h", question="q?", expected_doc_ids=("a-2023",), expected_spans=("| Capex | 5 | 6 |",))
+    assert [p.reason for p in checker.check_question(q2, texts, min_chars=5)] == [
+        "also in filings not expected: a-2024"
+    ]
+    assert checker.reachable(q, {"a-2024": ["| 2024 | 2025 |", "| Capex | 5 | 6 |"]})[0] is False
+    assert checker.reachable(q, {"a-2024": ["| 2024 | 2025 | x | Capex | 5 | 6 |"]})[0] is True
+
+
+def test_span_checker_exposure_reads_every_span_and_issuer(tmp_path):
+    checker = _checker()
+    (tmp_path / "acme-2024.md").write_text(
+        "The Widget Labs stake was sold for $3.0 billion. Capital expenditures were $9.1 billion in 2024.",
+        encoding="utf-8",
+    )
+    (tmp_path / "acme-2023.md").write_text(
+        "Capital expenditures were $7.4 billion in 2023.", encoding="utf-8"
+    )
+    (tmp_path / "beta-2024.md").write_text(
+        "Beta repurchased shares for $1.0 billion in 2024.", encoding="utf-8"
+    )
+    (tmp_path / "beta-2023.md").write_text(
+        "Beta repurchased shares for $2.0 billion in 2023.", encoding="utf-8"
+    )
+    texts = checker.load_markdown(tmp_path)
+    q = Question(
+        id="e", question="q?", expected_doc_ids=("acme-2024",),
+        expected_spans=("The Widget Labs stake was sold", "Capital expenditures were $9.1 billion in 2024"),
+    )  # fmt: skip
+    assert checker.difficulty(q, texts).exposure == 1  # the second span's wording is in acme-2023
+    both = Question(
+        id="b", question="q?", expected_doc_ids=("acme-2024", "beta-2024"),
+        expected_spans=("The Widget Labs stake was sold", "Beta repurchased shares for $1.0 billion"),
+        span_match="all",
+    )  # fmt: skip
+    assert checker.difficulty(both, texts).exposure == 1  # beta-2023: the second issuer counts too
+
+
+def test_filings_eval_excludes_tags_from_a_second_headline(tmp_path, capsys):
+    script = _script()
+    questions = [
+        _question("a", ("x",)),
+        _question("b", ("y",), tags=("chunk-loss",)),
+        Question(
+            id="c", question="q?", expected_behavior="abstain", expected_doc_ids=(), tags=("chunk-loss",)
+        ),
+    ]
+    assert [q.id for q in script.without_tags(questions, ["chunk-loss"])] == ["a"]
+    assert [q.id for q in script.without_tags(questions, ["other"])] == ["a", "b", "c"]
+    with pytest.raises(ValueError, match="no answering question left"):
+        script.without_tags(questions[1:], ["chunk-loss"])
+    pytest.importorskip("chunknorris")  # the ingest extra (not installed on Python 3.10 in CI)
+    qfile = _synthetic_corpus(tmp_path)
+    rows = [json.loads(line) for line in qfile.read_text().splitlines()]
+    rows[0]["tags"] = ["chunk-loss"]
+    qfile.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    out = tmp_path / "rows.json"
+    args = [
+        str(tmp_path),
+        str(qfile),
+        "--backend",
+        "fake",
+        "--resamples",
+        "50",
+        "--exclude-tag",
+        "chunk-loss",
+    ]
+    assert script.main([*args, "--json", str(out)]) == 0
+    printed = capsys.readouterr().out
+    answering = sum(1 for r in rows if r.get("expected_behavior") != "abstain")
+    assert f"without the questions tagged chunk-loss ({answering - 1} answering questions left)" in printed
+    for row in json.loads(out.read_text()):
+        assert row["excluding"]["tags"] == ["chunk-loss"]
+        assert row["excluding"]["report"]["questions"] == row["report"]["questions"] - 1
+
+
+def test_span_checker_chunk_split_is_expected_unreachable():
+    checker = _checker()
+    split = Question(
+        id="s", question="q?", expected_doc_ids=("d",), expected_spans=("2025 [...] | Capex | 5",),
+        tags=("table", "chunk-split"),
+    )  # fmt: skip
+    problems, notes = checker.check_reachable([split], {"d": ["| 2025 |", "| Capex | 5 |"]}, "v2/section")
+    assert not problems and notes == ["s '2025 [...] | Capex | 5': held by no v2/section chunk"]
+    problems, notes = checker.check_reachable([split], {"d": ["| 2025 | x | Capex | 5 |"]}, "v1/section")
+    assert not problems and notes == ["s: tagged chunk-split but reachable with v1/section chunks"]
