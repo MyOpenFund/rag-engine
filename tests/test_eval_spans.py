@@ -359,6 +359,37 @@ def test_load_filings_reads_and_checks_sections(tmp_path):
             script.load_filings(tmp_path)
 
 
+def test_filing_title_is_the_mcp_title():
+    """The no-vault MCP's `filing_title` (ruling R40): the chunk context, so the eval must match it."""
+    script = _script()
+    assert script.filing_title("AMAZON COM INC", "10-K", "2022-12-31", "2023-02-03") == (
+        "AMAZON COM INC 10-K for the period ended 2022-12-31, filed 2023-02-03"
+    )
+    without_period = script.filing_title("AMAZON COM INC", "8-K", None, "2023-02-03")
+    assert without_period == "AMAZON COM INC 8-K, filed 2023-02-03"
+
+
+def test_load_filings_builds_the_title_from_the_company(tmp_path):
+    script = _script()
+    (tmp_path / "d.md").write_text("0123456789", encoding="utf-8")
+    meta = {"company": "MICROSOFT CORP", "form": "10-K", "date": "2024-07-30", "report_date": "2024-06-30"}
+    (tmp_path / "d.json").write_text(json.dumps(meta), encoding="utf-8")
+    title = "MICROSOFT CORP 10-K for the period ended 2024-06-30, filed 2024-07-30"
+    assert script.load_filings(tmp_path)[0].title == title
+    del meta["report_date"]
+    (tmp_path / "d.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert script.load_filings(tmp_path)[0].title == "MICROSOFT CORP 10-K, filed 2024-07-30"
+    meta["title"] = "Microsoft 10-K FY2024"  # a title that is not the built one: refused, not silently used
+    (tmp_path / "d.json").write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="title"):
+        script.load_filings(tmp_path)
+    meta.pop("title")
+    meta.pop("company")
+    (tmp_path / "d.json").write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="title or company"):
+        script.load_filings(tmp_path)
+
+
 def test_filings_eval_section_cut_end_to_end(tmp_path, capsys):
     script = _script()
     qfile = _synthetic_corpus(tmp_path)

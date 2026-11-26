@@ -16,9 +16,14 @@ copied from the Markdown and passes `scripts/check_filings_eval.py` (below).
 The filings are not in the repository (full 10-K texts). They are fetched with company-corpus's live
 code (`company_corpus.live.filings.fetch_submissions` / `list_filings`, form `10-K`, report dates
 2022-01-01 to 2025-12-31, then `company_corpus.live.documents.filing_document`) and written as
-`<doc_id>.md` (`FilingDocument.markdown`) with a `<doc_id>.json` sidecar: `title`, `form`, `date`
-(filing date), `doc_id`, `url`, `cik` and `sections` (`[{"name", "start", "end"}]`, the
-`FilingDocument.sections`). The doc ids are `<ticker>-10k-fy<YYYY>`, the fiscal year being the year
+`<doc_id>.md` (`FilingDocument.markdown`) with a `<doc_id>.json` sidecar: `company` (the SEC name
+as EDGAR gives it, e.g. `AMAZON COM INC`), `form`, `date` (filing date), `report_date`, `doc_id`,
+`url`, `cik` and `sections` (`[{"name", "start", "end"}]`, the `FilingDocument.sections`). The
+script titles each filing as the no-vault MCP titles its chunks (`filing_title`, ruling R40):
+`<company> <form> for the period ended <report_date>, filed <date>`, e.g. `AMAZON COM INC 10-K for
+the period ended 2022-12-31, filed 2023-02-03`. Under v2 the title is the chunk context (embedded
+and indexed for BM25), so another title would measure another configuration than the one that
+ships; a sidecar `title` that differs from the built one is refused. The doc ids are `<ticker>-10k-fy<YYYY>`, the fiscal year being the year
 of the report date (Microsoft's ends on 30 June, Oracle's on 31 May, the others' on 31 December).
 
 ## Question format
@@ -30,12 +35,13 @@ JSON Lines, the format of `README.md` (version 2) plus one optional field:
 | `expected_spans` | A list of 1 to 3 short, distinct, verbatim texts of the filing that answer the question. |
 
 ```json
-{"id": "msft-fy24-cash", "question": "How much cash, cash equivalents and short-term investments did Microsoft hold at the end of fiscal 2024?", "expected_doc_ids": ["msft-10k-fy2024"], "expected_spans": ["Cash, cash equivalents, and short-term investments totaled $75.5 billion"], "kind": "factual", "tags": ["issuer:msft", "fy:2024"], "filters": {"doc_ids": ["msft-10k-fy2024"]}}
-{"id": "abs-01", "question": "What dividend per share did Oracle declare for fiscal 2031?", "expected_behavior": "abstain", "expected_doc_ids": []}
+{"id": "msft-fy24-cash", "question": "How much cash, cash equivalents and short-term investments did Microsoft hold at the end of fiscal 2024?", "expected_behavior": "answer", "expected_doc_ids": ["msft-10k-fy2024"], "expected_spans": ["Cash, cash equivalents, and short-term investments totaled $75.5 billion"], "kind": "liquidity", "tags": ["issuer:msft", "fy:2024", "section:item7"], "language": "en", "rationale": "Item 7, Liquidity and Capital Resources, Cash, Cash Equivalents, and Investments."}
+{"id": "abs-01", "question": "What dividend per share did Oracle declare for fiscal 2031?", "expected_behavior": "abstain", "expected_doc_ids": [], "kind": "abstention", "tags": ["abstain"], "language": "en", "rationale": "Future fiscal year: no 10-K covers it."}
 ```
 
 - `expected_doc_ids` names the filing(s) that hold the spans (the `<doc_id>` of the Markdown file).
-  `filters` may restrict the search to them; an unfiltered question is harder and says more.
+  No question of `filings_v1.jsonl` has `filters`: the search must find the issuer and the year
+  itself (the README format allows `filters`, which would make a question easier and say less).
 - A question that abstains (`expected_behavior: "abstain"`) carries no span. It is searched, never
   scored, and reported apart with the score of its first passage.
 - Files of the older versions still load and score exactly as before; `expected_spans` is ignored by
@@ -82,8 +88,8 @@ python scripts/filings_eval.py FILINGS_DIR eval/filings_v1.jsonl --backend onnx 
     --sweep-threshold 0.5,0.65,0.8 --sweep-keep-top 0,1,2 --sweep-solver milp,lp_greedy --json out.json
 ```
 
-`FILINGS_DIR` holds `<doc_id>.md` and `<doc_id>.json` (`{"title", "form", "date"}`, plus
-`sections` for the per-section cut). The script builds one local index per chunking profile and cut
+`FILINGS_DIR` holds `<doc_id>.md` and `<doc_id>.json` (`{"company", "form", "date", "report_date"}`,
+or a `title` instead of `company`, plus `sections` for the per-section cut). The script builds one local index per chunking profile and cut
 in a temporary directory and scores the matrix
 
 | chunking | retrieval |

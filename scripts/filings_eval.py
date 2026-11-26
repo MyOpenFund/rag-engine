@@ -2,7 +2,7 @@
 """Passage-level evaluation of the local index on SEC filings: chunking x retrieval.
 
 For a directory of Markdown filings (``<doc_id>.md`` and a sidecar ``<doc_id>.json`` holding
-``title``, ``form`` and ``date``) and a question file with ``expected_spans``
+``company`` or ``title``, ``form`` and ``date``) and a question file with ``expected_spans``
 (``eval/filings_README.md``), the script builds one local index per chunking profile (v1 and v2) in
 a temporary directory, runs every question through dense, hybrid and hybrid + eigenmind retrieval,
 and prints hit@5, hit@10 and MRR@10 with intervals, the seconds each 10-K took to index, and the
@@ -107,30 +107,59 @@ class Row:
     params: dict[str, Any] = field(default_factory=dict)
 
 
+def filing_title(company: str, form: str, report_date: str | None, filed: str | None) -> str:
+    """The title the no-vault MCP gives a filing's chunks, which is their context (embedded and
+    FTS-indexed): ``<company> <form> for the period ended <report_date>, filed <filed>``, ISO
+    dates, a missing date leaving its clause out. It mirrors ``myopenfund_mcp.filings.indexer.
+    filing_title`` (ruling R40): keep the two in step, or the eval no longer measures what ships."""
+    title = f"{company} {form}"
+    if report_date:
+        title += f" for the period ended {report_date}"
+    if filed:
+        title += f", filed {filed}"
+    return title
+
+
 def load_filings(directory: str | Path) -> list[Filing]:
     """Every ``<doc_id>.md`` of ``directory`` with its ``<doc_id>.json`` sidecar, sorted by id.
 
-    The sidecar holds ``title``, ``form`` and ``date`` (``YYYY-MM-DD``), all required, and may
-    hold ``sections`` (a list of ``{"name", "start", "end"}``, character offsets into the
-    Markdown) for ``--cuts section``. ``ValueError`` names the file when one is missing or
-    malformed, or the directory holds no filing.
+    The sidecar holds ``form`` and ``date`` (the filing date, ``YYYY-MM-DD``), both required, and
+    ``company`` (the SEC name, e.g. ``AMAZON COM INC``) or ``title``. With ``company``, the title is
+    built as the MCP builds it (``filing_title``, with the optional ``report_date``); a ``title``
+    given too must equal it. It may hold ``sections`` (a list of ``{"name", "start", "end"}``,
+    character offsets into the Markdown) for ``--cuts section``. ``ValueError`` names the file when
+    one is missing or malformed, or the directory holds no filing.
     """
     root = Path(directory)
     filings = []
     for path in sorted(root.glob("*.md")):
         sidecar = path.with_suffix(".json")
         if not sidecar.is_file():
-            raise ValueError(f"{path}: no sidecar {sidecar.name} (title, form, date)")
+            raise ValueError(f"{path}: no sidecar {sidecar.name} (company or title, form, date)")
         meta = json.loads(sidecar.read_text(encoding="utf-8"))
-        missing = [key for key in ("title", "form", "date") if not isinstance(meta.get(key), str)]
+        missing = [key for key in ("form", "date") if not isinstance(meta.get(key), str)]
         if missing:
             raise ValueError(f"{sidecar}: missing or not a string: {', '.join(missing)}")
+        title = _title(sidecar, meta)
         text = path.read_text(encoding="utf-8")
         sections = _sections(sidecar, meta, len(text))
-        filings.append(Filing(path.stem, text, meta["title"], meta["form"], meta["date"], sections))
+        filings.append(Filing(path.stem, text, title, meta["form"], meta["date"], sections))
     if not filings:
         raise ValueError(f"{root}: no Markdown filing")
     return filings
+
+
+def _title(sidecar: Path, meta: dict[str, Any]) -> str:
+    company, title = meta.get("company"), meta.get("title")
+    if not isinstance(company, str):
+        if isinstance(title, str):
+            return title
+        raise ValueError(f"{sidecar}: missing or not a string: title or company")
+    report_date = meta.get("report_date") if isinstance(meta.get("report_date"), str) else None
+    built = filing_title(company, meta["form"], report_date, meta["date"])
+    if title is not None and title != built:
+        raise ValueError(f"{sidecar}: title {title!r} is not the MCP title {built!r} of its company")
+    return built
 
 
 def _sections(sidecar: Path, meta: dict[str, Any], length: int) -> tuple[tuple[str, int, int], ...] | None:
