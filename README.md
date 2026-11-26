@@ -646,6 +646,10 @@ The defaults are the values the old engine ran with (ChunkNorris's own defaults)
 
 A `.txt` or `.md` file that is not valid UTF-8 is still read: each invalid byte sequence becomes `�` (U+FFFD) and a warning is logged.
 
+Markdown (`.md`, `.txt`, `.pptx` through MarkItDown, and `chunk_markdown`) loses no word on `---` lines, which ChunkNorris alone drops in two cases. **Front matter is not read**: a text that starts with `---` (a page break, a section cut at an offset, a YAML header) is kept whole, and a YAML header is plain text, its closing `---` a thematic break, not the underline of a heading. **A rule glued to text** (`---UNITED STATES`, `--- ---foo`), or a rule under a rule, keeps the text: the rule is split from it. Code fences are left alone, and a text without such lines is chunked exactly as before.
+
+Known limit: a **pure** `---` (or `===`) directly under a paragraph is a setext underline, as in any Markdown: the paragraph becomes a heading, as ChunkNorris always made it (a converted filing whose page break follows a paragraph without a blank line). Its words are kept in v1. In v2 a heading leaves the text of its chunks for their `context`, and `context_max_tokens` cuts a long one there: the words past the cut are in no chunk (as in 0.2.0). A paragraph of 300 words above a page break loses about 180 of them.
+
 OCR applies to PDF only, with one of three modes:
 
 | `ocr` | Behaviour |

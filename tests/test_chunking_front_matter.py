@@ -164,7 +164,7 @@ def _random_document(rng: random.Random) -> str:
         if kind < 0.35:
             lines.append(rng.choice(["---", "-----", "", "===", " ---", "--- ---"]))
         elif kind < 0.45:
-            rule = rng.choice(["---", "----", "===", "--- "])
+            rule = rng.choice(["---", "----", "===", "--- ", "--- ---", "---===", "=== --- ", "--- --- "])
             lines.append(rule + " ".join(rng.choices(vocabulary, k=rng.randint(1, 5))))
         else:
             lines.append(" ".join(rng.choices(vocabulary, k=rng.randint(1, 60))))
@@ -178,3 +178,146 @@ def _random_document(rng: random.Random) -> str:
 def test_random_paragraphs_and_rules_lose_no_word(profile, seed):
     text = _random_document(random.Random(seed))
     assert _missing_words(text, _chunk(text, profile)) == [], text
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+@pytest.mark.parametrize(
+    "line",
+    ["--- ---foo bar", "---===foo bar", "=== --- foo bar", "=== === foo", "--- --- Page 3", "--- ---\tfoo"],
+)
+def test_a_rule_glued_to_another_rule_and_text_keeps_every_word(profile, line):
+    # Split once, the text left ("---foo bar") is itself a rule under the rule split off: it
+    # needs the same check, else the line above and the glued text are both lost.
+    text = f"Intro alpha.\n{line}\nNext beta.\n"
+    assert _missing_words(text, _chunk(text, profile)) == []
+
+
+def _parsed(text: str) -> str:
+    from chunknorris.parsers import MarkdownParser
+
+    from rag_engine.chunking import _parse_markdown
+
+    return _parse_markdown(MarkdownParser, text).to_string()
+
+
+YAML_HEADER = "---\ntitle: Foxtrot Annual Report\ntags: alpha, bravo\n---\nIndia body paragraph here.\n"
+
+
+def test_yaml_front_matter_does_not_turn_its_last_key_into_a_heading():
+    # Decision: the header is plain text. Its closing --- is a thematic break, not a setext
+    # underline under "tags: ...".
+    parsed = _parsed(YAML_HEADER)
+    assert not [line for line in parsed.splitlines() if line.startswith("#")], parsed
+    assert "tags: alpha, bravo" in parsed and "India body paragraph here." in parsed
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_yaml_front_matter_keys_are_in_no_heading_context(profile):
+    chunks = _chunk(YAML_HEADER, profile)
+    assert _missing_words(YAML_HEADER, chunks) == []
+    for chunk in chunks:
+        assert "tags" not in (chunk.context or ""), chunk.context
+        assert not [line for line in chunk.text.splitlines() if line.startswith("#")], chunk.text
+
+
+def test_a_page_break_cut_does_not_make_a_heading_of_the_line_above_its_second_break():
+    parsed = _parsed(PAGE_BREAK_CUT)
+    assert not [line for line in parsed.splitlines() if line.startswith("#")], parsed
+
+
+def test_a_setext_heading_stays_a_heading():
+    assert _parsed("Real Heading\n---\nBody words alpha beta.\n").splitlines()[0] == "## Real Heading"
+    assert _parsed("Real Heading\n===\nBody words alpha beta.\n").splitlines()[0] == "# Real Heading"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Intro alpha.\n\n| a | b |\n|---|---|\n| 1 | 2 |",
+        "a | b\n--- | ---\none | two",
+        "Intro.\n```\ncode line\n---not split\n```\nAfter.",
+    ],
+    ids=["pipe-table", "table-without-pipes", "code-fence"],
+)
+def test_tables_and_code_fences_are_left_alone(text):
+    from rag_engine.chunking import _markdown_for_parser
+
+    assert _markdown_for_parser(text) == text
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_a_glued_rule_inside_a_code_fence_keeps_its_words_through_chunk_markdown(profile):
+    text = "Intro alpha.\n```\ncode line gamma\n---kept delta\n```\nAfter epsilon.\n"
+    assert _missing_words(text, _chunk(text, profile)) == []
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "---\r\npage one alpha\r\n---\r\npage two beta\r\n",
+        "Intro alpha\r\n---GLUED gamma\r\nbeta\r\n",
+        "Intro alpha\r\n--- ---foo gamma\r\nbeta\r\n",
+    ],
+    ids=["leading", "glued", "glued-twice"],
+)
+def test_crlf_text_keeps_its_words(profile, text):
+    assert _missing_words(text, _chunk(text, profile)) == []
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_a_rule_left_after_the_parser_removes_a_base64_image_keeps_the_first_page(profile):
+    # ChunkNorris removes base64 images first: the text then starts with the --- glued to it.
+    text = "data:image/png;base64,AAAA---\npage one alpha\n---\npage two beta\n"
+    assert {"page", "one", "alpha", "two", "beta"} <= _words(" ".join(c.text for c in _chunk(text, profile)))
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_chunk_file_keeps_glued_rule_text_of_a_pptx(tmp_path, profile):
+    pptx = pytest.importorskip("pptx")
+    pytest.importorskip("markitdown")
+    from pptx.util import Inches
+
+    deck = pptx.Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[5])
+    slide.shapes.title.text = "Deck title"
+    box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(5), Inches(2)).text_frame
+    box.text = "Alpha slide words here\n--- ---UNITED STATES Kilo\nBravo more words on the slide"
+    path = tmp_path / "deck.pptx"
+    deck.save(path)
+    chunks = chunk_file(path, options=PROFILES[profile], tokenizer=FakeTokenizer())
+    assert _missing_words(box.text, chunks) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "text\n" + "-" * 600_000 + "x\nmore\n",
+        "text\n" + "-" * 600_000 + "\nmore\n",
+        "text\n---" + "." * 600_000 + "\nmore\n",
+        "text\n" + "--- " * 150_000 + "foo\n",
+        "---\n" * 150_000 + "text\n",
+        "---\n\n" * 120_000 + "text\n",
+        "text\n" + "---\n" * 150_000,
+        ("word " * 40 + "\n---GLUED text here\n") * 2_800,
+    ],
+    ids=[
+        "dash-line-glued",
+        "dash-line",
+        "dash-punctuation",
+        "rule-groups",
+        "leading-rules",
+        "leading-rules-blank",
+        "stacked-rules",
+        "glued-every-other-line",
+    ],
+)
+def test_preprocessing_is_linear_on_pathological_input(text):
+    import time
+
+    from rag_engine.chunking import _markdown_for_parser
+
+    assert len(text) >= 600_000
+    start = time.perf_counter()
+    _markdown_for_parser(text)
+    assert time.perf_counter() - start < 1.0
