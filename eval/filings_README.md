@@ -26,6 +26,30 @@ and indexed for BM25), so another title would measure another configuration than
 ships; a sidecar `title` that differs from the built one is refused. The doc ids are `<ticker>-10k-fy<YYYY>`, the fiscal year being the year
 of the report date (Microsoft's ends on 30 June, Oracle's on 31 May, the others' on 31 December).
 
+## Results (provisional, pending the owner's validation of the set)
+
+ONNX `intfloat/multilingual-e5-base`, 4 CPU, `k = 10`, 43 answering questions, 1000 bootstrap draws;
+filings titled as the MCP titles them (`filing_title`, above). v1 does not put the title in its
+chunks (no context header), so its rows do not depend on it.
+
+| chunking | retrieval | hit@5 | hit@10 | MRR@10 | s/10-K |
+|---|---|---|---|---|---|
+| v1 | hybrid | 0.326 [0.19,0.47] | 0.419 [0.28,0.56] | 0.241 [0.13,0.34] | 46.7 |
+| v1/section | hybrid | 0.279 [0.16,0.42] | 0.349 [0.21,0.49] | 0.238 [0.13,0.35] | 34.4 |
+| v2 | dense | 0.558 [0.40,0.70] | 0.698 [0.56,0.81] | 0.397 [0.27,0.52] | 126.2 |
+| v2 | hybrid | 0.651 [0.51,0.79] | 0.767 [0.63,0.88] | 0.474 [0.35,0.59] | 126.2 |
+| v2/section | dense | 0.558 [0.40,0.70] | 0.651 [0.49,0.79] | 0.387 [0.26,0.51] | 120.3 |
+| **v2/section** (what the MCP ships) | **hybrid** | **0.698 [0.56,0.81]** | **0.767 [0.63,0.88]** | **0.452 [0.33,0.57]** | 120.3 |
+
+- **v2 >= v1** on hit@10 (hybrid): 0.419 -> 0.767 whole-document, 0.349 -> 0.767 per section
+  (per question: v2/section wins 18, v1/section wins 0).
+- **eigenmind stays off**: at its default threshold (0.65) hybrid+eigenmind gives the same metrics as
+  hybrid on every row (e5 cosines between candidates sit above the threshold, so the graph is one
+  clique); higher thresholds, swept on an earlier run with other titles, start selecting and lose.
+- Most of the 10 misses of v2/section hybrid are year confusions: adjacent 10-Ks carry near-identical
+  sentences with other figures. The five abstentions' top fused scores (0.029 to 0.033) are not
+  calibrated: no abstention threshold follows from them.
+
 ## Question format
 
 JSON Lines, the format of `README.md` (version 2) plus one optional field:
