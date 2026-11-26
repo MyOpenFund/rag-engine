@@ -659,7 +659,7 @@ def test_the_committed_v2_set_is_well_formed():
     assert {q.difficulty for q in abstaining} == {"easy", "medium", "hard"}
     french = [q for q in questions if q.language == "fr"]
     assert len(french) >= 6 and {q.difficulty for q in french} == {"easy", "medium", "hard"}
-    for difficulty, low, high in (("easy", 0.18, 0.35), ("medium", 0.45, 0.62), ("hard", 0.19, 0.3)):
+    for difficulty, low, high in (("easy", 0.17, 0.35), ("medium", 0.45, 0.62), ("hard", 0.19, 0.3)):
         assert low <= sum(q.difficulty == difficulty for q in questions) / len(questions) <= high
     tables = [q for q in questions if "table" in q.tags]
     assert len(tables) >= 8

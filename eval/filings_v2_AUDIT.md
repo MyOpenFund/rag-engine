@@ -222,7 +222,7 @@ Per question. "Alternatives" counts spans added by C1/C2 (not the table spans re
 
 ## v2.2: fixes of the second review
 
-A second review (Fable; probes against every filing of each question's issuer, prose and table rows,
+A second review (probes against every filing of each question's issuer, prose and table rows,
 and the chunks of both profiles and cuts) asked for changes. **v2.1 90 questions -> v2.2 92: 2 restored,
 37 changed (spans, filings, wording or label), 53 kept untouched.** Codes in the per-question table: C
 critical, I important, T table span rewritten as a gap span, m minor, D difficulty as measured.
@@ -302,3 +302,10 @@ Per question (changed or restored in v2.2; factors as in the v2.1 table):
 | msft-fy22-construction-commitments | 1 → 2 | - | hard → hard | OV 0.29 low, YT 3 | I: + contractual-obligations row 'Construction commitments(b) ... 8,518' (self-labelled; a balance of the filing's date, no year row) |
 | msft-fy25-capex-table-fr | - → 1 | restored | - (dropped) → hard | OV 0.20 low, TB | I: restored (dropped in v2.1), tagged chunk-split, gap span |
 | amzn-fy25-leases-not-commenced | - → 1 | restored | - (dropped) → medium | OV 0.57 mid, TB | I: restored (dropped in v2.1), tagged chunk-split, gap span |
+
+## v2.2 final check
+
+| Change | Detail |
+|---|---|
+| `meta-fy22-restructuring` | Restructuring summary table added as a gap span (`Data Center Assets [...] 1,341 [...] 1,495`): the most on-topic passage, in chunks holding no listed span. The checker then measures the question as medium (table), relabelled from easy. |
+| Test bounds | easy 17-35 % (the set is 16 / 55 / 21 = 17 / 60 / 23 %), rather than adding an easy question whose figure also sits in three filings' table rows. |

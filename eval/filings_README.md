@@ -157,9 +157,9 @@ every label against the criteria above (the audit lists each change and each que
 
 | | easy | medium | hard | all |
 |---|---|---|---|---|
-| answering | 15 | 52 | 18 | 85 |
+| answering | 14 | 53 | 18 | 85 |
 | abstention | 2 | 2 | 3 | 7 |
-| **all** | **17 (18 %)** | **54 (59 %)** | **21 (23 %)** | **92** |
+| **all** | **16 (17 %)** | **55 (60 %)** | **21 (23 %)** | **92** |
 | of which French | 1 | 3 | 6 | 10 |
 | of which a table answer (`table`) | 0 | 8 | 4 | 12 |
 | of which table rows as alternatives (`table-alt`) | 3 | 10 | 5 | 18 |
