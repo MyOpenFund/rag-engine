@@ -33,6 +33,8 @@ ENGINE_MODULES = [
     "rag_engine.chunking",
     "rag_engine.ingest",
     "rag_engine.search",
+    "rag_engine.local",
+    "rag_engine.select",
     "rag_engine.eval",
     "rag_engine.eval_check",
     "rag_engine.cli",
@@ -216,6 +218,7 @@ PUBLIC_NAMES = {
         "CollectionMismatchError",
         "CollectionNotFoundError",
         "DateFieldsError",
+        "IndexLocked",
         "MissingIndexError",
         "QdrantAuthError",
         "QdrantStore",
@@ -253,6 +256,8 @@ PUBLIC_NAMES = {
         "UnsupportedFormatError",
         "check_ocr_languages",
         "chunk_file",
+        "chunk_markdown",
+        "load_tokenizer",
         "ocr_available",
     },
     "rag_engine.ingest": {"IngestResult", "ingest_document"},
@@ -265,6 +270,18 @@ PUBLIC_NAMES = {
         "is_searchable",
         "search",
     },
+    "rag_engine.local": {
+        "DATE_FILTER_MODE",
+        "DEFAULT_CANDIDATES",
+        "DEFAULT_MAX_TERMS",
+        "DEFAULT_RRF_K",
+        "LOCAL_KEYS",
+        "LocalIndex",
+        "collection_name",
+        "fts_query",
+        "hybrid_search",
+    },
+    "rag_engine.select": {"DEFAULT_THRESHOLD", "ROLES", "select_diverse"},
     "rag_engine.eval": {
         "BEHAVIORS",
         "BOOTSTRAP_SEED",
@@ -289,14 +306,19 @@ PUBLIC_NAMES = {
         "FilterEffect",
         "Means",
         "NotInCollection",
+        "PassageAbstention",
+        "PassageReport",
+        "PassageResult",
         "Question",
         "QuestionResult",
         "QuestionSet",
         "RankedDocument",
         "TopScores",
         "evaluate",
+        "evaluate_passages",
         "format_report",
         "load_questions",
+        "span_hit",
     },
     "rag_engine.eval_check": {
         "CatalogueEntry",
@@ -363,6 +385,23 @@ def test_the_onnx_extra_declares_what_the_backend_imports(pyproject):
     # fastembed, bounded to the minor version parity was measured on; and huggingface_hub, which
     # the backend imports itself (snapshot_download) and must not receive by chance.
     assert onnx == ["fastembed>=0.9,<0.10", "huggingface_hub>=0.20"]
+
+
+def test_the_local_extra_brings_the_onnx_backend_and_the_ingest_parsers(pyproject):
+    # The local index embeds with onnx and parses filings with the ingest extra; it needs no server.
+    assert pyproject["project"]["optional-dependencies"]["local"] == ["myopenfund-rag-engine[onnx,ingest]"]
+
+
+def test_the_graph_extra_bounds_eigenmind_to_0_2(pyproject):
+    # rag_engine.select runs eigenmind 0.2's Supported Diversity; 0.1 had another API.
+    assert pyproject["project"]["optional-dependencies"]["graph"] == ["eigenmind>=0.2,<0.3"]
+
+
+def test_the_test_job_installs_the_graph_extra():
+    # The eigenmind tests skip without it; the test job installs it on every Python version.
+    steps = _workflow(CI)["jobs"]["tests"]["steps"]
+    installs = [s["run"] for s in steps if s.get("run", "").startswith("pip install -e")]
+    assert len(installs) == 1 and '".[dev,graph' in installs[0]
 
 
 def test_the_installed_huggingface_hub_takes_the_arguments_the_backend_uses():
@@ -713,12 +752,13 @@ def test_ci_keeps_its_jobs_and_adds_package():
 
 def test_install_hints_name_the_published_distribution():
     # The PyPI name `rag-engine` belongs to another project: the hints must name ours.
-    from rag_engine import chunking, embedding
+    from rag_engine import chunking, embedding, select
 
     for hint, extra in (
         (embedding._TORCH_EXTRA, "torch"),
         (embedding._ONNX_EXTRA, "onnx"),
         (chunking._INSTALL_HINT, "ingest"),
+        (select._INSTALL_HINT, "graph"),
     ):
         assert f"'{DIST}[{extra}]'" in hint
         assert "'rag-engine[" not in hint

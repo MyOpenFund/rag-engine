@@ -25,11 +25,17 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from rag_engine.config import valid_ocr_languages
 from rag_engine.errors import RagEngineError
+
+if TYPE_CHECKING:
+    from chunknorris.chunkers.markdown_chunker import SupportsEncode
 
 __all__ = [
     "ENABLE_OCR_ENV",
@@ -46,6 +52,8 @@ __all__ = [
     "UnsupportedFormatError",
     "check_ocr_languages",
     "chunk_file",
+    "chunk_markdown",
+    "load_tokenizer",
     "ocr_available",
 ]
 
@@ -83,7 +91,9 @@ PDF_BODY_LINE_SPACING = None
 PDF_ENABLE_ML_FEATURES = False
 
 # ``MarkdownChunker`` can also split on a token count, given a tokenizer. The engine counts in
-# words only; passed by name for the same reason as above.
+# words only; passed by name for the same reason as above. The token cap of the v2 profile is
+# enforced by :func:`_enforce_token_cap` instead: ChunkNorris's own token split cuts a table
+# anywhere and does not repeat its header row.
 _CHUNKER_HARD_MAX_TOKEN_COUNT = None
 
 _INSTALL_HINT = "document parsing needs the ingest extra: pip install 'myopenfund-rag-engine[ingest]'"
@@ -97,10 +107,22 @@ class Chunk:
 
     ``text`` is the chunk as the chunker produced it. ``page`` is the page the chunk starts on,
     as numbered by ChunkNorris (from 0), or ``None`` for a format without pages.
+
+    ``context`` is the path of headings the chunk sits under, ``"<title> › <h1> › <h2> …"``;
+    ``None`` unless the chunking profile has ``context_header`` (v2). A chunk is embedded as
+    :attr:`embedded_text`, so that every consumer (indexing, token counting) agrees.
     """
 
     text: str
     page: int | None
+    context: str | None = None
+
+    @property
+    def embedded_text(self) -> str:
+        """The text to embed: ``context + "\\n\\n" + text``, ``text`` alone without a context."""
+        if self.context is None:
+            return self.text
+        return f"{self.context}\n\n{self.text}"
 
 
 @dataclass(frozen=True)
@@ -122,12 +144,69 @@ class ChunkingOptions:
     leaves the surplus (page, index) pairs of the old cut behind as stale points. A collection
     is to be ingested with one set of options; changing them requires a clean re-ingestion of
     the document set. ``ValueError`` for a value that cannot be used.
+
+    The four fields below are off by default: ``ChunkingOptions()`` is the v1 profile, the one
+    production collections were ingested with, and is byte-for-byte what it was. They make the
+    v2 profile (:meth:`v2`) and need a tokenizer (see :func:`chunk_markdown`):
+
+    - ``max_chunk_token_count``: hard maximum of tokens of an embedded chunk (its context
+      included), ``None`` for no token limit. It is checked with the tokenizer given by the
+      caller, so it needs to be the one of the embedding model.
+    - ``table_rows_per_chunk``: a markdown table longer than the cap is cut into chunks of this
+      many rows, each starting with the header row and the separator line. ``None``: as many
+      rows as fit under the cap. Only with ``max_chunk_token_count`` (refused otherwise: the
+      tables are cut by the token splitter alone).
+    - ``context_header``: each chunk carries ``context``, its path of headings, and the
+      heading lines at the top of its text are dropped (the context says the same).
+    - ``context_max_tokens``: most tokens a context may take. A longer one loses its middle
+      heading levels, then words of its last label and of its title, then characters, until it
+      fits. At most half of ``max_chunk_token_count`` (so at least half of the cap is left for the
+      text), and only with ``context_header``; both are refused otherwise.
+      ``None``: no limit of its own (it still has to leave room for text under the cap:
+      ``ValueError`` at chunking time when not even one character fits).
+    - ``overlap_tokens``: when one over-long block (a paragraph, a line, a table row) is cut in
+      windows of words, the end of a window is repeated at the start of the next, up to this
+      many tokens. There is no overlap between the pieces of a table, nor between paragraphs or
+      lines packed together; only between the windows of a single block.
+    - ``version``: a label of the profile, ``"v1"`` or ``"v2"``, for a collection to record
+      what it was ingested with. It changes nothing in the cut, and ``"v1"`` is refused when
+      any of the fields above is set, so the label cannot misstate the cut.
     """
 
     max_headers_to_use: str = "h4"
     max_chunk_word_count: int = 200
     hard_max_chunk_word_count: int = 400
     min_chunk_word_count: int = 15
+    max_chunk_token_count: int | None = None
+    table_rows_per_chunk: int | None = None
+    context_header: bool = False
+    overlap_tokens: int = 0
+    context_max_tokens: int | None = None
+    version: str = "v1"
+
+    @classmethod
+    def v2(cls) -> ChunkingOptions:
+        """The v2 profile: chunks that fit the 512-token window of e5-base, with a context.
+
+        - ``max_chunk_token_count=480``: 512 (the window of e5-base) minus 2 special tokens
+          minus a margin for the ``"passage: "`` prefix and for differences between token counts.
+        - ``table_rows_per_chunk=None``: a long table is split by tokens, the header row and the
+          separator line repeated in every piece.
+        - ``context_header=True``: the title and headings above a chunk are embedded with it.
+        - ``overlap_tokens=32``: overlap between the windows of an over-long block.
+        - ``context_max_tokens=120``: a quarter of the cap (the most allowed is half), so that the
+          context never crowds the text out.
+
+        A collection ingested with v1 needs a clean re-ingestion to move to v2.
+        """
+        return cls(
+            max_chunk_token_count=480,
+            table_rows_per_chunk=None,
+            context_header=True,
+            overlap_tokens=32,
+            context_max_tokens=120,
+            version="v2",
+        )
 
     def __post_init__(self) -> None:
         if self.max_headers_to_use not in HEADER_LEVELS:
@@ -147,6 +226,52 @@ class ChunkingOptions:
             raise ValueError(
                 f"max_chunk_word_count ({self.max_chunk_word_count}) must not exceed "
                 f"hard_max_chunk_word_count ({self.hard_max_chunk_word_count})"
+            )
+        for name, minimum, nullable in (
+            ("max_chunk_token_count", 8, True),
+            ("table_rows_per_chunk", 1, True),
+            ("overlap_tokens", 0, False),
+            ("context_max_tokens", 1, True),
+        ):
+            value = getattr(self, name)
+            if value is None and nullable:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"{name} must be an integer of at least {minimum}, got {value!r}")
+        if self.max_chunk_token_count is not None and self.overlap_tokens >= self.max_chunk_token_count:
+            raise ValueError(
+                f"overlap_tokens ({self.overlap_tokens}) must be below max_chunk_token_count "
+                f"({self.max_chunk_token_count})"
+            )
+        if (
+            self.max_chunk_token_count is not None
+            and self.context_max_tokens is not None
+            and self.context_max_tokens > self.max_chunk_token_count // 2
+        ):
+            raise ValueError(
+                f"context_max_tokens ({self.context_max_tokens}) must be at most half of "
+                f"max_chunk_token_count ({self.max_chunk_token_count}), so that at least half of the "
+                "cap is left for the text"
+            )
+        if self.table_rows_per_chunk is not None and self.max_chunk_token_count is None:
+            raise ValueError(
+                "table_rows_per_chunk cuts tables under the token cap: it needs max_chunk_token_count"
+            )
+        if self.context_max_tokens is not None and not self.context_header:
+            raise ValueError("context_max_tokens limits the context: it needs context_header=True")
+        if not isinstance(self.context_header, bool):
+            raise ValueError(f"context_header must be a bool, got {self.context_header!r}")  # noqa: TRY004
+        if not isinstance(self.version, str) or not self.version.strip():
+            raise ValueError(f"version must be a non-empty string, got {self.version!r}")
+        if self.version == "v1" and (
+            self.max_chunk_token_count is not None
+            or self.table_rows_per_chunk is not None
+            or self.context_header
+            or self.overlap_tokens
+            or self.context_max_tokens is not None
+        ):
+            raise ValueError(
+                'version "v1" is the profile without any v2 field: set version="v2" (or use v2())'
             )
 
 
@@ -211,6 +336,7 @@ def chunk_file(
     ocr: str = "auto",
     ocr_languages: str = "eng",
     options: ChunkingOptions | None = None,
+    tokenizer: SupportsEncode | None = None,
 ) -> list[Chunk]:
     """Parse the file at ``path`` and return its chunks, in document order.
 
@@ -237,7 +363,10 @@ def chunk_file(
     checked for every format, with the rule of the settings (:func:`check_ocr_languages`).
 
     ``options`` are the chunker's sizes, for every format; ``None`` means ``ChunkingOptions()``,
-    the values production documents were chunked with.
+    the values production documents were chunked with. ``tokenizer`` is needed when
+    ``options.max_chunk_token_count`` is set (``ValueError`` without), and ignored otherwise;
+    see :func:`chunk_markdown`. The context of a chunk then starts with the file's name, without
+    its extension.
 
     Chunks whose text is empty or whitespace are left out. A document with no extractable text
     (an empty file, a scanned PDF read without OCR) gives ``[]``.
@@ -256,6 +385,7 @@ def chunk_file(
         options = ChunkingOptions()
     elif not isinstance(options, ChunkingOptions):
         raise ValueError(f"options must be a ChunkingOptions or None, got {options!r}")
+    _check_tokenizer(options, tokenizer)
     filepath = os.fspath(path)
     ext = os.path.splitext(filepath)[1].lower()
     if ext not in SUPPORTED_EXTENSIONS:
@@ -298,24 +428,90 @@ def chunk_file(
         else:
             # .csv: the delimiter is detected by the parser.
             document = CSVParser().parse_file(filepath)
-        raw_chunks = MarkdownChunker(
-            max_headers_to_use=options.max_headers_to_use,
-            max_chunk_word_count=options.max_chunk_word_count,
-            hard_max_chunk_word_count=options.hard_max_chunk_word_count,
-            min_chunk_word_count=options.min_chunk_word_count,
-            hard_max_chunk_token_count=_CHUNKER_HARD_MAX_TOKEN_COUNT,
-        ).chunk(document)
+        raw_chunks = _markdown_chunker(MarkdownChunker, options).chunk(document)
     except TextNotFoundException:
         # ChunkNorris raises instead of returning nothing when a document has no text at all
         # (a PDF without a text layer read with OCR off, for instance). Not an error here.
         return []
 
+    title = os.path.splitext(os.path.basename(filepath))[0]
+    return _to_chunks(raw_chunks, options, title, tokenizer)
+
+
+def chunk_markdown(
+    text: str,
+    *,
+    options: ChunkingOptions | None = None,
+    title: str | None = None,
+    tokenizer: SupportsEncode | None = None,
+) -> list[Chunk]:
+    """Chunk a markdown string, in document order; no file is involved.
+
+    ``options`` as in :func:`chunk_file` (``None``: v1). ``tokenizer`` is any object with an
+    ``encode(text) -> list`` method (see :func:`load_tokenizer`); it is required when
+    ``options.max_chunk_token_count`` is set, and ``ValueError`` is raised without it.
+
+    With a token cap, no chunk has more than ``max_chunk_token_count`` tokens once embedded
+    (:attr:`Chunk.embedded_text`, the tokenizer's special tokens included). A chunk under the cap
+    is left as ChunkNorris cut it. A longer one is split: a markdown table into pieces that each
+    repeat its header row and separator line, other text by paragraphs, a paragraph longer than
+    the cap by windows of words with ``overlap_tokens`` of overlap. Pieces keep the page of the
+    chunk they come from.
+
+    With ``context_header``, ``title`` is the first element of ``Chunk.context`` (the first
+    heading is not repeated when it is the title); without a title the context is the headings.
+    """
+    if options is None:
+        options = ChunkingOptions()
+    elif not isinstance(options, ChunkingOptions):
+        raise ValueError(f"options must be a ChunkingOptions or None, got {options!r}")
+    _check_tokenizer(options, tokenizer)
+    try:
+        from chunknorris.chunkers import MarkdownChunker
+        from chunknorris.exceptions import TextNotFoundException
+        from chunknorris.parsers import MarkdownParser
+    except ImportError as error:
+        raise _missing_dependency(error) from error
+    try:
+        raw_chunks = _markdown_chunker(MarkdownChunker, options).chunk(MarkdownParser().parse_string(text))
+    except TextNotFoundException:
+        return []
+    return _to_chunks(raw_chunks, options, title, tokenizer)
+
+
+def _check_tokenizer(options: ChunkingOptions, tokenizer: object) -> None:
+    if tokenizer is None and (
+        options.max_chunk_token_count is not None or options.context_max_tokens is not None
+    ):
+        raise ValueError(
+            "max_chunk_token_count and context_max_tokens need a tokenizer "
+            "(see rag_engine.chunking.load_tokenizer); none was given"
+        )
+
+
+def _markdown_chunker(chunker_class, options: ChunkingOptions):
+    return chunker_class(
+        max_headers_to_use=options.max_headers_to_use,
+        max_chunk_word_count=options.max_chunk_word_count,
+        hard_max_chunk_word_count=options.hard_max_chunk_word_count,
+        min_chunk_word_count=options.min_chunk_word_count,
+        hard_max_chunk_token_count=_CHUNKER_HARD_MAX_TOKEN_COUNT,
+    )
+
+
+def _to_chunks(raw_chunks, options: ChunkingOptions, title: str | None, tokenizer) -> list[Chunk]:
+    """ChunkNorris chunks to :class:`Chunk` objects, applying the v2 steps the options ask for."""
     chunks: list[Chunk] = []
     for raw in raw_chunks:
         text = raw.get_text()
         if not text.strip():
             continue
-        chunks.append(Chunk(text=text, page=getattr(raw, "start_page", None)))
+        page = getattr(raw, "start_page", None)
+        if not options.context_header and options.max_chunk_token_count is None:
+            chunks.append(Chunk(text=text, page=page))
+            continue
+        headers = [h.text for h in getattr(raw, "headers", None) or []]
+        chunks.extend(_v2_chunks(text, page, headers, options, title, tokenizer))
     return chunks
 
 
@@ -404,3 +600,322 @@ def _patch_line_spacing(pdf_parser_class) -> None:
         return
     if pdf_parser_class.__dict__.get("_get_line_spacing") is not _SAFE_LINE_SPACING:
         pdf_parser_class._get_line_spacing = _SAFE_LINE_SPACING
+
+
+# ---------------------------------------------------------------------------
+# v2: context header and token cap
+# ---------------------------------------------------------------------------
+
+_CONTEXT_SEPARATOR = " › "
+_HEADING_MARK = re.compile(r"^\s*#+\s*")
+
+
+def _context_path(headers: Sequence[str], title: str | None, limit: int | None, count) -> str | None:
+    """``"<title> › <h1> › <h2> …"`` for the headings above a chunk, ``None`` when there are none.
+
+    A first heading equal to the title is not repeated. With ``limit`` (tokens), the middle
+    levels are dropped, then the last label is cut, until the path fits.
+    """
+    parts = [title.strip()] if title and title.strip() else []
+    for header in headers:
+        label = _HEADING_MARK.sub("", header).strip()
+        if label and not (not parts[1:] and parts and label == parts[0]):
+            parts.append(label)
+    if not parts:
+        return None
+    if limit is not None:
+        # Drop the middle levels, then words of the last label, then words of the title.
+        while count(_CONTEXT_SEPARATOR.join(parts)) > limit:
+            if len(parts) > 2:
+                del parts[1]
+                continue
+            words = parts[-1].split() if len(parts) == 2 else []
+            if len(words) > 1:
+                parts[-1] = " ".join(words[:-1])
+                continue
+            words = parts[0].split()
+            if len(words) > 1:
+                parts[0] = " ".join(words[:-1])
+                continue
+            break
+        joined = _CONTEXT_SEPARATOR.join(parts)
+        if count(joined) > limit:  # a single long word: cut characters
+            low, high = 0, len(joined)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if count(joined[:middle]) <= limit:
+                    low = middle
+                else:
+                    high = middle - 1
+            joined = joined[:low].rstrip(" ›")  # no dangling separator
+        return joined or None
+    return _CONTEXT_SEPARATOR.join(parts)
+
+
+def _v2_chunks(
+    text: str,
+    page: int | None,
+    headers: list[str],
+    options: ChunkingOptions,
+    title: str | None,
+    tokenizer,
+) -> list[Chunk]:
+    """The chunks of one ChunkNorris chunk under the v2 options (context and/or token cap)."""
+    lead = "\n\n".join(headers)
+    if headers and text.startswith(lead):
+        body = text[len(lead) :].lstrip("\n")
+    else:
+        lead, body = "", text
+    cap = options.max_chunk_token_count
+
+    def count(value: str) -> int:
+        return len(tokenizer.encode(value))
+
+    context = None
+    prefix = ""
+    if options.context_header:
+        context = _context_path(headers, title, options.context_max_tokens, count)
+        if not body.strip():
+            return []
+    elif lead:
+        prefix = lead + "\n\n"  # no context: the heading lines stay in the text, on every piece
+
+    def make(piece: str) -> Chunk:
+        return Chunk(text=prefix + piece, page=page, context=context)
+
+    if cap is None:
+        return [make(body)]
+
+    def fits(piece: str) -> bool:
+        return count(make(piece).embedded_text) <= cap
+
+    if not fits("x"):
+        raise ValueError(
+            f"not even one character fits under max_chunk_token_count={cap} with a context of "
+            f"{count(context or '')} tokens: raise the cap or set context_max_tokens"
+        )
+    if fits(body):
+        return [make(body)]
+    pieces: list[str] = []
+    for kind, content in _blocks(body):
+        if kind == "table":
+            pieces.extend(_split_table(content[0], content[1], fits, count, options))
+        else:
+            pieces.extend(_split_prose(content, fits, count, options.overlap_tokens))
+    return [make(piece) for piece in pieces if piece.strip()]
+
+
+def _is_separator(line: str) -> bool:
+    cells = line.strip().replace("|", "").replace(":", "").replace(" ", "")
+    return "|" in line and bool(cells) and set(cells) == {"-"}
+
+
+def _blocks(body: str) -> list[tuple[str, object]]:
+    """The body as ``("prose", text)`` and ``("table", (header_lines, row_lines))`` blocks, in order."""
+    lines = body.split("\n")
+    blocks: list[tuple[str, object]] = []
+    prose: list[str] = []
+
+    def flush() -> None:
+        if "".join(prose).strip():
+            blocks.append(("prose", "\n".join(prose).strip("\n")))
+        prose.clear()
+
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("|"):
+            j = i
+            while j < len(lines) and lines[j].lstrip().startswith("|"):
+                j += 1
+            run = lines[i:j]
+            if len(run) >= 2 and _is_separator(run[1]):
+                flush()
+                blocks.append(("table", (run[:2], run[2:])))
+            else:
+                prose.extend(run)
+            i = j
+        else:
+            prose.append(lines[i])
+            i += 1
+    flush()
+    return blocks
+
+
+def _split_table(header: list[str], rows: list[str], fits, count, options: ChunkingOptions) -> list[str]:
+    """Pieces of a table, each starting with its header row and separator line."""
+    head = "\n".join(header)
+    if not fits(head):
+        # The header alone is wider than the cap: it cannot be repeated, the table is cut as text.
+        return _windows("\n".join([*header, *rows]), fits, count, options.overlap_tokens)
+    if not rows:
+        return [head]
+    pieces: list[str] = []
+    group: list[str] = []
+    per_chunk = options.table_rows_per_chunk
+    header_written = False
+
+    def emit() -> None:
+        nonlocal header_written
+        if group:
+            pieces.append(head + "\n" + "\n".join(group))
+            group.clear()
+            header_written = True
+
+    for row in rows:
+        if not fits(head + "\n" + row):
+            # A row that does not fit even alone: cut as text, without the header.
+            emit()
+            pieces.extend(_windows(row, fits, count, options.overlap_tokens))
+            continue
+        if (per_chunk is not None and len(group) >= per_chunk) or (
+            group and not fits(head + "\n" + "\n".join([*group, row]))
+        ):
+            emit()
+        group.append(row)
+    emit()
+    if not header_written:
+        # Every row was too wide to sit beside the header: the header is still part of the text.
+        pieces.insert(0, head)
+    return pieces
+
+
+def _split_prose(text: str, fits, count, overlap_tokens: int) -> list[str]:
+    """Pieces of prose: paragraphs packed up to the cap, an over-long paragraph cut in windows."""
+    pieces: list[str] = []
+    group: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        if not paragraph.strip():
+            continue
+        if not fits(paragraph):
+            if group:
+                pieces.append("\n\n".join(group))
+                group = []
+            pieces.extend(_windows(paragraph, fits, count, overlap_tokens))
+        elif group and not fits("\n\n".join([*group, paragraph])):
+            pieces.append("\n\n".join(group))
+            group = [paragraph]
+        else:
+            group.append(paragraph)
+    if group:
+        pieces.append("\n\n".join(group))
+    return pieces
+
+
+def _windows(text: str, fits, count, overlap_tokens: int) -> list[str]:
+    """Cut ``text`` into pieces that fit: lines packed together, a line that is too long in windows of words.
+
+    Line breaks are kept (lists, pipe rows); blank lines are dropped.
+    """
+    pieces: list[str] = []
+    group: list[str] = []
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        if not fits(line):
+            if group:
+                pieces.append("\n".join(group))
+                group = []
+            pieces.extend(_word_windows(line, fits, count, overlap_tokens))
+        elif group and not fits("\n".join([*group, line])):
+            pieces.append("\n".join(group))
+            group = [line]
+        else:
+            group.append(line)
+    if group:
+        pieces.append("\n".join(group))
+    return pieces
+
+
+def _word_windows(text: str, fits, count, overlap_tokens: int) -> list[str]:
+    """Cut ``text`` into windows of words that fit, the end of one repeated at the start of the next."""
+    specials = count("")
+    pieces: list[str] = []
+    current: list[str] = []
+
+    def overlap_of(words: list[str]) -> list[str]:
+        if overlap_tokens <= 0:
+            return []
+        taken: list[str] = []
+        total = 0
+        for word in reversed(words[1:]):  # never the whole window: progress is guaranteed
+            total += max(count(word) - specials, 1)
+            if total > overlap_tokens:
+                break
+            taken.append(word)
+        return taken[::-1]
+
+    for word in text.split():
+        if fits(" ".join([*current, word])):
+            current.append(word)
+            continue
+        if current:
+            pieces.append(" ".join(current))
+            carried = overlap_of(current)
+            current = carried if fits(" ".join([*carried, word])) else []
+            if fits(" ".join([*current, word])):
+                current.append(word)
+                continue
+            current = []
+        # A word that does not fit alone: cut it by characters.
+        rest = word
+        while rest and not fits(rest):
+            low, high = 1, len(rest)
+            while low < high:  # largest prefix that fits (at least one character)
+                middle = (low + high + 1) // 2
+                if fits(rest[:middle]):
+                    low = middle
+                else:
+                    high = middle - 1
+            if low == 1 and not fits(rest[:1]):
+                raise ValueError("not even one character fits under the token cap")
+            pieces.append(rest[:low])
+            rest = rest[low:]
+        current = [rest] if rest else []
+    if current:
+        pieces.append(" ".join(current))
+    return pieces
+
+
+class _EncodingTokenizer:
+    """``tokenizers.Tokenizer`` seen as ChunkNorris's ``SupportsEncode``: ``encode(text) -> list[int]``.
+
+    Truncation and padding are switched off, so a count is the true length of the text; the
+    special tokens are included, as when the model embeds it.
+    """
+
+    def __init__(self, tokenizer) -> None:
+        tokenizer.no_truncation()
+        tokenizer.no_padding()
+        self._tokenizer = tokenizer
+
+    def encode(self, text: str) -> list[int]:
+        return self._tokenizer.encode(text).ids
+
+
+def load_tokenizer(cache_dir: str | os.PathLike[str], model_name: str) -> SupportsEncode:
+    """The tokenizer of a pinned embedding model, to count tokens the way the model does.
+
+    ``model_name`` is a model of :data:`rag_engine.embedding.ONNX_MODELS`. Its ``tokenizer.json``
+    is looked for in ``cache_dir`` (the model cache), downloaded from the pinned revision when
+    it is not there, and checked against the pinned SHA-256 and size before it is read, as
+    ``OnnxEmbedder`` does: :class:`rag_engine.embedding.ModelIntegrityError` when it differs.
+    Only that file is fetched, not the ONNX weights. ``ValueError`` for a model that is not pinned;
+    ``ImportError`` when the ``tokenizers`` package is missing.
+    """
+    from rag_engine import embedding
+
+    known = embedding._pinned_model(model_name)
+    if known is None:
+        raise ValueError(
+            f"no pinned tokenizer for {model_name!r}: models are {', '.join(sorted(embedding.ONNX_MODELS))}"
+        )
+    try:
+        from tokenizers import Tokenizer
+    except ImportError as error:
+        raise ImportError(
+            f"loading a tokenizer needs the tokenizers package (import failed: {error})"
+        ) from error
+    only = ("tokenizer.json",)
+    directory = embedding._pinned_model_dir(model_name, known, os.fspath(cache_dir), only)
+    embedding._verify_pinned_files(model_name, known, directory, only)
+    return _EncodingTokenizer(Tokenizer.from_file(os.fspath(directory / "tokenizer.json")))

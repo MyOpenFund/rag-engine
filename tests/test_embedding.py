@@ -1731,3 +1731,24 @@ def test_real_model_loaded_from_a_cache_directory_reports_no_deprecated_argument
     print(f"\nsentence-transformers {sentence_transformers.__version__}, cache_folder given: ", end="")
     print("nothing reported as deprecated" if not any("deprecat" in text.lower() for text in said) else said)
     assert not [text for text in said if "cache" in text.lower() and "deprecat" in text.lower()]
+
+
+def test_provider_cpu_default(fastembed_stub):
+    embedder = OnnxEmbedder(LISTED_SPEC)
+    assert embedder.provider == "cpu"
+    assert fastembed_stub.instances[0].init_kwargs["providers"] == CPU_ONLY
+
+
+def test_provider_coreml_providers_list(fastembed_stub):
+    embedder = OnnxEmbedder(LISTED_SPEC, provider="coreml")
+    assert embedder.provider == "coreml"
+    assert fastembed_stub.instances[0].init_kwargs["providers"] == [
+        "CoreMLExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+
+
+def test_unknown_provider_raises_valueerror(fastembed_stub):
+    with pytest.raises(ValueError, match="provider"):
+        OnnxEmbedder(LISTED_SPEC, provider="cuda")  # type: ignore[arg-type]
+    assert fastembed_stub.instances == []

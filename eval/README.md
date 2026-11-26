@@ -8,6 +8,8 @@ Question files for `rag-engine eval`, the script that builds the automatic one, 
 | `make_known_item.py` | Builds a known-item file from manifest files. Standard library only; not part of the installed package. |
 | `fixtures/corpus.json`, `fixtures/questions.jsonl` | 13 small documents (32 chunks) and 13 questions with known answers, in the first version of the format. The test suite loads them into a collection and checks the exact metrics. |
 | `analytical_v2.jsonl` | 91 questions on the content of the policy core, written by hand and checked against the documents: 72 that the corpus answers, 4 whose premise is false, 15 that the corpus cannot answer. |
+| `filings_v1.jsonl` | 48 questions (43 answering with verbatim `expected_spans`, 5 abstentions) on the 10-Ks of five issuers, FY2022-FY2025, checked by `scripts/check_filings_eval.py`; pending the owner's validation (see `filings_README.md`). |
+| `filings_README.md` | The passage-level evaluation on SEC filings: the `expected_spans` field, how questions are checked, the measurement protocol of `scripts/filings_eval.py`. |
 | `fixtures/questions_v2.jsonl` | 13 questions on the same 13 documents that use every field of the second version of the format: essential and acceptable documents, either-of groups, expected behaviour, a second run without filters, questions that abstain. |
 
 `analytical_v2.jsonl` holds 91 questions on the content of the documents (see "The analytical batch" below). Unlike the known-item questions, which measure whether a document a user can describe is found, they ask what an analyst would ask, and they use the second version of the format.

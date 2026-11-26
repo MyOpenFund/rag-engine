@@ -35,7 +35,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -535,6 +535,7 @@ ONNX_BATCH_SIZE = 32
 """Default number of texts per inference call of :class:`OnnxEmbedder`."""
 
 _CPU_PROVIDERS = ("CPUExecutionProvider",)
+_COREML_PROVIDERS = ("CoreMLExecutionProvider", "CPUExecutionProvider")
 
 _onnx_registration_lock = threading.Lock()
 _sha256_lock = threading.Lock()
@@ -580,17 +581,19 @@ def _onnx_cache_dir(cache_dir: str | os.PathLike[str] | None) -> str:
     return os.environ.get("FASTEMBED_CACHE_PATH") or os.path.join(tempfile.gettempdir(), "fastembed_cache")
 
 
-def _pinned_model_dir(name: str, known: OnnxModel, cache_dir: str) -> Path:
+def _pinned_model_dir(name: str, known: OnnxModel, cache_dir: str, only: Sequence[str] | None = None) -> Path:
     """Directory holding the files of ``known`` at its pinned revision, downloaded if needed.
 
     The files already in ``cache_dir`` are used without any request to the Hugging Face Hub.
+    ``only`` restricts the files fetched to some of the entry's files (the tokenizer, for a
+    caller that does not run the model); ``None`` means all of them.
     """
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise ImportError(_ONNX_EXTRA) from exc
     repository = known.hf or name
-    files = list(known.files)
+    files = list(known.files) if only is None else list(only)
     request: dict[str, Any] = {"revision": known.revision, "allow_patterns": files, "cache_dir": cache_dir}
 
     def missing_from(directory: Path) -> list[str]:
@@ -654,14 +657,20 @@ def _file_sha256(path: Path, *, cached: bool = False) -> tuple[str, int]:
     return digest, stat.st_size
 
 
-def _verify_pinned_files(name: str, known: OnnxModel, directory: Path) -> str:
+def _verify_pinned_files(
+    name: str, known: OnnxModel, directory: Path, only: Sequence[str] | None = None
+) -> str:
     """Check every file about to be loaded against the table; return the SHA-256 of the ONNX file.
+
+    ``only`` restricts the check to some files of the entry (see :func:`_pinned_model_dir`).
 
     The first file that differs raises :class:`ModelIntegrityError`, which names it. The
     tokenizer and configuration files (17 MB in all for E5) are read and hashed at every
     call; only the hash of the ONNX file is kept from one call to the next.
     """
     for file, (expected, expected_size) in known.files.items():
+        if only is not None and file not in only:
+            continue
         path = directory / file
         found, size = _file_sha256(path, cached=file == known.model_file)
         if found != expected or size != expected_size:
@@ -755,8 +764,12 @@ class OnnxEmbedder(BaseEmbedder):
     ``ValueError``. The declared dimension is compared with ``spec.dim`` before anything is
     downloaded.
 
-    The session runs on the CPU execution provider only, also when the GPU build of
-    onnxruntime is installed: parity was measured on CPU.
+    By default (``provider="cpu"``) the session runs on the CPU execution provider only, also
+    when the GPU build of onnxruntime is installed: parity with torch was measured on CPU.
+    ``provider="coreml"`` opts into Apple's CoreML provider (CPU stays as fallback for the
+    operators it cannot run). Its parity was not measured and its vectors may differ from the
+    CPU ones: use it for local indexes only, never for a collection searched with CPU vectors.
+    Any other value raises a ``ValueError``.
 
     Texts are given to fastembed's plain ``embed``, with the prefix of the specification and
     nothing else. Texts longer than the model's limit (512 tokens for E5) are cut by the
@@ -777,8 +790,11 @@ class OnnxEmbedder(BaseEmbedder):
         cache_dir: str | os.PathLike[str] | None = None,
         threads: int | None = None,
         batch_size: int = ONNX_BATCH_SIZE,
+        provider: Literal["cpu", "coreml"] = "cpu",
     ) -> None:
         super().__init__(spec)
+        if provider not in ("cpu", "coreml"):
+            raise ValueError(f"OnnxEmbedder: provider must be 'cpu' or 'coreml', got {provider!r}")
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError(f"OnnxEmbedder: batch_size must be an integer of at least 1, got {batch_size!r}")
         if threads is not None and (type(threads) is not int or threads < 1):
@@ -791,12 +807,14 @@ class OnnxEmbedder(BaseEmbedder):
         except ImportError as exc:
             raise ImportError(_ONNX_EXTRA) from exc
         self.batch_size = batch_size
+        self._provider = provider
         self.model_path: Path | None = None
         self.model_sha256: str | None = None
         self._lock = threading.Lock()
         self._model: Any = None
-        # The CPU provider is named: left to itself, fastembed picks CUDA when onnxruntime has it.
-        options: dict[str, Any] = {"providers": list(_CPU_PROVIDERS)}
+        # Providers are always named: left to itself, fastembed picks CUDA when onnxruntime has it.
+        providers = _COREML_PROVIDERS if provider == "coreml" else _CPU_PROVIDERS
+        options: dict[str, Any] = {"providers": list(providers)}
         if threads is not None:
             options["threads"] = threads
         known = _pinned_model(spec.name)
@@ -837,6 +855,11 @@ class OnnxEmbedder(BaseEmbedder):
             )
         self._model = TextEmbedding(registered, **options)
         logger.info("ONNX embedding model ready (dim=%d)", spec.dim)
+
+    @property
+    def provider(self) -> str:
+        """The execution provider requested: ``"cpu"`` or ``"coreml"``."""
+        return self._provider
 
     def _check_dimension(self, declared: int | None) -> None:
         if declared is not None and declared != self._spec.dim:

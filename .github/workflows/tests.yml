@@ -24,8 +24,9 @@ jobs:
           cache-dependency-path: pyproject.toml
       # The ingest extra (document parsers) is installed on 3.12 and on 3.13, the version
       # production runs on and the golden fixture was captured with: the tests that need the
-      # real libraries run there. 3.10 keeps the light install, where they skip.
-      - run: pip install -e ".[dev${{ matrix.python-version != '3.10' && ',ingest' || '' }}]"
+      # real libraries run there. 3.10 keeps the light install, where they skip. The graph
+      # extra (eigenmind, for rag_engine.select) is light and installed on every version.
+      - run: pip install -e ".[dev,graph${{ matrix.python-version != '3.10' && ',ingest' || '' }}]"
       - name: Check that the document parsers are importable
         if: matrix.python-version != '3.10'
         run: python -c "import chunknorris.chunkers, chunknorris.parsers, markitdown, pptx, pymupdf"

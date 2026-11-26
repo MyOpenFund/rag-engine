@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -36,6 +37,7 @@ __all__ = [
     "CollectionMismatchError",
     "CollectionNotFoundError",
     "DateFieldsError",
+    "IndexLocked",
     "MissingIndexError",
     "QdrantAuthError",
     "QdrantStore",
@@ -122,6 +124,22 @@ def _check_date_fields(doc_id: str, fields: Mapping[str, Any]) -> None:
             f"{fields['date']!r} with the precision {fields['date_precision']!r} (document {doc_id!r}; "
             f"expected {', '.join(f'{key}={expected[key]!r}' for key in wrong)}); {remedy}"
         )
+
+
+class IndexLocked(StoreError):
+    """A Qdrant local folder is already open, by another process or another client of this one.
+
+    qdrant-client's local mode locks its folder for the lifetime of the client that opened it:
+    one index folder serves one client at a time. Close the other client (or stop the process
+    that holds it), or use a Qdrant server for concurrent access.
+    """
+
+
+#: What qdrant-client's local mode says when its folder is locked (a ``RuntimeError``). qdrant-client
+#: raises no dedicated exception, so the store depends on this wording (checked on 1.20): a release
+#: that rewords it would surface as the plain ``RuntimeError`` instead of :class:`IndexLocked`.
+#: ``tests/test_local_index.py`` (the second open of a locked folder) catches such a change.
+_LOCKED_MESSAGE = "already accessed by another instance"
 
 
 class MissingIndexError(StoreError):
@@ -353,6 +371,38 @@ class QdrantStore:
             timeout,
             settings=settings,
         )
+
+    @classmethod
+    def local(cls, path: str | os.PathLike[str]) -> QdrantStore:
+        """A store on qdrant-client's local mode, persisted in the folder ``path``.
+
+        No server: the collections live in ``path`` (created when missing) and are read and
+        written in this process. Local mode keeps no payload index, so
+        :meth:`has_date_intervals` is always ``False`` there; a search over it states its
+        ``date_filter_mode`` explicitly instead of ``"auto"``.
+
+        The client is built with ``force_disable_check_same_thread=True``: where SQLite is not
+        compiled ``THREADSAFE=1`` (the macOS default is 2), qdrant-client otherwise opens its
+        storage with ``check_same_thread=True``, and a write from any thread but the opener
+        fails. Local mode has no locking of its own, so **the caller serialises access**
+        (:class:`rag_engine.local.LocalIndex` holds a lock around every call). qdrant-client keeps
+        this setting on a class attribute: it applies to every local client of the process.
+
+        The folder is locked while the client is open. A folder already opened by another
+        process, or by another client of this process, raises :class:`IndexLocked`. The
+        client is closed with ``store.client.close()``, which releases the lock. The
+        environment is not read.
+        """
+        try:
+            client = QdrantClient(path=os.fspath(path), force_disable_check_same_thread=True)
+        except RuntimeError as exc:
+            if _LOCKED_MESSAGE in str(exc):
+                raise IndexLocked(
+                    f"the local index folder {os.fspath(path)!r} is already open in another process or "
+                    "client: close it there first (local mode allows one client per folder)"
+                ) from exc
+            raise
+        return cls(client=client)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(host={self._host!r}, port={self._port!r}, https={self._https!r})"

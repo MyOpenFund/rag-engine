@@ -2,6 +2,37 @@
 
 All notable changes to rag-engine are recorded here. Versions follow [semantic versioning](https://semver.org).
 
+## 0.2.0 — 2026-11-26
+
+An index on the user's own disk with a hybrid search, an opt-in second chunking profile, a diversity selection kept off by default, and a passage-level evaluation on SEC filings. Everything is opt-in: nothing changes for the existing collections, for `ingest_document` or for `search`.
+
+### Compatibility
+
+- **`ChunkingOptions()` is the v1 profile and its output is unchanged**: the chunks of the default options were verified byte-identical to those of 0.1.0. The new option fields are off by default, and `version="v1"` is refused when any of them is set, so the label cannot misstate the cut.
+- **Nothing changes for existing collections or for `ingest_document`.** `ingest_document` now refuses a `chunking_options` whose `version` is not `"v1"` (`ValueError`, before the file is read): its payload has no place for `Chunk.context`, so a v2 chunk would lose its headings. Moving a collection to v2 needs a clean re-ingestion of its document set; that re-ingestion is not part of this release.
+
+### Delivered
+
+- **Chunking v2, opt-in** (`rag_engine.chunking`):
+  - New fields of `ChunkingOptions`, all off by default: `max_chunk_token_count` (hard maximum of tokens of an embedded chunk, context included), `table_rows_per_chunk` (rows per piece of a long table; only with `max_chunk_token_count`, refused otherwise), `context_header` (each chunk carries its path of headings), `overlap_tokens` (overlap between the windows of one over-long block), `context_max_tokens` (at most half of the cap; only with `context_header`), and `version` (`"v1"` or `"v2"`, a label a collection records).
+  - `ChunkingOptions.v2()`: `max_chunk_token_count=480` (the 512-token window of e5-base minus the special tokens and a margin for the `"passage: "` prefix), `overlap_tokens=32`, `context_max_tokens=120`, `context_header=True`, `table_rows_per_chunk=None` (a long table is split by tokens, its header row and separator line repeated in every piece).
+  - `Chunk.context` (`"<title> › <h1> › <h2> …"`, `None` without `context_header`) and `Chunk.embedded_text` (the context, a blank line and the text; the text alone without a context): what a chunk is embedded and token-counted as.
+  - `chunk_markdown(text, *, options=None, title=None, tokenizer=None)`: chunk a Markdown string, no file involved; `title` is the first element of the context.
+  - `load_tokenizer(cache_dir, model_name)`: the `tokenizer.json` of a pinned model, fetched alone at the pinned revision and checked against its SHA-256 and size (`ModelIntegrityError`) before it is read.
+  - `chunk_file(..., tokenizer=None)`: needed when `max_chunk_token_count` is set (`ValueError` without it), ignored otherwise; the context then starts with the file name without its extension.
+- **CoreML provider** (`rag_engine.embedding`): `OnnxEmbedder(provider="coreml")` opts into Apple's CoreML execution provider, the CPU provider staying as the fallback for the operators it cannot run; where CoreML is not available the session falls back to the CPU without a word. Its parity with the CPU vectors was **not measured**: use it for local indexes only, never for a collection searched with CPU vectors. `provider="cpu"` stays the default; any other value is a `ValueError`. `OnnxEmbedder.provider` names the provider asked for.
+- **Local Qdrant store** (`rag_engine.store`): `QdrantStore.local(path)`, a store on qdrant-client's local mode persisted in a folder, without a server and without reading the environment. The folder is locked while the client is open: a second open, from this process or another, raises `IndexLocked` (a new `StoreError`). Local mode keeps no payload index and has no locking of its own: the caller serialises access.
+- **Local index and hybrid search** (`rag_engine.local`, extra `local`):
+  - `LocalIndex(root, *, collection, dim)`: Qdrant local mode under `root/qdrant` and an SQLite FTS5 table under `root/fts.sqlite3` (WAL), written together; SQLite is the record of what is served. `add(doc_id, chunks, vectors, payload, *, first_index)` stores the text as given and writes the point ids an ingestion into a server would give; re-adding a document with fewer chunks leaves its surplus chunks, so a replacement calls `delete(doc_id)` first. A string that cannot be encoded as UTF-8 (a lone surrogate) in `doc_id`, a text, a context or the payload is a `StoreError` before anything is written. `delete`, `doc_ids`, `count`, `close`; a context manager. **One client per folder**.
+  - `hybrid_search(query, *, index, embedder, filters, limit, candidates=50, rrf_k=60, selector=None, max_terms=64)`: the production `search` on the dense side and BM25 on the FTS side, `candidates` deep each (`DEFAULT_CANDIDATES`), under the same `SearchFilters`, fused by Reciprocal Rank Fusion with `k = 60` (`DEFAULT_RRF_K`, Cormack, Clarke and Büttcher 2009). `selector` receives the fused candidates and their stored vectors.
+  - `fts_query(text, *, max_terms=64)`: the words of a query as an FTS5 MATCH string that cannot be read as FTS5 syntax, joined by `OR`; only the first `max_terms` distinct words are kept (`DEFAULT_MAX_TERMS`), so a 200,000-word query costs no more than a short one.
+  - `collection_name(model_name, model_revision, chunker_version, provider)`: one collection per embedding setup, so vectors of another model, revision, chunker or provider are never mixed.
+  - Scale: qdrant-client advises against local mode above about **20,000 points**, the practical ceiling of a local index (about twenty 10-Ks under v2); beyond it, use a Qdrant server.
+- **Diversity selection** (`rag_engine.select`, extra `graph`): `select_diverse(hits, vectors, limit, *, threshold=0.65, keep_top=0, time_limit=2.0, ...)` runs the Supported Diversity of eigenmind 0.2 on the cosine graph of the candidates, then fills up by fused rank; it plugs into `hybrid_search` as `selector=`. **Off by default**: on the filings evaluation it returned the hybrid ranks at the default threshold 0.65, and did worse whenever it selected (higher thresholds). `time_limit` accepts any positive finite real number, NumPy scalars included.
+- **Extras**: `local` (`myopenfund-rag-engine[onnx,ingest]`: the ONNX backend and the parsers, no server) and `graph` (`eigenmind>=0.2,<0.3`; the 0.1 API was removed in 0.2).
+- **Passage-level evaluation** (`rag_engine.eval`): the optional question field `expected_spans` (1 to 3 short verbatim texts of the answer; ignored by `rag-engine eval`), `span_hit(text, spans)` (NFKD, case, white space and typography folded), `evaluate_passages(questions, run, *, k=10, bootstrap_resamples=1000, interval_min_questions=20)` with `PassageReport`, `PassageResult` and `PassageAbstention`: hit@n and MRR@n with intervals over the questions; a passage counts only when it comes from an expected document.
+- **Filings question set**: `eval/filings_v1.jsonl`, 48 questions (43 answering, 5 abstentions) on the 10-Ks of five issuers, fiscal years 2022 to 2025, with `scripts/check_filings_eval.py` and `scripts/filings_eval.py`; see `eval/filings_README.md`. Its results are **provisional, pending the owner's validation of the set**, and its caveats are listed there.
+
 ## 0.1.0 — 2026-11-25
 
 First version: ingestion, the two embedding backends, filtered search, and the evaluation of that search.
