@@ -9,6 +9,8 @@ Question files for `rag-engine eval`, the script that builds the automatic one, 
 | `fixtures/corpus.json`, `fixtures/questions.jsonl` | 13 small documents (32 chunks) and 13 questions with known answers, in the first version of the format. The test suite loads them into a collection and checks the exact metrics. |
 | `analytical_v2.jsonl` | 91 questions on the content of the policy core, written by hand and checked against the documents: 72 that the corpus answers, 4 whose premise is false, 15 that the corpus cannot answer. |
 | `filings_v1.jsonl` | 48 questions (43 answering with verbatim `expected_spans`, 5 abstentions) on the 10-Ks of five issuers, FY2022-FY2025, checked by `scripts/check_filings_eval.py`; pending the owner's validation (see `filings_README.md`). |
+| `filings_v2.jsonl` | 80 questions (73 answering, 7 abstentions) on the same 20 filings, each with a `difficulty` (23 easy, 38 medium, 19 hard), 8 in French, 12 table-row spans, 5 questions that need every span (`span_match: "all"`, 4 of them across two filings); audit of v1 in `filings_v2_AUDIT.md`; pending measurement (see `filings_README.md`). |
+| `filings_v2_AUDIT.md` | The audit of every v1 question (kept, rewritten or dropped, with the reason) behind `filings_v2.jsonl`. |
 | `filings_README.md` | The passage-level evaluation on SEC filings: the `expected_spans` field, how questions are checked, the measurement protocol of `scripts/filings_eval.py`. |
 | `fixtures/questions_v2.jsonl` | 13 questions on the same 13 documents that use every field of the second version of the format: essential and acceptable documents, either-of groups, expected behaviour, a second run without filters, questions that abstain. |
 

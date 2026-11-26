@@ -2,6 +2,14 @@
 
 All notable changes to rag-engine are recorded here. Versions follow [semantic versioning](https://semver.org).
 
+## Unreleased
+
+### Delivered
+
+- **Filings evaluation v2** (`eval/filings_v2.jsonl`, 80 questions, pending measurement): the v1 set audited question by question (`eval/filings_v2_AUDIT.md`) and extended with difficulty levels, table-row spans, two-filing questions, risk factors and notes, negations and French questions. v1 and its published numbers are unchanged.
+- **Two optional question fields** (`rag_engine.eval`, read by `evaluate_passages` only): `span_match` (`"any"`, the default and the 0.2.0 behaviour, or `"all"`: every span must be found among the first `k` passages) and `difficulty` (`"easy"`, `"medium"`, `"hard"`). `PassageResult` carries `difficulty` and `language`; `PassageReport.groups(attribute)` splits a report by kind, difficulty or language. Existing question files load and score as before.
+- `scripts/filings_eval.py` prints and writes hit@5, hit@10 and MRR@10 by difficulty and by language; `scripts/check_filings_eval.py` checks that every expected filing holds a span, verifies the `absent:` terms of abstentions, takes `--require-difficulty`, and prints with `--report` where every span and its wording occur in other filings.
+
 ## 0.2.0 — 2026-11-26
 
 An index on the user's own disk with a hybrid search, an opt-in second chunking profile, a diversity selection kept off by default, and a passage-level evaluation on SEC filings. Everything is opt-in: nothing changes for the existing collections, for `ingest_document` or for `search`.
