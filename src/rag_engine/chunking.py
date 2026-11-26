@@ -403,10 +403,10 @@ def chunk_file(
 
     try:
         if ext == ".pptx":
-            document = MarkdownParser().parse_string(_pptx_to_markdown(filepath))
+            document = _parse_markdown(MarkdownParser, _pptx_to_markdown(filepath))
         elif ext in (".txt", ".md"):
             # MarkdownParser.parse_file is strict about the encoding; the text is read here.
-            document = MarkdownParser().parse_string(_read_text(filepath))
+            document = _parse_markdown(MarkdownParser, _read_text(filepath))
         elif ext == ".pdf":
             use_ocr = ("auto" if ocr_available() else "never") if ocr == "auto" else ocr
             if use_ocr != "never":
@@ -460,6 +460,9 @@ def chunk_markdown(
 
     With ``context_header``, ``title`` is the first element of ``Chunk.context`` (the first
     heading is not repeated when it is the title); without a title the context is the headings.
+
+    No front matter is read: a text that starts with ``---`` (a page break, a YAML header) keeps
+    all its words, and so does a line glued to a rule (``"---UNITED STATES"``).
     """
     if options is None:
         options = ChunkingOptions()
@@ -473,10 +476,68 @@ def chunk_markdown(
     except ImportError as error:
         raise _missing_dependency(error) from error
     try:
-        raw_chunks = _markdown_chunker(MarkdownChunker, options).chunk(MarkdownParser().parse_string(text))
+        raw_chunks = _markdown_chunker(MarkdownChunker, options).chunk(_parse_markdown(MarkdownParser, text))
     except TextNotFoundException:
         return []
     return _to_chunks(raw_chunks, options, title, tokenizer)
+
+
+#: Leading whitespace (a BOM included) and a run of three dashes or more, at the start of a text.
+_LEADING_DASHES = re.compile(r"\A[\s\ufeff]*-{3,}")
+
+#: A line that starts with a run of three ``-`` or ``=`` or more, glued to text with a word in it.
+_GLUED_RULE = re.compile(r"(-{3,}|={3,})[ \t]*(.*\w.*)")
+
+
+def _is_setext_rule(line: str) -> bool:
+    """Whether ChunkNorris reads ``line`` as a setext underline when the line above is not blank."""
+    return line.startswith(("---", "==="))
+
+
+def _markdown_for_parser(text: str) -> str:
+    """``text`` changed so that ChunkNorris's ``MarkdownParser.parse_string`` drops no word.
+
+    Two steps of ChunkNorris (1.3.7 to 1.5.0) lose text on lines that start with ``---``.
+    Converted filings have ``---`` page breaks, sometimes glued to the next line
+    (``"---UNITED STATES"``) or stacked, and a section cut at an offset often starts on one.
+
+    - Front matter. ``parse_metadata`` strips the string, and when it then starts with ``---``
+      and a later line is exactly ``---``, drops everything up to that line as YAML. rag-engine
+      never reads front matter (documents are not Jekyll pages): the runs of dashes the text
+      starts with are removed, with the whitespace (a BOM included) around them, so a YAML header
+      is kept as text.
+    - Setext headings. ``convert_setext_to_atx`` reads a line that starts with ``---`` or
+      ``===`` under a non-blank line as the underline of a heading: it drops the line whole,
+      text glued to the rule included, and replaces the line it has output last with a heading.
+      A rule glued to text is split in two, the rule then the text; a rule under another rule is
+      separated from it by a blank line, since the line output last is then the heading made by
+      the rule above and its text would be lost. Code fences are tracked as ChunkNorris tracks
+      them, and left alone.
+
+    Only dashes and whitespace are removed, never a word. A text no rule applies to is returned
+    unchanged, so its chunks are the ones ChunkNorris always gave.
+    """
+    while (match := _LEADING_DASHES.match(text)) is not None:
+        text = text[match.end() :]
+    out: list[str] = []
+    within_code_block = False
+    for line in text.split("\n"):
+        if line.startswith("```") and "```" not in line[3:]:
+            within_code_block = not within_code_block
+        if within_code_block or not _is_setext_rule(line) or not out or not out[-1].strip():
+            out.append(line)
+        elif _is_setext_rule(out[-1]):
+            out.extend(("", line))
+        elif (glued := _GLUED_RULE.fullmatch(line)) is not None:
+            out.extend(glued.groups())
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _parse_markdown(parser_class, text: str):
+    """``parser_class().parse_string`` of ``text``, no word dropped (:func:`_markdown_for_parser`)."""
+    return parser_class().parse_string(_markdown_for_parser(text))
 
 
 def _check_tokenizer(options: ChunkingOptions, tokenizer: object) -> None:
