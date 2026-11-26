@@ -73,12 +73,12 @@ chunks (no context header), so its rows do not depend on it.
   v2 chunk carries the title, which names the company and the period. Part of the v1 -> v2 gap is
   therefore this, not the quality of the cut.
 
-## Version 2: `filings_v2.jsonl` (pending measurement)
+## Version 2: `filings_v2.jsonl`
 
-> **Status: pending measurement.** v2 has not been run with the ONNX model yet; it has no published
-> number. v1 stays in the repository for history and its numbers above stay as published: v2 does not
-> replace them, it is a different set (a v2 number is never compared with a v1 number as if one set had
-> been scored twice).
+> **Status: measured (2026-11-26), with the 0.2.1 chunker fix.** v1 stays in the repository for history
+> and its numbers above stay as published: v2 does not replace them, it is a different set (a v2 number
+> is never compared with a v1 number as if one set had been scored twice). The results are below
+> ([Results of v2](#results-of-v2)).
 
 v1 was challenged question by question (`filings_v2_AUDIT.md`: 36 kept, 9 rewritten, 3 dropped) and
 extended with harder and more varied questions; an adversarial review of that first v2 led to v2.1, and a
@@ -253,7 +253,8 @@ only the language differs, so comparing a twin's two ranks says what the languag
   piece is parsed as YAML front matter and dropped, up to the next `---`. Amazon's Item 7 opening (in all
   four Amazon 10-Ks) and Alphabet's FY2025 Item 7 trends and Item 1A leasing risk are lost that way.
   `amzn-fcf-drivers` and `googl-fy25-ai-infra-costs` ask about that text: they miss with the section cut
-  until the parsing is fixed, and are reachable with the document cut. Their labels say how hard the
+  until the parsing is fixed (rag-engine 0.2.1 fixes it: both are found, see the results), and are
+  reachable with the document cut. Their labels say how hard the
   passage would be to retrieve were it whole (both easy), so they sit in the easy group:
   **`--exclude-tag chunk-loss,chunk-split`** makes the runner print the headline table a second time
   without these four questions (and write it as `excluding` in the JSON), so every row is read with and
@@ -275,6 +276,138 @@ question none of whose spans (with `"all"`: none of one group's spans) is held w
 note says when it has become reachable. The runner prints, under
 the main table, the same metrics **by difficulty** and **by language** for every row, and writes them as
 `by_difficulty` / `by_language` in the JSON.
+
+### Results of v2
+
+Measured on 2026-11-26: ONNX `intfloat/multilingual-e5-base`, 4 CPU, `k = 10`, 1000 bootstrap draws, the
+20 filings titled as the MCP titles them, `filings_v2.jsonl` at sha256 `ada062c38036`, profiles v1 and v2,
+cuts document and section, eigenmind at its default threshold only (0.65, `keep_top` 0, `milp`):
+
+```
+python scripts/filings_eval.py FILINGS_DIR eval/filings_v2.jsonl --backend onnx --model-cache MODELS \
+    --profiles v1,v2 --cuts document,section --exclude-tag chunk-loss,chunk-split --json out.json
+```
+
+**The chunker is rag-engine 0.2.0 plus the 0.2.1 fix** (PR #13, `fix/leading-rule-front-matter`: text
+starting with `---` or with rules glued to it is no longer lost before the Markdown parser). Without it,
+the section cut drops the first page of 54 section pieces of these filings; the v1 numbers above were
+measured with 0.2.0 (their rerun with the fix is below).
+
+**All 85 answering questions:**
+
+| chunking | retrieval | hit@5 | hit@10 | MRR@10 | s/10-K |
+|---|---|---|---|---|---|
+| v1 | dense | 0.306 [0.21,0.41] | 0.376 [0.27,0.48] | 0.160 [0.11,0.22] | 41.7 |
+| v1 | hybrid | 0.435 [0.34,0.54] | 0.529 [0.42,0.64] | 0.275 [0.20,0.35] | 41.7 |
+| v1 | hybrid+eigenmind | 0.435 [0.34,0.54] | 0.529 [0.42,0.64] | 0.275 [0.20,0.35] | 41.7 |
+| v2 | dense | 0.553 [0.46,0.67] | 0.671 [0.56,0.78] | 0.360 [0.28,0.45] | 152.7 |
+| v2 | hybrid | 0.576 [0.47,0.68] | 0.706 [0.61,0.81] | 0.403 [0.33,0.49] | 152.7 |
+| v2 | hybrid+eigenmind | 0.576 [0.47,0.68] | 0.706 [0.61,0.81] | 0.403 [0.33,0.49] | 152.7 |
+| v1/section | dense | 0.282 [0.20,0.39] | 0.365 [0.26,0.47] | 0.187 [0.12,0.26] | 41.8 |
+| v1/section | hybrid | 0.424 [0.33,0.53] | 0.506 [0.40,0.61] | 0.269 [0.19,0.35] | 41.8 |
+| v1/section | hybrid+eigenmind | 0.424 [0.33,0.53] | 0.506 [0.40,0.61] | 0.269 [0.19,0.35] | 41.8 |
+| v2/section | dense | 0.553 [0.45,0.66] | 0.671 [0.58,0.78] | 0.370 [0.29,0.47] | 150.0 |
+| **v2/section** (what the MCP ships) | **hybrid** | **0.576 [0.47,0.68]** | **0.741 [0.65,0.85]** | **0.402 [0.33,0.49]** | 150.0 |
+| v2/section | hybrid+eigenmind | 0.576 [0.47,0.68] | 0.741 [0.65,0.85] | 0.402 [0.33,0.49] | 150.0 |
+
+**Without the `chunk-loss` and `chunk-split` questions (81 answering questions):**
+
+| chunking | retrieval | hit@5 | hit@10 | MRR@10 |
+|---|---|---|---|---|
+| v1 | dense | 0.309 [0.21,0.42] | 0.370 [0.27,0.48] | 0.161 [0.10,0.23] |
+| v1 | hybrid | 0.432 [0.33,0.53] | 0.531 [0.42,0.64] | 0.273 [0.19,0.35] |
+| v1 | hybrid+eigenmind | 0.432 [0.33,0.53] | 0.531 [0.42,0.64] | 0.273 [0.19,0.35] |
+| v2 | dense | 0.556 [0.44,0.67] | 0.679 [0.58,0.78] | 0.361 [0.28,0.45] |
+| v2 | hybrid | 0.593 [0.48,0.70] | 0.728 [0.63,0.83] | 0.411 [0.32,0.50] |
+| v2 | hybrid+eigenmind | 0.593 [0.48,0.70] | 0.728 [0.63,0.83] | 0.411 [0.32,0.50] |
+| v1/section | dense | 0.284 [0.19,0.38] | 0.358 [0.25,0.46] | 0.183 [0.12,0.25] |
+| v1/section | hybrid | 0.420 [0.32,0.53] | 0.506 [0.40,0.62] | 0.273 [0.20,0.35] |
+| v1/section | hybrid+eigenmind | 0.420 [0.32,0.53] | 0.506 [0.40,0.62] | 0.273 [0.20,0.35] |
+| v2/section | dense | 0.556 [0.44,0.67] | 0.679 [0.57,0.79] | 0.370 [0.29,0.45] |
+| **v2/section** | **hybrid** | **0.593 [0.48,0.70]** | **0.753 [0.65,0.85]** | **0.408 [0.32,0.49]** |
+| v2/section | hybrid+eigenmind | 0.593 [0.48,0.70] | 0.753 [0.65,0.85] | 0.408 [0.32,0.49] |
+
+Search latency: 84 to 101 ms dense, 99 to 128 ms hybrid, 110 to 143 ms with eigenmind. Chunks: v1 3019
+(section 3120), v2 11072 (section 11095).
+
+**Decisions** (the rules of the protocol, on hit@10):
+
+- **v2 >= v1: PASS**, hybrid, on both cuts: 0.529 -> 0.706 whole-document, 0.506 -> 0.741 per section
+  (without `chunk-loss`/`chunk-split`: 0.531 -> 0.728 and 0.506 -> 0.753). v2 is kept.
+- **eigenmind stays off**: at the default threshold, hybrid+eigenmind gives exactly hybrid's metrics on
+  every row (as on v1: the e5 cosines between candidates sit above 0.65, the graph is one clique), and
+  costs 10 to 15 ms per search.
+- Hybrid's gain over dense is smaller on v2 than on v1 (0.671 -> 0.741 per section, overlapping
+  intervals, against 0.365 -> 0.506 for v1/section), and on French questions dense alone does better (below).
+
+**By difficulty and by language, v2/section hybrid** (what the MCP ships; small groups, no interval):
+
+| group | n | hit@5 | hit@10 | MRR@10 |
+|---|---|---|---|---|
+| easy | 14 | 0.857 | 1.000 | 0.648 |
+| medium | 53 | 0.660 | 0.792 | 0.435 |
+| hard | 18 | 0.111 | 0.389 | 0.116 |
+| en | 75 | 0.613 | 0.773 | 0.421 |
+| fr | 10 | 0.300 | 0.500 | 0.261 |
+
+The labels order the results as they should on every v2 row (easy > medium > hard; on the v1 hybrid rows,
+easy, 14 questions, scores below medium). French questions lose
+about a third of hit@10 (0.773 -> 0.500); dense alone does better on French than hybrid (0.600 v2/section:
+BM25 matches no English word of a French question). Of the twins (rank of the first hit, English / French):
+Microsoft's OpenAI commitments 3 / 3, Amazon's Anthropic investment 2 / 6, Alphabet's first dividend 7 /
+miss, Meta's servers and network assets (a table row) miss / miss.
+
+**The two `chunk-loss` questions are found now.** With the 0.2.1 fix, `googl-fy25-ai-infra-costs` is at
+rank 1 and `amzn-fcf-drivers` at rank 6 under v2/section hybrid (and both are found by every v1 row);
+the section cut no longer loses their text. (`amzn-fcf-drivers` misses under v2 whole-document hybrid:
+a retrieval miss, not a lost text.) The two `chunk-split` questions miss on every row, as built: no v2
+chunk holds their row with its years (`msft-fy25-capex-table-fr` has its answer row at rank 5, without
+the year row).
+
+**Misses of v2/section hybrid** (22 of 85; a miss is no span from an expected filing in the first 10),
+with the reason read from their ten passages:
+
+| question | difficulty | reason |
+|---|---|---|
+| `msft-fy24-cfo` | medium | year confusion: the FY2023 and FY2025 MD&A rank above the FY2024 sentence |
+| `msft-fy24-investing` | medium | issuer confusion: Meta's and Oracle's cash-flow paragraphs (same wording) fill the top 8 |
+| `googl-fy23-cash` | medium | year confusion: the FY2024 liquidity paragraph ranks 1 and 2 |
+| `amzn-fy24-liquidity` | medium | year confusion: FY2022/FY2023 notes rank first; the FY2025 table's year row comes without its answer row |
+| `amzn-fy25-finance-leases` | medium | year confusion: the FY2024 footnote with the same wording ranks 1 |
+| `meta-fy22-capex` | medium | year confusion: FY2023 ranks 1, then other passages of the right filing |
+| `msft-fy23-buyback` | medium | right filing, wrong passage: the Item 8 share-repurchase note ranks 1, the sentence is not in the top 10 |
+| `meta-fy23-notes` | medium | right filing, neighbour passage: Note 10 (`$8.50 billion issued in May 2023`) at rank 1, not the proceeds sentence |
+| `msft-fy23-computer-equipment` | medium | table row: the useful-life prose of the same note outranks the property table |
+| `meta-fy23-servers` | medium | table row: construction-in-progress prose outranks the property table |
+| `amzn-fy25-aws-share` | hard | table split: the table's lead-in sentence is at rank 2, the table itself in another chunk |
+| `orcl-fy23-fcf` | hard | paraphrase and table: "cash left after capital spending" does not reach the free-cash-flow table |
+| `msft-fy22-construction-commitments` | hard | paraphrase ("server farms") and year confusion: FY2023 passages rank 1, 2 and 4 |
+| `googl-fy24-dividend-fr` | hard | cross-lingual: no passage of the expected filing in the top 10 (its English twin is at rank 7) |
+| `msft-fy23-leases-fr` | hard | cross-lingual and year confusion: the FY2022 sentence with the same wording ranks 1 |
+| `meta-fy23-servers-fr` | hard | cross-lingual and table row (its English twin misses too) |
+| `msft-fy23-depreciation-fr` | hard | cross-lingual: passages of the right filings rank 1 to 9 (the intangible-assets table first), none with the depreciation sentence |
+| `meta-capex-outlook-compare` | hard | multi-span: the 2025 range is found (rank 8), the 2026 range is not |
+| `googl-vs-meta-fy24-capex` | hard | multi-span, two issuers: Alphabet's figure at rank 1, Alphabet fills the list, no Meta passage |
+| `meta-dividends-2024-2025` | hard | multi-span: 2024 found at rank 1, no passage of the FY2025 10-K |
+| `msft-fy25-capex-table-fr` | hard | `chunk-split`, by construction (answer row at rank 5 without its years) |
+| `amzn-fy25-leases-not-commenced` | medium | `chunk-split`, by construction |
+
+By category: **year or issuer confusion 6** (with `msft-fy22-construction-commitments` and
+`msft-fy23-leases-fr`, 8 involve it), **cross-lingual 4** (4 of the 9 answerable French questions
+miss), **multi-span "all" 3** (one fact found, the other not: 3 of the 7 `all` questions), **table row or
+split 3**, **right filing, wrong passage 2**, **paraphrase 2**, **`chunk-split` 2** (by construction).
+The year template is still the first cause, as in v1; French and "all" questions are new and the
+weakest groups.
+
+**Abstentions** (reported, not scored): the top fused scores of the seven, under v2/section hybrid, run
+from 0.026 to 0.033, as v1's: still no threshold separates them from the answering questions.
+
+**The v1 set rerun with the fix.** `filings_v1.jsonl` scored on a v2/section index built with the fixed
+chunker (the runner's own `build_index`, `retrievals` and `evaluate_passages`, same defaults; the same
+index reproduces the v2 numbers above exactly): **v2/section hybrid hit@10 = 0.791 [0.65,0.91]** (34 of
+43), against **0.767** published with 0.2.0; hit@5 0.674 [0.51,0.81], MRR@10 0.463 [0.35,0.58]. The one
+question gained is `googl-fy25-capex` (rank 4), whose answer sat in Alphabet's FY2025 Item 7 text the
+0.2.0 section cut lost; no question is lost. The published v1 table above is left as measured.
 
 ## Question format
 
