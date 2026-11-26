@@ -61,6 +61,8 @@ selection is needed, so ``limit >= len(hits)`` works without it.
 
 from __future__ import annotations
 
+import math
+import numbers
 from collections.abc import Sequence
 
 import numpy as np
@@ -124,7 +126,8 @@ def select_diverse(
     - ``min_degree``, ``relaxation``, ``solver``: passed to ``eigenmind.supported_diversity``
       (eigenmind's defaults).
     - ``time_limit``: seconds for its MILP stage only (2.0, not eigenmind's 10.0; not a total
-      budget, see the module docstring); ``solver="lp_greedy"`` is the fast path.
+      budget, see the module docstring); ``solver="lp_greedy"`` is the fast path. Any finite
+      positive real number, NumPy scalars included; it is passed on as a ``float``.
     - ``keep_top``: how many of the best fused hits are always kept, an integer >= 0 (0:
       none); the selection fills the other ``limit - keep_top`` slots, away from them.
 
@@ -137,8 +140,14 @@ def select_diverse(
         raise ValueError(f"role must be one of {ROLES}, got {role!r}")
     if not 0.0 <= threshold < 1.0:
         raise ValueError(f"threshold must lie in [0, 1), got {threshold!r}")
-    if isinstance(time_limit, bool) or not (isinstance(time_limit, (int, float)) and time_limit > 0):
-        raise ValueError(f"time_limit must be a positive number of seconds, got {time_limit!r}")
+    if (
+        isinstance(time_limit, (bool, np.bool_))
+        or not isinstance(time_limit, numbers.Real)
+        or not math.isfinite(time_limit)
+        or time_limit <= 0
+    ):
+        raise ValueError(f"time_limit must be a positive finite number of seconds, got {time_limit!r}")
+    time_limit = float(time_limit)
     if type(keep_top) is not int or keep_top < 0:
         raise ValueError(f"keep_top must be an integer >= 0, got {keep_top!r}")
     array = _check_vectors(vectors, len(hits))

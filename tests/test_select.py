@@ -250,3 +250,27 @@ def test_refuses_bad_options(kwargs):
     vectors, _ = _clusters([3, 3])
     with pytest.raises(ValueError):
         select_diverse(_hits(6), vectors, 2, **kwargs)
+
+
+@pytest.mark.parametrize("time_limit", [np.float32(0.5), np.float64(0.5), np.int64(1), 1, 0.5])
+def test_time_limit_accepts_numpy_numbers(monkeypatch, time_limit):
+    import eigenmind
+
+    seen = {}
+    original = eigenmind.supported_diversity
+
+    def spy(*args, **kwargs):
+        seen["time_limit"] = kwargs.get("time_limit")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(eigenmind, "supported_diversity", spy)
+    vectors, _ = _clusters([3, 3])
+    assert len(select_diverse(_hits(6), vectors, 2, time_limit=time_limit)) == 2
+    assert type(seen["time_limit"]) is float and seen["time_limit"] == float(time_limit)
+
+
+@pytest.mark.parametrize("time_limit", [np.float32("nan"), float("inf"), np.bool_(True), "1"])
+def test_time_limit_refuses_non_finite_and_non_numbers(time_limit):
+    vectors, _ = _clusters([3, 3])
+    with pytest.raises(ValueError, match="time_limit"):
+        select_diverse(_hits(6), vectors, 2, time_limit=time_limit)
