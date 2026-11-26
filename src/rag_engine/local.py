@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import itertools
 import json
 import logging
 import re
@@ -54,6 +55,7 @@ from .store import QdrantStore, StoreError
 __all__ = [
     "DATE_FILTER_MODE",
     "DEFAULT_CANDIDATES",
+    "DEFAULT_MAX_TERMS",
     "DEFAULT_RRF_K",
     "LOCAL_KEYS",
     "LocalIndex",
@@ -78,6 +80,12 @@ DEFAULT_CANDIDATES = 50
 #: The ``k`` of Reciprocal Rank Fusion (``1 / (k + rank)``), the default of ``rrf_k``: 60, the
 #: value of Cormack, Clarke and Büttcher (2009).
 DEFAULT_RRF_K = 60
+#: How many distinct words of a query the FTS side searches for, the default of ``max_terms``
+#: of :func:`fts_query` and :func:`hybrid_search`: the first 64. A question is a few dozen
+#: words at most; the cap keeps a pasted document (or a hostile 200,000-word query) from
+#: becoming a MATCH of thousands of ``OR`` terms. The dense side is not affected (the
+#: embedder truncates to its own window).
+DEFAULT_MAX_TERMS = 64
 
 #: Payload keys :meth:`LocalIndex.add` writes itself; the given payload may not set them.
 LOCAL_KEYS = ("text", "context", "chunk_number", "page", "date_start", "date_end")
@@ -123,7 +131,7 @@ def _word_character(character: str) -> bool:
     return unicodedata.category(character)[0] in "LNM" or unicodedata.category(character) == "Co"
 
 
-def fts_query(text: str) -> str:
+def fts_query(text: str, *, max_terms: int = DEFAULT_MAX_TERMS) -> str:
     """``text`` as an FTS5 MATCH string that cannot be read as FTS5 syntax.
 
     The words of ``text`` (runs of letters, numbers and combining marks; everything else
@@ -133,23 +141,30 @@ def fts_query(text: str) -> str:
     made only of combining marks is dropped; repeated words are kept once. ``OR`` lets bm25()
     rank a chunk by how many of the words it holds, rather than demanding all of them.
 
+    ``max_terms`` (default :data:`DEFAULT_MAX_TERMS`, an integer >= 1, else ``ValueError``):
+    only the first ``max_terms`` distinct words are kept, and the text is read no further, so
+    the cost does not grow with the length of ``text`` beyond them.
+
     A ``text`` with no word (blank, punctuation, emoji: ``'"()'``, ``'"'``) is a
     ``ValueError``: there is nothing to match.
     """
     if not isinstance(text, str):
         raise TypeError(f"the FTS query must be a string, got {type(text).__name__}")
-    words: list[str] = []
+    if type(max_terms) is not int or max_terms < 1:
+        raise ValueError(f"max_terms must be an integer >= 1, got {max_terms!r}")
+    words: dict[str, None] = {}  # insertion-ordered set: the first occurrence of each word
     current: list[str] = []
-    for character in [*text, " "]:
+    for character in itertools.chain(text, " "):
         if _word_character(character):
             current.append(character)
             continue
         if current:
             word = "".join(current)
             if any(unicodedata.category(c)[0] in "LN" or unicodedata.category(c) == "Co" for c in word):
-                words.append(word)
+                words[word] = None
+                if len(words) >= max_terms:
+                    break
             current = []
-    words = list(dict.fromkeys(words))
     if not words:
         raise ValueError(f"the FTS query holds no word to search for: {text!a}")
     return " OR ".join(f'"{word}"' for word in words)
@@ -251,6 +266,14 @@ class _Row:
     payload: dict[str, Any]
 
 
+def _unencodable(doc_id: str, what: str) -> StoreError:
+    # ascii(): the message can itself be encoded, whatever the strings hold.
+    return StoreError(
+        f"{what} of document {doc_id!a} holds a string that cannot be encoded as UTF-8 (a lone "
+        "surrogate): nothing was written"
+    )
+
+
 @contextmanager
 def _sqlite(action: str) -> Iterator[None]:
     """Raise an error of SQLite as a :class:`StoreError` that says what was being done."""
@@ -339,7 +362,13 @@ class LocalIndex:
         id is ``point_id(doc_id, page_for_id(chunk.page), first_index + i)``, the id an
         ingestion into a server gives, so a document added in several batches (priority
         sections first) keeps distinct ids as long as the batches do not overlap. Writing a
-        batch again overwrites it, on both sides.
+        batch again overwrites it, on both sides. Only the ids of the new batch are
+        overwritten: re-adding a document with **fewer** chunks than before leaves its surplus
+        chunks in the index, still served. To replace a document, call :meth:`delete` first.
+
+        The text is stored as given: no normalisation, no trimming. The chunker already gives it
+        in NFKD, the form :func:`hybrid_search` puts the query in; a caller that builds chunks
+        itself is to do the same.
 
         Each chunk is stored with ``{"doc_id": doc_id, **payload}`` plus ``chunk_number``,
         ``text``, ``context`` (when the chunk has one), ``page`` (when it has one), and
@@ -350,14 +379,19 @@ class LocalIndex:
         ``ValueError``: ``doc_id`` not a non-blank string, ``first_index`` not an integer >= 0,
         ``vectors`` not of shape ``(len(chunks), dim)``, a ``payload`` that sets one of
         :data:`LOCAL_KEYS` or a ``doc_id`` other than ``doc_id``, a ``payload`` that cannot be
-        written as JSON (``TypeError`` from ``json``). Nothing is written then: every row is
-        encoded before the first write. A SQLite failure is a :class:`StoreError`, after the
+        written as JSON (``TypeError`` from ``json``). :class:`StoreError` when ``doc_id``, a
+        chunk's ``text`` or ``context``, or a key or value of ``payload`` holds a string that
+        cannot be encoded as UTF-8 (a lone surrogate, as a JSON escape such as ``\\ud800``
+        gives). Nothing is written then: every row is encoded and checked before the first
+        write. A SQLite failure is a :class:`StoreError`, after the
         points just written to Qdrant have been deleted again. Should a batch that overwrote
         chunks fail that way, those chunks keep their previous rows in SQLite and are served
         by the FTS side only until the batch is added again.
         """
         if not isinstance(doc_id, str) or not doc_id.strip():
             raise ValueError(f"doc_id must be a non-blank string, got {doc_id!r}")
+        if not _encodable(doc_id):
+            raise _unencodable(doc_id, "doc_id")
         if type(first_index) is not int or first_index < 0:
             raise ValueError(f"first_index must be an integer >= 0, got {first_index!r}")
         clashes = [key for key in LOCAL_KEYS if key in payload]
@@ -390,6 +424,10 @@ class LocalIndex:
                 full["context"] = chunk.context
             ident = point_id(doc_id, page_for_id(chunk.page), number)
             encoded = json.dumps(common, ensure_ascii=False, allow_nan=False)
+            # SQLite stores UTF-8: a lone surrogate would fail its insert after the Qdrant write.
+            for name, value in (("text", chunk.text), ("context", chunk.context), ("payload", encoded)):
+                if value is not None and not _encodable(value):
+                    raise _unencodable(doc_id, f"the {name} of chunk {number}")
             points.append(models.PointStruct(id=ident, vector=vector.tolist(), payload=full))
             rows.append((ident, doc_id, ident, chunk.text, chunk.context, encoded))
         idents = [point.id for point in points]
@@ -512,14 +550,16 @@ def hybrid_search(
     candidates: int = DEFAULT_CANDIDATES,
     rrf_k: int = DEFAULT_RRF_K,
     selector: Callable[[list[Hit], np.ndarray, int], list[Hit]] | None = None,
+    max_terms: int = DEFAULT_MAX_TERMS,
 ) -> list[Hit]:
     """The chunks of ``index`` that best answer ``query``: dense and BM25, fused by RRF.
 
     - Dense: :func:`rag_engine.search.search` on ``index.store``, ``candidates`` deep, with
       ``date_filter_mode`` set to :data:`DATE_FILTER_MODE` (no payload-schema read).
     - Lexical: the FTS5 table, ``candidates`` deep, ordered by ``bm25()``, on
-      :func:`fts_query` of the query put in NFKD (the form chunks are stored in). A query
-      without any word (``"???"``) is searched on the dense side alone.
+      :func:`fts_query` of the query put in NFKD (the form chunks are stored in), on its first
+      ``max_terms`` distinct words (default :data:`DEFAULT_MAX_TERMS`). A query without any
+      word (``"???"``) is searched on the dense side alone.
     - ``filters`` (every field of :class:`SearchFilters`) restrict both sides alike.
     - Both sides are searched under the lock of ``index`` (the query is embedded before), and
       a dense hit whose chunk has no SQLite row is dropped before the fusion
@@ -538,7 +578,7 @@ def hybrid_search(
       fused candidate (no vector is read and the selector is not called), the first ``limit``
       fused candidates are returned. The query is embedded once either way.
 
-    ``limit``, ``candidates`` and ``rrf_k`` are integers >= 1, else :class:`SearchError`
+    ``limit``, ``candidates``, ``rrf_k`` and ``max_terms`` are integers >= 1, else :class:`SearchError`
     (``limit`` may exceed ``candidates``: the fusion holds up to ``2 * candidates`` chunks).
     ``search`` raises its own :class:`SearchError` for a query it refuses (blank, nothing
     searchable).
@@ -546,6 +586,7 @@ def hybrid_search(
     _count("limit", limit)
     _count("candidates", candidates)
     _count("rrf_k", rrf_k)
+    _count("max_terms", max_terms)
     once = _OnceQuery(embedder)
     if isinstance(query, str) and query.strip() and _encodable(query) and is_searchable(query):
         normalized = unicodedata.normalize(QUERY_NORMALIZATION, query)
@@ -554,7 +595,7 @@ def hybrid_search(
             # A query search() refuses is not embedded: search() raises before asking.
             once.encode_query(normalized)
     try:
-        match: str | None = fts_query(unicodedata.normalize(QUERY_NORMALIZATION, query))
+        match: str | None = fts_query(unicodedata.normalize(QUERY_NORMALIZATION, query), max_terms=max_terms)
     except (TypeError, ValueError):
         match = None
     # Both sides under the index lock: they see the same state of the index.

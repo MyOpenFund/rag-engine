@@ -17,7 +17,7 @@ from qdrant_client import models
 
 from rag_engine.chunking import Chunk
 from rag_engine.embedding import FakeEmbedder, ModelSpec
-from rag_engine.local import LocalIndex, collection_name, fts_query, hybrid_search
+from rag_engine.local import DEFAULT_MAX_TERMS, LocalIndex, collection_name, fts_query, hybrid_search
 from rag_engine.schema import page_for_id, point_id
 from rag_engine.search import SearchError, SearchFilters, search
 from rag_engine.store import IndexLocked, QdrantStore, StoreError
@@ -538,3 +538,62 @@ def test_the_dense_search_runs_under_the_index_lock(index, embedder, monkeypatch
     monkeypatch.setattr(local_module, "search", spy)
     hybrid_search("capex", index=index, embedder=embedder, filters=None, limit=5)
     assert owned == [True]
+
+
+# --- final review: query size, unencodable text ----------------------------------------------------
+
+
+def test_fts_query_keeps_the_first_max_terms_distinct_words():
+    assert fts_query("a b a c d", max_terms=3) == '"a" OR "b" OR "c"'
+    assert fts_query(" ".join(f"w{i}" for i in range(100))).count(" OR ") == DEFAULT_MAX_TERMS - 1
+    for bad in (0, -1, True, 2.0, None):
+        with pytest.raises(ValueError, match="max_terms"):
+            fts_query("capex", max_terms=bad)
+
+
+def test_the_default_max_terms_is_a_documented_parameter():
+    import inspect
+
+    assert DEFAULT_MAX_TERMS == 64
+    assert inspect.signature(fts_query).parameters["max_terms"].default == DEFAULT_MAX_TERMS
+    assert inspect.signature(hybrid_search).parameters["max_terms"].default == DEFAULT_MAX_TERMS
+
+
+def test_a_200k_word_query_is_fast(index, embedder):
+    import time
+
+    _add(index, embedder, "a", ["capital expenditure rose", "revenue fell"])
+    query = "capital " + " ".join(f"word{i}" for i in range(200_000))
+    started = time.perf_counter()
+    match = fts_query(query)
+    assert match.count(" OR ") == DEFAULT_MAX_TERMS - 1 and match.startswith('"capital"')
+    hits = hybrid_search(query, index=index, embedder=embedder, filters=None, limit=5)
+    elapsed = time.perf_counter() - started
+    assert {hit.doc_id for hit in hits} == {"a"}
+    assert elapsed < 5.0, elapsed
+
+
+def test_hybrid_search_passes_max_terms_to_the_fts_side(index, embedder, monkeypatch):
+    seen = []
+    original = index._fts_rows
+    monkeypatch.setattr(index, "_fts_rows", lambda match, *a: seen.append(match) or original(match, *a))
+    hybrid_search("alpha beta gamma", index=index, embedder=embedder, filters=None, limit=5, max_terms=2)
+    assert seen == ['"alpha" OR "beta"']
+    with pytest.raises(SearchError, match="max_terms"):
+        hybrid_search("alpha", index=index, embedder=embedder, filters=None, limit=5, max_terms=0)
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["text", "context", "payload_value", "payload_key", "doc_id"],
+)
+def test_a_lone_surrogate_is_a_store_error_before_any_write(index, embedder, where):
+    bad = "capex \ud800"
+    chunk = Chunk(bad if where == "text" else "capex", page=None, context=bad if where == "context" else None)
+    payload = {"title": bad} if where == "payload_value" else {bad: "x"} if where == "payload_key" else {}
+    doc_id = bad if where == "doc_id" else "a"
+    vectors = np.ones((1, SPEC.dim), np.float32)
+    with pytest.raises(StoreError, match="UTF-8"):
+        index.add(doc_id, [chunk], vectors, payload, first_index=0)
+    assert index.store.count(COLLECTION) == 0
+    assert index.doc_ids() == set()
