@@ -71,7 +71,7 @@ import random
 import statistics
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, overload
 
 from . import __version__
@@ -170,7 +170,18 @@ QUESTION_FIELDS: tuple[str, ...] = (
     "run_unfiltered",
     "essential_any_of",
     "expected_spans",
+    "span_match",
+    "difficulty",
 )
+
+#: How the ``expected_spans`` of a question are matched: ``any`` (one of them is enough, the default)
+#: or ``all`` (each must be found among the first ``k`` passages: a question that needs two filings).
+SPAN_MATCHES: tuple[str, ...] = ("any", "all")
+#: The span matching of a question that states none.
+DEFAULT_SPAN_MATCH = "any"
+#: The difficulty labels a question may carry (``eval/filings_README.md`` defines them); a label only,
+#: the report groups by it.
+DIFFICULTIES: tuple[str, ...] = ("easy", "medium", "hard")
 
 _REQUIRED = ("id", "question")
 _NO_KIND = "(none)"
@@ -314,6 +325,13 @@ class Question:
         evaluation (:func:`evaluate_passages`): a retrieved passage is a hit when it holds one
         of them (:func:`span_hit`). Distinct non-blank strings; empty unless given, and always
         empty on a question that abstains. :func:`evaluate` does not read them.
+    ``span_match``
+        One of :data:`SPAN_MATCHES`: ``"any"`` (the default), a passage holding any one span is
+        a hit; ``"all"``, every span must be held by some passage among the first ``k`` (a
+        question whose answer needs two filings), and the rank is the position where the last
+        missing span is first found. ``"all"`` needs at least two spans.
+    ``difficulty``
+        ``None`` or one of :data:`DIFFICULTIES`: a label the passage report groups by.
 
     The fields are checked when the question is built (``EvalError``); lists are kept as
     tuples. A document id may not start or end with a space, ``must_include`` and
@@ -338,6 +356,8 @@ class Question:
     run_unfiltered: bool = False
     essential_any_of: tuple[tuple[str, ...], ...] | None = None  # a tuple once built, never None
     expected_spans: tuple[str, ...] = ()
+    span_match: str = DEFAULT_SPAN_MATCH
+    difficulty: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -364,6 +384,12 @@ class Question:
             object.__setattr__(self, name, _strings(name, getattr(self, name)))
         if self.expected_spans and self.expected_behavior == "abstain":
             raise EvalError("'expected_spans' is given on a question whose 'expected_behavior' is 'abstain'")
+        if not isinstance(self.span_match, str) or self.span_match not in SPAN_MATCHES:
+            raise EvalError(f"'span_match' must be one of {', '.join(SPAN_MATCHES)}, got {self.span_match!r}")
+        if self.span_match == "all" and len(self.expected_spans) < 2:
+            raise EvalError("'span_match' is 'all' with fewer than two 'expected_spans': it would mean 'any'")
+        if self.difficulty is not None and self.difficulty not in DIFFICULTIES:
+            raise EvalError(f"'difficulty' must be one of {', '.join(DIFFICULTIES)}, got {self.difficulty!r}")
         both = [text for text in self.must_include if text in self.must_not_include]
         if both:
             raise EvalError(
@@ -479,6 +505,10 @@ class Question:
         for name in ("must_include", "must_not_include", "expected_spans"):
             if getattr(self, name):
                 result[name] = list(getattr(self, name))
+        if self.span_match != DEFAULT_SPAN_MATCH:
+            result["span_match"] = self.span_match
+        if self.difficulty is not None:
+            result["difficulty"] = self.difficulty
         if self.kind is not None:
             result["kind"] = self.kind
         if self.tags:
@@ -534,7 +564,7 @@ def _question_of(record: object) -> Question:
         filters = SearchFilters.from_mapping(filters)
         if _filters_dict(filters) is None:
             filters = None  # {} and a filter of nulls restrict nothing
-    for name in ("kind", "language", "rationale", "expected_behavior"):
+    for name in ("kind", "language", "rationale", "expected_behavior", "span_match", "difficulty"):
         if record.get(name) is not None and not isinstance(record[name], str):
             raise EvalError(f"'{name}' must be a string, got {record[name]!r}")
     rerun = record.get("run_unfiltered")
@@ -566,6 +596,8 @@ def _question_of(record: object) -> Question:
         run_unfiltered=bool(rerun),
         essential_any_of=record.get("essential_any_of"),
         expected_spans=record["expected_spans"] if record.get("expected_spans") is not None else (),
+        span_match=record["span_match"] if record.get("span_match") is not None else DEFAULT_SPAN_MATCH,
+        difficulty=record.get("difficulty"),
     )
     _check_normalised(question)
     return question
@@ -631,6 +663,9 @@ def load_questions(path: str | os.PathLike[str]) -> QuestionSet:
     - ``expected_spans`` (optional): a list of non-blank strings, none twice, the verbatim
       passages that answer the question, scored by :func:`evaluate_passages`; not allowed on
       a question that abstains;
+    - ``span_match`` (optional): ``"any"`` (the default) or ``"all"`` (every span is needed;
+      at least two spans);
+    - ``difficulty`` (optional): ``"easy"``, ``"medium"`` or ``"hard"``, a label;
     - ``run_unfiltered`` (optional): ``true`` or ``false``; ``true`` only on a question
       whose ``filters`` restrict something.
 
@@ -2540,6 +2575,8 @@ def format_report(report: EvalReport) -> str:
 
 #: Salt of the seed of the passage intervals, so they do not repeat the draws of the document ones.
 _PASSAGE_INTERVAL_SEED = "passages"
+#: The attributes of a :class:`PassageResult` a :class:`PassageReport` can be split by.
+_PASSAGE_GROUPS = ("kind", "difficulty", "language")
 
 
 _FOLDED = str.maketrans(
@@ -2589,6 +2626,8 @@ class PassageResult:
     rank: int | None
     returned: int
     kind: str | None = None
+    difficulty: str | None = None
+    language: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2660,6 +2699,22 @@ class PassageReport:
             metrics=("m",),
         )["m"]
 
+    def groups(self, attribute: str) -> dict[str, PassageReport]:
+        """The report split by ``attribute`` of the results (``kind``, ``difficulty`` or ``language``):
+        one report per value, in order of first appearance, ``(none)`` for questions without one.
+        Each keeps the depth and the interval settings, so a small group gets no interval."""
+        if attribute not in _PASSAGE_GROUPS:
+            raise EvalError(f"unknown grouping {attribute!r} (one of {', '.join(_PASSAGE_GROUPS)})")
+        labels = [getattr(r, attribute) or _NO_KIND for r in self.results]
+        return {
+            label: replace(
+                self,
+                results=tuple(r for r, own in zip(self.results, labels, strict=True) if own == label),
+                abstentions=(),
+            )
+            for label in dict.fromkeys(labels)
+        }
+
     def _metric_names(self) -> list[str]:
         depths = sorted({n for n in (1, 3, 5, 10, self.k) if n <= self.k})
         return [f"{kind}_{n}" for n in depths for kind in ("hit_at", "mrr")]
@@ -2702,6 +2757,33 @@ class PassageReport:
         return "\n".join(lines)
 
 
+def _passage_rank(question: Question, hits: Sequence[Hit]) -> int | None:
+    """The 1-based rank at which ``hits`` answer ``question``, or ``None``.
+
+    A passage counts only if it comes from one of the question's ``expected_doc_ids`` (when it
+    lists any). With ``span_match="any"`` the rank is that of the first passage holding a span;
+    with ``"all"`` it is the smallest ``r`` such that every span is held by some passage among
+    the first ``r`` (``None`` when one span is never found).
+    """
+    wanted = question.expected_doc_ids or ()
+    firsts: list[int | None] = []
+    for span in question.expected_spans:
+        firsts.append(
+            next(
+                (
+                    i
+                    for i, hit in enumerate(hits, start=1)
+                    if (not wanted or hit.doc_id in wanted) and span_hit(hit.text, (span,))
+                ),
+                None,
+            )
+        )
+    found = [rank for rank in firsts if rank is not None]
+    if question.span_match == "all":
+        return max(found) if found and len(found) == len(firsts) else None
+    return min(found) if found else None
+
+
 def evaluate_passages(
     questions: Sequence[Question],
     run: Callable[[Question], Sequence[Hit]],
@@ -2718,6 +2800,8 @@ def evaluate_passages(
     question needs ``expected_spans`` (``EvalError`` otherwise). The report gives hit@n and
     MRR@n for any ``n <= k``. When the question lists ``expected_doc_ids``, a passage counts
     only if it comes from one of them: a sentence repeated by another year's filing is no hit.
+    A question with ``span_match="all"`` is a hit at the rank where its last span is first
+    found (every span must be held by a passage among the first ``k``).
 
     Returns a :class:`PassageReport` rather than an :class:`EvalReport`: that one ranks
     documents, has no notion of a passage, and its aggregates are built around expected
@@ -2737,13 +2821,10 @@ def evaluate_passages(
             top = hits[0].score if hits else None
             abstentions.append(PassageAbstention(question.id, len(hits), top))
             continue
-        wanted = question.expected_doc_ids or ()
-
-        def holds(hit: Hit, question: Question = question, wanted: Sequence[str] = wanted) -> bool:
-            return (not wanted or hit.doc_id in wanted) and span_hit(hit.text, question.expected_spans)
-
-        rank = next((i for i, hit in enumerate(hits, start=1) if holds(hit)), None)
-        results.append(PassageResult(question.id, rank, len(hits), question.kind))
+        rank = _passage_rank(question, hits)
+        results.append(
+            PassageResult(question.id, rank, len(hits), question.kind, question.difficulty, question.language)
+        )
     return PassageReport(
         k=k,
         results=tuple(results),

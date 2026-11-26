@@ -10,7 +10,18 @@ The rules of ``eval/filings_README.md`` ("How a question is checked"), applied m
   times in each, with the comparison of ``rag_engine.eval.span_hit`` (NFKD, typography folded,
   case-folded, white space collapsed);
 - a span found in a filing the question does not expect is reported: it would be a hit for the
-  wrong filing (boilerplate, or a figure repeated by the next year's 10-K).
+  wrong filing (boilerplate, or a figure repeated by the next year's 10-K);
+- every expected filing holds at least one of the question's spans (a filing listed without a span
+  could never give a hit);
+- with ``--require-difficulty``, every question carries a ``difficulty``;
+- an abstention's ``absent:<term>`` tag names a term found, as a whole word, in no filing, and an
+  ``absent@<issuer>:<term>`` tag a term found in no filing of that issuer (doc ids
+  ``<issuer>-...``): the search terms of the abstention, checked rather than asserted.
+
+``--report`` also prints, for every span, how often it occurs in each expected filing, in how many
+other filings it occurs, and in how many other filings its *wording* occurs: the longest stretch of
+the span between figures (at least 15 characters), the sentence a neighbouring year's 10-K repeats
+with other numbers. That last count is the year-confusion exposure of the question.
 
 Run it::
 
@@ -22,6 +33,7 @@ It prints one line per problem and a summary, and exits 1 when there is any prob
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -33,6 +45,10 @@ from rag_engine.eval import Question, _squash, load_questions
 DEFAULT_MIN_CHARS = 20
 #: The most times a span may appear in one expected filing ("once or twice").
 DEFAULT_MAX_PER_FILING = 2
+#: The shortest stretch of wording between figures the ``--report`` looks for in other filings.
+WORDING_MIN_CHARS = 15
+#: A figure of a span: digits with their separators, an optional dollar sign and scale word.
+_FIGURE = re.compile(r"\(?\$?\d[\d.,]*\)?(?: (?:billion|million))?%?")
 
 
 @dataclass(frozen=True)
@@ -66,7 +82,7 @@ def check_question(
 ) -> list[Problem]:
     """The problems of one question (empty when it passes)."""
     if question.expected_behavior == "abstain":
-        return []
+        return check_absent(question, texts)
     problems = [
         Problem(question.id, None, f"expected filing {doc_id!r} not in the directory")
         for doc_id in question.expected_doc_ids
@@ -94,7 +110,95 @@ def check_question(
         if elsewhere:
             others = ", ".join(elsewhere)
             problems.append(Problem(question.id, span, f"also in filings not expected: {others}"))
+    needles = [_squash(span) for span in question.expected_spans]
+    problems.extend(
+        Problem(question.id, None, f"expected filing {doc_id!r} holds none of the spans")
+        for doc_id in expected
+        if not any(needle and needle in texts[doc_id] for needle in needles)
+    )
     return problems
+
+
+def absent_terms(question: Question) -> list[tuple[str | None, str]]:
+    """The ``(issuer or None, term)`` of the ``absent:`` and ``absent@<issuer>:`` tags of ``question``."""
+    terms: list[tuple[str | None, str]] = []
+    for tag in question.tags:
+        if tag.startswith("absent:"):
+            terms.append((None, tag[len("absent:") :]))
+        elif tag.startswith("absent@") and ":" in tag:
+            issuer, term = tag[len("absent@") :].split(":", 1)
+            terms.append((issuer, term))
+    return terms
+
+
+def check_absent(question: Question, texts: Mapping[str, str]) -> list[Problem]:
+    """The ``absent`` tags of an abstention whose term is found, as a whole word, where it must not be."""
+    problems = []
+    for issuer, term in absent_terms(question):
+        needle = _squash(term)
+        pattern = re.compile(r"(?<!\w)" + re.escape(needle) + r"(?!\w)")
+        if not needle:
+            problems.append(Problem(question.id, None, f"blank absent term in {term!r}"))
+            continue
+        found = [
+            doc_id
+            for doc_id, text in texts.items()
+            if (issuer is None or doc_id.startswith(f"{issuer}-")) and pattern.search(text)
+        ]
+        if found:
+            where = "" if issuer is None else f" ({issuer} filings)"
+            problems.append(
+                Problem(question.id, None, f"absent term {term!r}{where} found in {', '.join(found)}")
+            )
+    return problems
+
+
+def wording(span: str) -> str:
+    """The longest stretch of ``span`` between figures, normalised; empty when every stretch is short."""
+    parts = [part.strip(" ,.;") for part in _FIGURE.split(_squash(span))]
+    longest = max(parts, key=len, default="")
+    return longest if len(longest) >= WORDING_MIN_CHARS else ""
+
+
+@dataclass(frozen=True)
+class SpanOccurrence:
+    """Where one span of one question occurs (``--report``)."""
+
+    question_id: str
+    span: str
+    in_expected: dict[str, int]
+    other_filings: tuple[str, ...]
+    wording_filings: tuple[str, ...]
+
+    def format(self) -> str:
+        expected = ", ".join(f"{doc_id}x{n}" for doc_id, n in self.in_expected.items())
+        others = ", ".join(self.other_filings) or "-"
+        return (
+            f"{self.question_id}: {self.span[:60]!r} expected [{expected}] "
+            f"other filings {len(self.other_filings)} ({others}); "
+            f"same wording in {len(self.wording_filings)} other filing(s)"
+        )
+
+
+def occurrences(questions: Sequence[Question], texts: Mapping[str, str]) -> list[SpanOccurrence]:
+    """Every span of every answering question with where it, and its wording, occur."""
+    result = []
+    for question in questions:
+        if question.expected_behavior == "abstain":
+            continue
+        expected = set(question.expected_doc_ids or ())
+        for span in question.expected_spans:
+            needle, words = _squash(span), wording(span)
+            result.append(
+                SpanOccurrence(
+                    question.id,
+                    span,
+                    {doc_id: texts[doc_id].count(needle) for doc_id in sorted(expected) if doc_id in texts},
+                    tuple(d for d, t in texts.items() if d not in expected and needle in t),
+                    tuple(d for d, t in texts.items() if d not in expected and words and words in t),
+                )
+            )
+    return result
 
 
 def check(
@@ -120,6 +224,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-per-filing", type=int, default=DEFAULT_MAX_PER_FILING, help="most occurrences in one filing"
     )
+    p.add_argument("--require-difficulty", action="store_true", help="every question must carry a difficulty")
+    p.add_argument("--report", action="store_true", help="also print where every span and its wording occur")
     return p
 
 
@@ -128,6 +234,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     questions = load_questions(args.questions)
     texts = load_markdown(args.filings)
     problems = check(questions, texts, min_chars=args.min_chars, max_per_filing=args.max_per_filing)
+    if args.require_difficulty:
+        problems.extend(Problem(q.id, None, "no difficulty") for q in questions if q.difficulty is None)
+    if args.report:
+        for occurrence in occurrences(questions, texts):
+            print(occurrence.format())
     for problem in problems:
         print(problem.format())
     answering = [q for q in questions if q.expected_behavior != "abstain"]

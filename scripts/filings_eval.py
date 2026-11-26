@@ -71,6 +71,8 @@ DEFAULT_K = 10
 MIN_K = 10
 #: The metric the two decision rules read.
 DECISION_METRIC = "hit_at_10"
+#: The question attributes the breakdown tables split every row by.
+BREAKDOWNS = ("difficulty", "language")
 _FAKE_SPEC = ModelSpec(name="fake", dim=16, passage_prefix="passage: ", query_prefix="query: ")
 
 
@@ -432,6 +434,34 @@ def format_table(rows: Sequence[Row]) -> str:
     return "\n".join(lines)
 
 
+def breakdown(report: PassageReport, attribute: str) -> dict[str, dict[str, Any]]:
+    """hit@5, hit@10 and MRR@10 of ``report`` per value of ``attribute`` (``difficulty``,
+    ``language``): ``{label: {"questions": n, "hit_at_5": ..., "hit_at_10": ..., "mrr_10": ...}}``.
+    Groups are small: their values carry no interval and are read as indications."""
+    return {
+        label: {"questions": len(group.results)}
+        | {metric: group.value(metric) for metric in ("hit_at_5", "hit_at_10", "mrr_10")}
+        for label, group in report.groups(attribute).items()
+    }
+
+
+def format_breakdown(rows: Sequence[Row], attribute: str) -> str:
+    """One line per row and value of ``attribute``: the questions of that group and their metrics."""
+    header = ("chunking", "retrieval", attribute, "n", "hit@5", "hit@10", "MRR@10")
+    body = [
+        (row.chunking, row.retrieval, label, str(m["questions"]),
+         f"{m['hit_at_5']:.3f}", f"{m['hit_at_10']:.3f}", f"{m['mrr_10']:.3f}")
+        for row in rows
+        for label, m in breakdown(row.report, attribute).items()
+    ]  # fmt: skip
+    widths = [max(len(line[i]) for line in (header, *body)) for i in range(len(header))]
+    lines = (
+        "  ".join(cell.ljust(width) for cell, width in zip(line, widths, strict=True))
+        for line in (header, *body)
+    )
+    return "\n".join(lines)
+
+
 def eigenmind_verdict(
     hybrid: PassageReport, eigenmind: PassageReport, metric: str = DECISION_METRIC
 ) -> tuple[bool, str]:
@@ -560,13 +590,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"sha256 {questions_sha256[:12]}), backend {args.backend}\n"
     )
     print(format_table(rows))
+    for attribute in BREAKDOWNS:
+        print(f"\nby {attribute} (no interval: small groups)\n")
+        print(format_breakdown(rows, attribute))
     print()
     print("\n".join(decisions(rows)))
     if args.json:
         payload = [
             {"chunking": r.chunking, "retrieval": r.retrieval, "params": r.params, "chunks": r.chunks,
              "seconds_per_filing": r.seconds_per_filing, "ms_per_search": r.ms_per_search,
-             "questions_sha256": questions_sha256, "report": r.report.to_dict()}
+             "questions_sha256": questions_sha256, "report": r.report.to_dict(),
+             **{f"by_{a}": breakdown(r.report, a) for a in BREAKDOWNS}}
             for r in rows
         ]  # fmt: skip
         args.json.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
