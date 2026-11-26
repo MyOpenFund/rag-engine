@@ -299,6 +299,7 @@ def test_v2_cap_with_real_e5_tokenizer(excerpt, tmp_path):
 
 
 def test_load_tokenizer_verifies_hash(tmp_path, monkeypatch):
+    pytest.importorskip("tokenizers")  # the onnx extra, not installed by the CI test job
     from rag_engine import embedding
 
     (tmp_path / "tokenizer.json").write_text("{}")
