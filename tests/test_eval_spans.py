@@ -200,6 +200,7 @@ def _synthetic_corpus(root):
 
 
 def test_filings_eval_runs_on_a_synthetic_corpus(tmp_path, capsys):
+    pytest.importorskip("chunknorris")  # the ingest extra (not installed on Python 3.10 in CI)
     script = _script()
     qfile = _synthetic_corpus(tmp_path)
     out = tmp_path / "rows.json"
@@ -324,6 +325,7 @@ def test_section_pieces_cut_like_the_mcp():
 
 
 def test_section_cut_never_spans_two_sections(tmp_path):
+    pytest.importorskip("chunknorris")  # the ingest extra (not installed on Python 3.10 in CI)
     script = _script()
     first = "# Item 7\n\n" + " ".join(f"alpha{i}" for i in range(60))
     second = "\n\n# Item 8\n\n" + " ".join(f"omega{i}" for i in range(60))
@@ -391,6 +393,7 @@ def test_load_filings_builds_the_title_from_the_company(tmp_path):
 
 
 def test_filings_eval_section_cut_end_to_end(tmp_path, capsys):
+    pytest.importorskip("chunknorris")  # the ingest extra (not installed on Python 3.10 in CI)
     script = _script()
     qfile = _synthetic_corpus(tmp_path)
     for sidecar in tmp_path.glob("*.json"):
