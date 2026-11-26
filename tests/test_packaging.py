@@ -273,6 +273,7 @@ PUBLIC_NAMES = {
     "rag_engine.local": {
         "DATE_FILTER_MODE",
         "DEFAULT_CANDIDATES",
+        "DEFAULT_MAX_TERMS",
         "DEFAULT_RRF_K",
         "LOCAL_KEYS",
         "LocalIndex",
