@@ -310,3 +310,13 @@ def test_load_tokenizer_verifies_hash(tmp_path, monkeypatch):
 def test_load_tokenizer_unknown_model(tmp_path):
     with pytest.raises(ValueError, match="no pinned tokenizer"):
         load_tokenizer(tmp_path, "nobody/not-a-model")
+
+
+def test_table_rows_per_chunk_needs_a_token_cap():
+    # Without max_chunk_token_count the table splitter never runs: the value would be ignored.
+    with pytest.raises(ValueError, match="table_rows_per_chunk"):
+        ChunkingOptions(table_rows_per_chunk=10, version="v2")
+    assert (
+        ChunkingOptions(max_chunk_token_count=480, table_rows_per_chunk=10, version="v2").table_rows_per_chunk
+        == 10
+    )

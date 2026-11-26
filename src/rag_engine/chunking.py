@@ -154,7 +154,8 @@ class ChunkingOptions:
       caller, so it needs to be the one of the embedding model.
     - ``table_rows_per_chunk``: a markdown table longer than the cap is cut into chunks of this
       many rows, each starting with the header row and the separator line. ``None``: as many
-      rows as fit under the cap.
+      rows as fit under the cap. Only with ``max_chunk_token_count`` (refused otherwise: the
+      tables are cut by the token splitter alone).
     - ``context_header``: each chunk carries ``context``, its path of headings, and the
       heading lines at the top of its text are dropped (the context says the same).
     - ``context_max_tokens``: most tokens a context may take. A longer one loses its middle
@@ -251,6 +252,10 @@ class ChunkingOptions:
                 f"context_max_tokens ({self.context_max_tokens}) must be at most half of "
                 f"max_chunk_token_count ({self.max_chunk_token_count}), so that at least half of the "
                 "cap is left for the text"
+            )
+        if self.table_rows_per_chunk is not None and self.max_chunk_token_count is None:
+            raise ValueError(
+                "table_rows_per_chunk cuts tables under the token cap: it needs max_chunk_token_count"
             )
         if self.context_max_tokens is not None and not self.context_header:
             raise ValueError("context_max_tokens limits the context: it needs context_header=True")
