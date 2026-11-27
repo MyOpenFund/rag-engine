@@ -403,10 +403,10 @@ def chunk_file(
 
     try:
         if ext == ".pptx":
-            document = MarkdownParser().parse_string(_pptx_to_markdown(filepath))
+            document = _parse_markdown(MarkdownParser, _pptx_to_markdown(filepath))
         elif ext in (".txt", ".md"):
             # MarkdownParser.parse_file is strict about the encoding; the text is read here.
-            document = MarkdownParser().parse_string(_read_text(filepath))
+            document = _parse_markdown(MarkdownParser, _read_text(filepath))
         elif ext == ".pdf":
             use_ocr = ("auto" if ocr_available() else "never") if ocr == "auto" else ocr
             if use_ocr != "never":
@@ -460,6 +460,10 @@ def chunk_markdown(
 
     With ``context_header``, ``title`` is the first element of ``Chunk.context`` (the first
     heading is not repeated when it is the title); without a title the context is the headings.
+
+    No front matter is read: a text that starts with ``---`` (a page break, a YAML header) keeps
+    all its words, and so does a line glued to a rule (``"---UNITED STATES"``). A YAML header is
+    plain text, its closing ``---`` a thematic break.
     """
     if options is None:
         options = ChunkingOptions()
@@ -473,10 +477,123 @@ def chunk_markdown(
     except ImportError as error:
         raise _missing_dependency(error) from error
     try:
-        raw_chunks = _markdown_chunker(MarkdownChunker, options).chunk(MarkdownParser().parse_string(text))
+        raw_chunks = _markdown_chunker(MarkdownChunker, options).chunk(_parse_markdown(MarkdownParser, text))
     except TextNotFoundException:
         return []
     return _to_chunks(raw_chunks, options, title, tokenizer)
+
+
+#: The runs of three dashes or more a text starts with, the whitespace (a BOM included) around them.
+_LEADING_RULES = re.compile(r"\A[\s\ufeff]*(?:-{3,}[\s\ufeff]*)+")
+
+#: A word character, the test for text glued to a rule.
+_WORD_CHARACTER = re.compile(r"\w")
+
+
+def _is_setext_rule(line: str) -> bool:
+    """Whether ChunkNorris reads ``line`` as a setext underline when the line above is not blank."""
+    return line.startswith(("---", "==="))
+
+
+def _toggles_code_fence(line: str) -> bool:
+    """Whether ChunkNorris's ``convert_setext_to_atx`` opens or closes a code block on ``line``."""
+    return line.startswith("```") and "```" not in line[3:]
+
+
+def _split_glued_rule(line: str) -> tuple[str, str] | None:
+    """``(rule, text)`` for a setext ``line`` glued to text with a word in it; ``None`` otherwise.
+
+    ``rule`` is the run of ``-`` or ``=`` the line starts with; the spaces and tabs after it are
+    dropped. Linear in the length of the line (no backtracking regex).
+    """
+    run_end = len(line) - len(line.lstrip(line[0]))
+    text = line[run_end:].lstrip(" \t")
+    if _WORD_CHARACTER.search(text) is None:
+        return None
+    return line[:run_end], text
+
+
+def _yaml_closing_line(text: str) -> int | None:
+    """The index of the line ChunkNorris's ``parse_metadata`` reads as the end of a YAML header."""
+    if not text.startswith("---"):
+        return None
+    lines = text.split("\n")
+    try:
+        return lines.index("---", 1)
+    except ValueError:
+        return None
+
+
+def _markdown_for_parser(text: str) -> str:
+    """``text`` changed so that ChunkNorris's ``MarkdownParser.parse_string`` drops no word.
+
+    ``text`` is the output of ``MarkdownParser.cleanup_string`` (see :func:`_parse_markdown`), the
+    string the next steps of the parser see. Two of them (ChunkNorris 1.3.7 to 1.5.0) lose text
+    on lines that start with ``---``. Converted filings have ``---`` page breaks, sometimes glued
+    to the next line (``"---UNITED STATES"``) or stacked, and a section cut at an offset often
+    starts on one.
+
+    - Front matter. ``parse_metadata`` drops, when the string starts with ``---`` and a later line
+      is exactly ``---``, everything up to that line as YAML. rag-engine never reads front matter
+      (documents are not Jekyll pages): the runs of dashes the text starts with are removed, with
+      the whitespace (a BOM included) around them, so a YAML header is kept as plain text. The
+      line that would have closed it gets a blank line above it: it is then a thematic break,
+      not the underline of a heading made of the line above (the last key of a header).
+    - Setext headings. ``convert_setext_to_atx`` reads a line that starts with ``---`` or
+      ``===`` under a non-blank line as the underline of a heading: it drops the line whole,
+      text glued to the rule included, and replaces the line it has output last with a heading.
+      A rule glued to text is split in two, the rule then the text, and the text goes through
+      the same check (``"--- ---foo"``: the text ``"---foo"`` is itself a rule, under the rule
+      split off). A rule under another rule is separated from it by a blank line, since the line
+      output last is then the heading made by the rule above and its text would be lost. Code
+      fences are tracked as ChunkNorris tracks them, and left alone.
+
+    A pure rule under a line stays an underline: a paragraph directly above a ``---`` page break
+    is a heading, as ChunkNorris always made it. Only dashes and whitespace are removed, never a
+    word. A text no rule applies to is returned unchanged. Linear in the length of the text.
+    """
+    closing = _yaml_closing_line(text)
+    if (match := _LEADING_RULES.match(text)) is not None:
+        removed = text[: match.end()]
+        text = text[match.end() :]
+        if closing is not None:
+            closing -= removed.count("\n")
+            closing = closing if closing > 0 else None
+    else:
+        closing = None
+    out: list[str] = []
+    within_code_block = False
+    for index, line in enumerate(text.split("\n")):
+        if index == closing and not within_code_block and out and out[-1].strip():
+            out.append("")
+        while True:
+            if _toggles_code_fence(line):
+                within_code_block = not within_code_block
+            if within_code_block or not _is_setext_rule(line) or not out or not out[-1].strip():
+                out.append(line)
+            elif _is_setext_rule(out[-1]):
+                out.extend(("", line))
+            elif (glued := _split_glued_rule(line)) is not None:
+                rule, line = glued
+                out.append(rule)
+                continue
+            else:
+                out.append(line)
+            break
+    return "\n".join(out)
+
+
+def _parse_markdown(parser_class, text: str):
+    """``parser_class().parse_string`` of ``text``, no word dropped (:func:`_markdown_for_parser`).
+
+    The rules are looked for in the text cleaned up as ``parse_string`` cleans it (stripped, runs
+    of blank lines shortened, base64 images removed), where the parser finds them. When none
+    applies, ``text`` itself is parsed, unchanged; otherwise the changed text, which
+    ``parse_string`` cleans again without changing it.
+    """
+    cleaned = parser_class.cleanup_string(text)
+    changed = _markdown_for_parser(cleaned)
+    return parser_class().parse_string(text if changed == cleaned else changed)
 
 
 def _check_tokenizer(options: ChunkingOptions, tokenizer: object) -> None:
