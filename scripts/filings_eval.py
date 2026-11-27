@@ -25,6 +25,10 @@ the ``FilingDocument.sections`` of company-corpus), the text outside every secti
 too, and each piece is chunked alone, so no chunk spans two sections. Its rows are labelled
 ``<profile>/section``; ``--cuts document`` (the default) chunks the whole Markdown at once.
 
+``--exclude-tag chunk-loss`` prints the headline table a second time without the questions carrying
+one of the tags (and writes it as ``excluding`` in the JSON): the same runs, fewer questions. The
+first table always scores every question, as their ``difficulty`` stays as measured.
+
 ``--backend fake`` embeds with a hash-based ``FakeEmbedder`` and counts tokens by words: it checks
 the plumbing, its numbers mean nothing. Every threshold is an option; the sweeps
 (``--sweep-threshold``, ``--sweep-keep-top``, ``--sweep-solver``) add one eigenmind row per
@@ -41,7 +45,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -71,6 +75,8 @@ DEFAULT_K = 10
 MIN_K = 10
 #: The metric the two decision rules read.
 DECISION_METRIC = "hit_at_10"
+#: The question attributes the breakdown tables split every row by.
+BREAKDOWNS = ("difficulty", "language")
 _FAKE_SPEC = ModelSpec(name="fake", dim=16, passage_prefix="passage: ", query_prefix="query: ")
 
 
@@ -105,6 +111,8 @@ class Row:
     ms_per_search: float
     chunks: int
     params: dict[str, Any] = field(default_factory=dict)
+    #: The same run scored without the questions of the excluded tags (``--exclude-tag``), or ``None``.
+    excluding: PassageReport | None = None
 
 
 def filing_title(company: str, form: str, report_date: str | None, filed: str | None) -> str:
@@ -354,9 +362,14 @@ def run_matrix(
     time_limit: float = 2.0,
     bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
     interval_min_questions: int = DEFAULT_INTERVAL_MIN_QUESTIONS,
+    exclude_tags: Sequence[str] = (),
 ) -> list[Row]:
-    """Build one index per cut x profile in a temporary directory and score every retrieval on it."""
+    """Build one index per cut x profile in a temporary directory and score every retrieval on it.
+
+    With ``exclude_tags``, every row also carries the same run scored without the questions holding
+    one of those tags (:attr:`Row.excluding`): the headline with and without, say, ``chunk-loss``."""
     check_inputs(questions, profiles, k, cuts, filings)
+    kept = without_tags(questions, exclude_tags) if exclude_tags else None
     # One encode before any timer: the first call of a model loads and warms it.
     embedder.encode_passage(["warm-up"])
     embedder.encode_query("warm-up")
@@ -387,17 +400,32 @@ def run_matrix(
                     started = time.perf_counter()
                     hits = {question.id: run(question) for question in questions}
                     ms = 1000.0 * (time.perf_counter() - started) / max(len(questions), 1)
-                    report = evaluate_passages(
-                        questions,
-                        lambda question, hits=hits: hits[question.id],
-                        k=k,
-                        bootstrap_resamples=bootstrap_resamples,
-                        interval_min_questions=interval_min_questions,
-                    )
-                    rows.append(Row(label_of(label, cut), name, report, seconds, ms, chunks, params))
+                    reports = [
+                        evaluate_passages(
+                            subset,
+                            lambda question, hits=hits: hits[question.id],
+                            k=k,
+                            bootstrap_resamples=bootstrap_resamples,
+                            interval_min_questions=interval_min_questions,
+                        )
+                        for subset in ((questions,) if kept is None else (questions, kept))
+                    ]
+                    rows.append(
+                        Row(label_of(label, cut), name, reports[0], seconds, ms, chunks, params,
+                            reports[1] if kept is not None else None)
+                    )  # fmt: skip
             finally:
                 index.close()
     return rows
+
+
+def without_tags(questions: Sequence[Question], tags: Sequence[str]) -> list[Question]:
+    """``questions`` less those carrying one of ``tags``; ``ValueError`` when no answering one is left."""
+    unwanted = set(tags)
+    kept = [question for question in questions if not unwanted & set(question.tags)]
+    if not any(question.expected_behavior != "abstain" for question in kept):
+        raise ValueError(f"--exclude-tag {','.join(tags)}: no answering question left")
+    return kept
 
 
 def _cell(report: PassageReport, metric: str) -> str:
@@ -429,6 +457,34 @@ def format_table(rows: Sequence[Row]) -> str:
         "  ".join(cell.ljust(width) for cell, width in zip(line, widths, strict=True))
         for line in (header, *body)
     ]
+    return "\n".join(lines)
+
+
+def breakdown(report: PassageReport, attribute: str) -> dict[str, dict[str, Any]]:
+    """hit@5, hit@10 and MRR@10 of ``report`` per value of ``attribute`` (``difficulty``,
+    ``language``): ``{label: {"questions": n, "hit_at_5": ..., "hit_at_10": ..., "mrr_10": ...}}``.
+    Groups are small: their values carry no interval and are read as indications."""
+    return {
+        label: {"questions": len(group.results)}
+        | {metric: group.value(metric) for metric in ("hit_at_5", "hit_at_10", "mrr_10")}
+        for label, group in report.groups(attribute).items()
+    }
+
+
+def format_breakdown(rows: Sequence[Row], attribute: str) -> str:
+    """One line per row and value of ``attribute``: the questions of that group and their metrics."""
+    header = ("chunking", "retrieval", attribute, "n", "hit@5", "hit@10", "MRR@10")
+    body = [
+        (row.chunking, row.retrieval, label, str(m["questions"]),
+         f"{m['hit_at_5']:.3f}", f"{m['hit_at_10']:.3f}", f"{m['mrr_10']:.3f}")
+        for row in rows
+        for label, m in breakdown(row.report, attribute).items()
+    ]  # fmt: skip
+    widths = [max(len(line[i]) for line in (header, *body)) for i in range(len(header))]
+    lines = (
+        "  ".join(cell.ljust(width) for cell, width in zip(line, widths, strict=True))
+        for line in (header, *body)
+    )
     return "\n".join(lines)
 
 
@@ -516,6 +572,11 @@ def parser() -> argparse.ArgumentParser:
         default=DEFAULT_INTERVAL_MIN_QUESTIONS,
         help="fewest questions for an interval",
     )
+    p.add_argument(
+        "--exclude-tag",
+        default="",
+        help="comma-separated tags (e.g. chunk-loss): also print the headline without their questions",
+    )
     p.add_argument("--json", type=Path, default=None, help="also write the rows as JSON to this file")
     return p
 
@@ -527,6 +588,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
     cuts = [c.strip() for c in args.cuts.split(",") if c.strip()]
     check_inputs(questions, profiles, args.k, cuts, filings)
+    exclude_tags = [t.strip() for t in args.exclude_tag.split(",") if t.strip()]
+    if exclude_tags:
+        without_tags(questions, exclude_tags)  # fails before any work when nothing would be left
     if args.backend == "fake":
         embedder: Embedder = FakeEmbedder(_FAKE_SPEC)
         tokenizer: Any = _WordTokenizer()
@@ -553,6 +617,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         time_limit=args.time_limit,
         bootstrap_resamples=args.resamples,
         interval_min_questions=args.min_questions,
+        exclude_tags=exclude_tags,
     )
     questions_sha256 = hashlib.sha256(args.questions.read_bytes()).hexdigest()
     print(
@@ -560,13 +625,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"sha256 {questions_sha256[:12]}), backend {args.backend}\n"
     )
     print(format_table(rows))
+    for attribute in BREAKDOWNS:
+        print(f"\nby {attribute} (no interval: small groups)\n")
+        print(format_breakdown(rows, attribute))
     print()
     print("\n".join(decisions(rows)))
+    if exclude_tags:
+        excluded = [replace(row, report=row.excluding) for row in rows if row.excluding is not None]
+        left = len(excluded[0].report.results) if excluded else 0
+        print(f"\nwithout the questions tagged {', '.join(exclude_tags)} ({left} answering questions left)\n")
+        print(format_table(excluded))
+        print()
+        print("\n".join(decisions(excluded)))
     if args.json:
         payload = [
             {"chunking": r.chunking, "retrieval": r.retrieval, "params": r.params, "chunks": r.chunks,
              "seconds_per_filing": r.seconds_per_filing, "ms_per_search": r.ms_per_search,
-             "questions_sha256": questions_sha256, "report": r.report.to_dict()}
+             "questions_sha256": questions_sha256, "report": r.report.to_dict(),
+             **{f"by_{a}": breakdown(r.report, a) for a in BREAKDOWNS},
+             **({"excluding": {"tags": exclude_tags, "report": r.excluding.to_dict()}}
+                if r.excluding is not None else {})}
             for r in rows
         ]  # fmt: skip
         args.json.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
