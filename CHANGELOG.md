@@ -2,6 +2,28 @@
 
 All notable changes to rag-engine are recorded here. Versions follow [semantic versioning](https://semver.org).
 
+## 0.2.1 — 2026-11-26
+
+A text-loss fix in the Markdown path of the chunker, for both profiles (v1 and v2).
+
+### Fixed
+
+- **Text that starts with `---` lost its first page** (`chunk_markdown`, and `chunk_file` for `.md`, `.txt` and `.pptx`). ChunkNorris's `MarkdownParser.parse_string` reads a string that starts with `---` (once stripped) as YAML front matter and drops everything up to the next `---` line. Filings converted to Markdown have `---` page breaks, and a section cut at an offset often starts on one: on twenty 10-Ks cut by section, 2.4 % of the words were lost (Amazon about 5 %, Alphabet up to 5.8 %, Meta up to 4.8 %), the first page of 54 section pieces. The runs of dashes a text starts with are now removed, with the whitespace and BOM around them, before the parser sees it (after ChunkNorris's own clean-up, so a `---` left by a removed base64 image counts too).
+- **A line glued to a rule, or a rule under a rule, lost its words.** ChunkNorris reads a line that starts with `---` or `===` under a non-blank line as a setext underline and drops it whole, text glued to the rule included (`---UNITED STATES`, a page break glued to the next line in converted filings); a second rule under the first replaced the heading the first had made, losing that line. A glued rule is now split from its text, and the text is checked again (`--- ---foo`: what is left is itself a rule); a rule under a rule is separated from it by a blank line (code fences left alone).
+- Only dashes and whitespace are removed, never a word; a text neither case applies to is chunked exactly as before (the v1 output of 0.2.0 is unchanged for it). On the same twenty 10-Ks the words lost by the parser go from 2.4 % to none.
+
+### Changed
+
+- **YAML front matter is now kept as plain text.** 0.2.0 dropped it silently (ChunkNorris read it as metadata, which rag-engine never used). Its closing `---` is a thematic break: the last key does not become a heading.
+
+### Known limit
+
+- A pure `---` directly under a paragraph is still a setext underline: the paragraph becomes a heading, as in 0.2.0. In v2 a long heading is cut by `context_max_tokens` in the `context`, and the words past the cut are in no chunk (as in 0.2.0).
+
+### Compatibility
+
+- **Indexes built with 0.2.0 from section cuts, or from any Markdown that starts with `---` or has rules glued to text, should be rebuilt**: their chunks miss text. Chunks of other documents are unchanged.
+
 ## 0.2.0 — 2026-11-26
 
 An index on the user's own disk with a hybrid search, an opt-in second chunking profile, a diversity selection kept off by default, and a passage-level evaluation on SEC filings. Everything is opt-in: nothing changes for the existing collections, for `ingest_document` or for `search`.

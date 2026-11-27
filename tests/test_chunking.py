@@ -71,6 +71,9 @@ def _install_stubs(monkeypatch, *, with_line_spacing=True):
 
     def make_parser(name):
         class Parser:
+            # As ChunkNorris's MarkdownParser.cleanup_string, for the text it parses: stripped.
+            cleanup_string = staticmethod(str.strip)
+
             def __init__(self, **kwargs):
                 stubs.calls.append((name, "init", kwargs))
 
